@@ -13,7 +13,7 @@ use crate::primitives::asset::{AssetAmount, AssetId};
 use crate::primitives::pool::{PoolId, PoolKind};
 use crate::primitives::price::Price;
 use crate::primitives::ratio::Bps;
-use crate::protocols::concentrated::{self, SwapState, TickData};
+use crate::protocols::concentrated::{self, SwapState};
 use crate::protocols::two_asset_direction;
 use crate::traits::exact_out::ExactOut;
 use crate::traits::introspect::Introspect;
@@ -21,7 +21,7 @@ use crate::traits::limits::{LimitedQuote, Limits};
 use crate::traits::pool::Pool;
 use crate::traits::pricing::Pricing;
 
-pub use crate::protocols::concentrated::TickInfo;
+pub use crate::protocols::concentrated::{TickData, TickInfo};
 
 /// How a V4 pool's hook affects quoting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -4,4 +4,7 @@
 pub mod aerodrome;
 #[cfg(feature = "curve")]
 pub mod curve;
+pub mod slipstream;
 pub mod uniswap_v2;
+pub mod uniswap_v3;
+pub mod uniswap_v4;

@@ -39,6 +39,38 @@ pub struct TickData {
     pub spacing: i32,
 }
 
+impl TickData {
+    /// Build tick data from a set of initialized ticks, computing the
+    /// initialization bitmap. `spacing` is the pool's tick spacing; each tick is
+    /// expected to be a multiple of it. This is how a state fetcher assembles the
+    /// tick state a swap traverses.
+    pub fn from_ticks(spacing: i32, ticks: impl IntoIterator<Item = (i32, TickInfo)>) -> TickData {
+        let mut tick_map = HashMap::new();
+        let mut bitmap: HashMap<i16, U256> = HashMap::new();
+        for (tick, info) in ticks {
+            set_bitmap_bit(&mut bitmap, tick, spacing);
+            tick_map.insert(tick, info);
+        }
+        TickData {
+            ticks: tick_map,
+            bitmap,
+            spacing,
+        }
+    }
+}
+
+/// Set the initialization bit for `tick` in a bitmap, using Uniswap's compressed
+/// word/bit encoding.
+fn set_bitmap_bit(bitmap: &mut HashMap<i16, U256>, tick: i32, spacing: i32) {
+    let compressed = match tick < 0 && tick % spacing != 0 {
+        true => (tick / spacing) - 1,
+        false => tick / spacing,
+    };
+    let word = (compressed >> 8) as i16;
+    let bit = (compressed % 256) as u8;
+    *bitmap.entry(word).or_insert(U256::ZERO) |= U256::from(1u64) << bit;
+}
+
 /// A concentrated-liquidity market snapshot with the fee resolved for one swap
 /// direction. Borrows the pool's [`TickData`]; cheap to build per quote.
 pub(crate) struct SwapState<'a> {
@@ -404,13 +436,7 @@ fn limit_already_reached(sqrt_price_x96: U256, zero_for_one: bool, sqrt_limit: U
 
 #[cfg(test)]
 pub(crate) fn set_tick_bit(bitmap: &mut HashMap<i16, U256>, tick: i32, spacing: i32) {
-    let compressed = match tick < 0 && tick % spacing != 0 {
-        true => (tick / spacing) - 1,
-        false => tick / spacing,
-    };
-    let word = (compressed >> 8) as i16;
-    let bit = (compressed % 256) as u8;
-    *bitmap.entry(word).or_insert(U256::ZERO) |= U256::from(1u64) << bit;
+    set_bitmap_bit(bitmap, tick, spacing);
 }
 
 /// Shared fixtures for the V3/V4 quoter test modules. Which helpers are used
