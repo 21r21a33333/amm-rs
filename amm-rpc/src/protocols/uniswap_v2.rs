@@ -1,20 +1,22 @@
 //! Uniswap V2 on-chain state source: batch-fetch `getReserves()` for a set of
 //! pools and decode each into a quotable [`UniswapV2Pool`].
 //!
-//! `refresh` pins the read to a block and uses one Multicall3 round trip
-//! (`tryAggregate(false, …)`), so a reverting pool surfaces as a skipped entry
-//! rather than failing the whole batch.
+//! `refresh` pins the read to a block and batches every pool's `getReserves`
+//! into one Multicall3 `aggregate3` (per-call `allowFailure`), so a reverting
+//! pool is skipped rather than failing the whole batch.
 
 use alloy::eips::BlockId;
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use alloy::sol;
+use alloy::sol_types::SolCall;
 use amm_core::primitives::asset::AssetId;
 use amm_core::primitives::pool::{PoolId, PoolKey};
 use amm_core::protocols::uniswap::v2::UniswapV2Pool;
 use amm_core::traits::pool::Pool;
 
 use crate::error::RpcError;
+use crate::multicall::{self, Call};
 use crate::source::StateSource;
 
 /// The default Uniswap V2 swap fee (30 bps) used when a [`PoolKey`] carries none.
@@ -78,37 +80,35 @@ impl<P: Provider + Send + Sync> StateSource for UniswapV2Source<P> {
     }
 
     async fn refresh(&self, keys: &[PoolKey], at: BlockId) -> Result<Vec<Box<dyn Pool>>, RpcError> {
-        // Add one getReserves() call per parseable key, tracking which keys made
-        // it in so the results line up.
-        let mut multicall = self
-            .provider
-            .multicall()
-            .dynamic::<IUniswapV2Pair::getReservesCall>();
+        // One getReserves() call per parseable key, tracking which keys made it in
+        // so the batched results line up.
+        let mut calls: Vec<Call> = Vec::new();
         let mut targets: Vec<&PoolKey> = Vec::new();
         for key in keys {
-            match key.address.parse::<Address>() {
-                Ok(address) => {
-                    let pair = IUniswapV2Pair::new(address, &self.provider);
-                    multicall = multicall.add_dynamic(pair.getReserves());
-                    targets.push(key);
-                }
-                Err(_) => continue,
+            if let Ok(target) = key.address.parse::<Address>() {
+                calls.push(Call {
+                    target,
+                    call_data: IUniswapV2Pair::getReservesCall {}.abi_encode().into(),
+                });
+                targets.push(key);
             }
         }
 
-        let results = multicall
-            .block(at)
-            .try_aggregate(false)
-            .await
-            .map_err(|e| RpcError::Transport(e.to_string()))?;
+        let results = multicall::aggregate3(&self.provider, calls, at).await?;
 
         // Keep the pools whose read succeeded and decoded; drop reverts.
         let pools = targets
             .into_iter()
             .zip(results)
             .filter_map(|(key, result)| {
-                let r = result.ok()?;
-                build_pool(key, U256::from(r.reserve0), U256::from(r.reserve1))
+                let decoded =
+                    IUniswapV2Pair::getReservesCall::abi_decode_returns(&result.return_data)
+                        .ok()?;
+                build_pool(
+                    key,
+                    U256::from(decoded.reserve0),
+                    U256::from(decoded.reserve1),
+                )
             })
             .collect();
         Ok(pools)
