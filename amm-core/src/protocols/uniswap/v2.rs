@@ -8,12 +8,12 @@
 
 use alloy_primitives::U256;
 
-use super::two_asset_direction;
 use crate::error::QuoteError;
 use crate::primitives::asset::{AssetAmount, AssetId};
 use crate::primitives::pool::{PoolId, PoolKind};
 use crate::primitives::price::Price;
 use crate::primitives::ratio::{Bps, Ratio};
+use crate::protocols::two_asset_direction;
 use crate::traits::exact_out::ExactOut;
 use crate::traits::introspect::Introspect;
 use crate::traits::pool::Pool;

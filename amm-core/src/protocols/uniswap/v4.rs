@@ -8,20 +8,20 @@
 
 use alloy_primitives::{B256, U256};
 
-use super::concentrated::{self, SwapState, TickData};
-use super::two_asset_direction;
 use crate::error::QuoteError;
 use crate::primitives::asset::{AssetAmount, AssetId};
 use crate::primitives::pool::{PoolId, PoolKind};
 use crate::primitives::price::Price;
 use crate::primitives::ratio::Bps;
+use crate::protocols::concentrated::{self, SwapState, TickData};
+use crate::protocols::two_asset_direction;
 use crate::traits::exact_out::ExactOut;
 use crate::traits::introspect::Introspect;
 use crate::traits::limits::{LimitedQuote, Limits};
 use crate::traits::pool::Pool;
 use crate::traits::pricing::Pricing;
 
-pub use super::concentrated::TickInfo;
+pub use crate::protocols::concentrated::TickInfo;
 
 /// How a V4 pool's hook affects quoting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,9 +220,7 @@ impl Limits for UniswapV4Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocols::uniswap::concentrated::fixtures::{
-        SQRT_1_1, full_range_ticks, usdc, weth,
-    };
+    use crate::protocols::concentrated::fixtures::{SQRT_1_1, full_range_ticks, usdc, weth};
     use alloy_primitives::B256;
 
     /// A full-range USDC/WETH V4 pool at tick 0, 1e18 liquidity, with the given

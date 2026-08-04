@@ -6,20 +6,20 @@
 
 use alloy_primitives::U256;
 
-use super::concentrated::{self, SwapState};
-use super::two_asset_direction;
 use crate::error::QuoteError;
 use crate::primitives::asset::{AssetAmount, AssetId};
 use crate::primitives::pool::{PoolId, PoolKind};
 use crate::primitives::price::Price;
 use crate::primitives::ratio::Bps;
+use crate::protocols::concentrated::{self, SwapState};
+use crate::protocols::two_asset_direction;
 use crate::traits::exact_out::ExactOut;
 use crate::traits::introspect::Introspect;
 use crate::traits::limits::{LimitedQuote, Limits};
 use crate::traits::pool::Pool;
 use crate::traits::pricing::Pricing;
 
-pub use super::concentrated::{TickData, TickInfo};
+pub use crate::protocols::concentrated::{TickData, TickInfo};
 
 /// A Uniswap V3 concentrated-liquidity pool over two assets.
 ///
@@ -161,10 +161,8 @@ impl Limits for UniswapV3Pool {
 mod tests {
     use super::*;
     use crate::primitives::ratio::Ratio;
-    use crate::protocols::uniswap::concentrated::fixtures::{
-        SQRT_1_1, dai, full_range_ticks, usdc, weth,
-    };
-    use crate::protocols::uniswap::concentrated::set_tick_bit;
+    use crate::protocols::concentrated::fixtures::{SQRT_1_1, dai, full_range_ticks, usdc, weth};
+    use crate::protocols::concentrated::set_tick_bit;
     use std::collections::HashMap;
 
     fn price(base: AssetId, quote: AssetId, n: u64, d: u64) -> Price {
