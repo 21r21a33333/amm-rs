@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Optional alloy-backed on-chain state fetching for amm-core pools."
 
 [dependencies]
-amm-core = { path = "../amm-core", features = ["uniswap-v2"] }
+amm-core = { path = "../amm-core", features = ["uniswap-v2", "aerodrome"] }
 alloy = { version = "2.2.0", features = ["contract", "provider-http"] }
 async-trait = "0.1"
 thiserror = { workspace = true }
