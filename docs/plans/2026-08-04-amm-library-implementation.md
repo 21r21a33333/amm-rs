@@ -16,6 +16,8 @@
 
 - License: `MIT OR Apache-2.0`. Edition 2024. MSRV pinned to the edition-2024 floor.
 - **Prefer tested, popular crates over hand-rolled code** — run a reuse audit before writing bespoke code. `no_std` is NOT a requirement; the crate is plain `std`.
+- **Tests must earn their place** — every committed test exercises real logic, a real branch, or a design invariant (parsing, math, error paths, rounding, object-safety). Never commit a test that only constructs a value and asserts a getter/field/enum returns it, or that basic arithmetic sums — those test the language/stdlib, not our code. Object-safety is guarded by a compile-time `const _: fn(&dyn Pool) = ...` assertion, not a runtime fake-pool test.
+- **Multi-asset pools:** the output asset is the `to: &AssetId` argument; the input is `amount_in.asset`. N-asset adapters (Curve/Balancer) store an index-ordered `assets: Vec<AssetId>` and resolve `(amount_in.asset → i, to → j)` before calling `get_amount_out(i, j, dx)` — mirroring arb-router's `quote_n_asset`.
 - Trait boundary is wei-exact `U256` raw amounts wrapped in `AssetAmount`; prices are exact-rational `Ratio`; NO `f64` anywhere in public signatures.
 - Core `Pool` trait MUST stay object-safe (no generics, no `async fn` on it) so `Box<dyn Pool>` works.
 - All fallible math returns `Result<_, QuoteError>`; `QuoteError` is math-only and MUST NOT reference I/O. I/O errors are `RpcError` in `amm-rpc`.

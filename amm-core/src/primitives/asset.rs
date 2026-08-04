@@ -195,14 +195,6 @@ mod tests {
     }
 
     #[test]
-    fn asset_amount_try_add_same_asset_sums() {
-        let a = asset(1, 0xaa);
-        let x = AssetAmount::new(a, U256::from(10u64));
-        let y = AssetAmount::new(a, U256::from(5u64));
-        assert_eq!(x.try_add(y).unwrap().raw, U256::from(15u64));
-    }
-
-    #[test]
     fn from_decimal_scales_by_decimals() {
         let amt = AssetAmount::from_decimal(asset(1, 0xaa), 6, "1.5").unwrap();
         assert_eq!(amt.raw, U256::from(1_500_000u64));

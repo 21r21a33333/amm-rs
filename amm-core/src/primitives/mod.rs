@@ -3,5 +3,6 @@
 //! are `Copy`.
 
 pub mod asset;
+pub mod pool;
 pub mod price;
 pub mod ratio;
