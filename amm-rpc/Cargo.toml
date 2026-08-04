@@ -13,6 +13,15 @@ alloy = { version = "2.2.0", features = ["contract", "provider-http"] }
 async-trait = "0.1"
 thiserror = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# Reused for the on-chain-state -> curve_math::Pool build (all 12 Curve variants);
+# same BSL-1.1 repo as curve-math, so the curve_math::Pool types unify. Opt-in
+# (BSL license), mirroring amm-core's `curve` feature.
+curve-adapter = { git = "https://github.com/sunce86/curve-math", version = "0.1.0-alpha.2", optional = true }
+
+[features]
+# On-chain state fetching for Curve pools. Pulls curve-adapter + amm-core/curve
+# (BSL-1.1); off by default so the crate stays MIT/Apache unless opted in.
+curve = ["dep:curve-adapter", "amm-core/curve"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -2,4 +2,6 @@
 //! AMM family's state into quotable `amm-core` pools.
 
 pub mod aerodrome;
+#[cfg(feature = "curve")]
+pub mod curve;
 pub mod uniswap_v2;
