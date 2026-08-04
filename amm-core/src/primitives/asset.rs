@@ -4,10 +4,10 @@
 //! address slot. Decimals are metadata ([`TokenMeta`]), deliberately *not* part
 //! of identity — an `AssetId` can be built without first fetching metadata.
 
-use alloc::string::String;
 use core::fmt;
 use core::str::FromStr;
 
+use alloy_primitives::utils::{ParseUnits, format_units, parse_units};
 use alloy_primitives::{B256, U256};
 
 use crate::error::{ParseError, QuoteError};
@@ -84,42 +84,52 @@ impl AssetAmount {
     }
 
     /// Parse a human decimal string (e.g. `"1.5"`) into a raw amount using
-    /// `decimals`. Rejects more fractional digits than `decimals`.
+    /// `decimals`. Delegates to alloy's `parse_units`; rejects negatives and
+    /// more fractional digits than `decimals`.
     pub fn from_decimal(asset: AssetId, decimals: u8, s: &str) -> Result<Self, ParseError> {
-        let s = s.trim();
-        let (int_part, frac_part) = s.split_once('.').unwrap_or((s, ""));
-        if (int_part.is_empty() && frac_part.is_empty())
-            || frac_part.len() > decimals as usize
-            || !int_part.bytes().all(|b| b.is_ascii_digit())
-            || !frac_part.bytes().all(|b| b.is_ascii_digit())
-        {
-            return Err(ParseError::Decimal);
+        // alloy's parse_units silently truncates extra fractional digits; reject
+        // that here so a wei-exact library never loses precision quietly.
+        if let Some((_, frac)) = s.split_once('.') {
+            if frac.len() > decimals as usize {
+                return Err(ParseError::Decimal);
+            }
         }
-        let scale = pow10(decimals as u32)?;
-        let int_val = parse_u256(if int_part.is_empty() { "0" } else { int_part })?;
-        let mut raw = int_val.checked_mul(scale).ok_or(ParseError::Overflow)?;
-        if !frac_part.is_empty() {
-            let frac_val = parse_u256(frac_part)?;
-            let pad = pow10(decimals as u32 - frac_part.len() as u32)?;
-            let scaled = frac_val.checked_mul(pad).ok_or(ParseError::Overflow)?;
-            raw = raw.checked_add(scaled).ok_or(ParseError::Overflow)?;
+        match parse_units(s, decimals).map_err(|_| ParseError::Decimal)? {
+            ParseUnits::U256(raw) => Ok(Self { asset, raw }),
+            ParseUnits::I256(_) => Err(ParseError::Decimal), // negative amounts are invalid
         }
-        Ok(Self { asset, raw })
+    }
+
+    /// Render as a human decimal string using `decimals` (alloy's `format_units`).
+    pub fn to_decimal_string(&self, decimals: u8) -> Result<String, ParseError> {
+        format_units(self.raw, decimals).map_err(|_| ParseError::Decimal)
     }
 
     /// Add two amounts of the *same* asset. `Err(AssetMismatch)` otherwise.
     pub fn try_add(self, other: Self) -> Result<Self, QuoteError> {
         self.same_asset(&other)?;
-        let raw = self.raw.checked_add(other.raw).ok_or(QuoteError::Overflow)?;
-        Ok(Self { asset: self.asset, raw })
+        let raw = self
+            .raw
+            .checked_add(other.raw)
+            .ok_or(QuoteError::Overflow)?;
+        Ok(Self {
+            asset: self.asset,
+            raw,
+        })
     }
 
     /// Subtract two amounts of the *same* asset. `Err(AssetMismatch)` on a
     /// different asset, `Err(Overflow)` on underflow.
     pub fn try_sub(self, other: Self) -> Result<Self, QuoteError> {
         self.same_asset(&other)?;
-        let raw = self.raw.checked_sub(other.raw).ok_or(QuoteError::Overflow)?;
-        Ok(Self { asset: self.asset, raw })
+        let raw = self
+            .raw
+            .checked_sub(other.raw)
+            .ok_or(QuoteError::Overflow)?;
+        Ok(Self {
+            asset: self.asset,
+            raw,
+        })
     }
 
     fn same_asset(&self, other: &Self) -> Result<(), QuoteError> {
@@ -141,14 +151,6 @@ pub struct TokenMeta {
     pub decimals: u8,
     /// Human ticker symbol.
     pub symbol: String,
-}
-
-fn parse_u256(s: &str) -> Result<U256, ParseError> {
-    s.parse::<U256>().map_err(|_| ParseError::Decimal)
-}
-
-fn pow10(exp: u32) -> Result<U256, ParseError> {
-    U256::from(10u64).checked_pow(U256::from(exp)).ok_or(ParseError::Overflow)
 }
 
 #[cfg(test)]
@@ -186,7 +188,10 @@ mod tests {
     fn asset_amount_try_add_rejects_mismatch() {
         let x = AssetAmount::new(asset(1, 0xaa), U256::from(1u64));
         let y = AssetAmount::new(asset(1, 0xbb), U256::from(1u64));
-        assert!(matches!(x.try_add(y), Err(QuoteError::AssetMismatch { .. })));
+        assert!(matches!(
+            x.try_add(y),
+            Err(QuoteError::AssetMismatch { .. })
+        ));
     }
 
     #[test]
@@ -206,5 +211,13 @@ mod tests {
     #[test]
     fn from_decimal_rejects_too_many_fractional_digits() {
         assert!(AssetAmount::from_decimal(asset(1, 0xaa), 2, "1.234").is_err());
+    }
+
+    #[test]
+    fn decimal_string_roundtrips() {
+        let a = asset(1, 0xaa);
+        let amt = AssetAmount::new(a, U256::from(1_500_000u64));
+        let s = amt.to_decimal_string(6).unwrap();
+        assert_eq!(AssetAmount::from_decimal(a, 6, &s).unwrap(), amt);
     }
 }

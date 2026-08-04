@@ -9,14 +9,18 @@ description = "Wei-exact, no_std-capable AMM quoting primitives and traits behin
 
 [dependencies]
 alloy-primitives = { workspace = true }
-thiserror = { workspace = true }   # no_std-compatible (2.0 core::error::Error); always on
-serde = { version = "1", features = ["derive"], optional = true, default-features = false }
-uniswap_v3_math = { version = "0.6", default-features = false, optional = true }
+num-bigint = "0.4"
+num-rational = { version = "0.4", features = ["num-bigint"] }
+num-traits = "0.2"
+thiserror = { workspace = true }
+serde = { version = "1", features = ["derive"], optional = true }
+uniswap_v3_math = { version = "0.6", optional = true }
+# Curve math is BSL-1.1 (free for research/testing/audit; commercial use needs a
+# paid license). Only the opt-in `curve` feature pulls it; the core stays MIT/Apache.
 curve-math = { git = "https://github.com/sunce86/curve-math", features = ["swap"], optional = true }
 
 [features]
-default = ["std"]
-std = ["alloy-primitives/std"]
+default = []
 serde = ["dep:serde", "alloy-primitives/serde"]
 uniswap-v2 = []
 uniswap-v3 = ["dep:uniswap_v3_math"]
@@ -26,6 +30,7 @@ aerodrome = ["dep:uniswap_v3_math"]
 
 [dev-dependencies]
 proptest = "1"
+rstest = "0.26"
 
 [lints]
 workspace = true

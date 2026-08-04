@@ -9,8 +9,8 @@ rust-version = "1.85"
 repository = "https://github.com/21r21a33333/amm-rs"
 
 [workspace.dependencies]
-alloy-primitives = { version = "1", default-features = false }
-thiserror = { version = "2", default-features = false }   # 2.0 impls core::error::Error → no_std
+alloy-primitives = "1"
+thiserror = "2"
 
 [workspace.lints.rust]
 missing_docs = "warn"

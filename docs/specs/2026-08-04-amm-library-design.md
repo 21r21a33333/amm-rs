@@ -51,6 +51,8 @@
 
 ### 2a. Post-research refinements (2026-08-04 revalidation)
 
+> **Superseded 2026-08-04:** `no_std` was subsequently **dropped** — `amm-core` is plain `std` (see the plan's *Phase-2 update*). Every `no_std`/`--no-default-features` reference in this spec is obsolete. `Ratio` uses `num_rational::BigRational`; `amm-rpc` uses alloy's native multicall (no hand-rolled provider/multicall/retry).
+
 Applied after re-auditing the plan against the SDK/ecosystem research and alloy/serde/tokio idioms:
 
 - **R1 — one canonical core error.** `QuoteError` is the single `amm-core` math error (covers quote + price + ratio); `amm-rpc::RpcError` wraps it via `#[from]`. No scattered per-op errors.
@@ -337,6 +339,6 @@ This is arb-router's `Exchange` trait re-homed to the I/O crate with a clearer n
 ## 15. Open items to refine during planning
 
 - **Fixed-point module home/name:** V3/V4 tick math is reused from `uniswap_v3_math`; if any *shared* fixed-point helpers emerge, they get a precisely-named module (candidate `fixed_point/`) rather than living loose. To confirm when detailing protocols.
-- **`Ratio` internal width:** RESOLVED (2026-08-04 audit) — store `U512` num/den, because a Uniswap V3 price `sqrtPriceX96²/2¹⁹²` reaches ~2³²¹ and overflows `U256`. Cross-multiply/apply use `U1024` scratch; `apply` returns `None` if the result exceeds `U256`. Only `spot_price` builds the wide `Ratio`; `quote()` stays on fixed-point tick math.
+- **`Ratio` representation:** RESOLVED — `Ratio` wraps `num_rational::BigRational` (arbitrary precision), which exactly represents a Uniswap V3 price (`sqrtPriceX96²/2¹⁹²` ~2³²¹, beyond `U256`) with no width-juggling, and — verified — still compiles `no_std + alloc`. Supersedes the earlier hand-rolled `U512` plan. Only `spot_price` builds the `Ratio`; `quote()` stays on fixed-point tick math.
 - **`PoolKind` variant list:** finalize the exact set when the v1 protocols are implemented (`#[non_exhaustive]` protects semver either way).
 - **Pool-families research:** a background survey may refine v2/v3 priorities and per-family difficulty; does not affect v1.

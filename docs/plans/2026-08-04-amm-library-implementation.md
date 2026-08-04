@@ -15,7 +15,7 @@
 ## Global Constraints
 
 - License: `MIT OR Apache-2.0`. Edition 2024. MSRV pinned to the edition-2024 floor.
-- `amm-core` MUST compile under `--no-default-features` (`no_std + alloc`); CI enforces this.
+- **Prefer tested, popular crates over hand-rolled code** — run a reuse audit before writing bespoke code. `no_std` is NOT a requirement; the crate is plain `std`.
 - Trait boundary is wei-exact `U256` raw amounts wrapped in `AssetAmount`; prices are exact-rational `Ratio`; NO `f64` anywhere in public signatures.
 - Core `Pool` trait MUST stay object-safe (no generics, no `async fn` on it) so `Box<dyn Pool>` works.
 - All fallible math returns `Result<_, QuoteError>`; `QuoteError` is math-only and MUST NOT reference I/O. I/O errors are `RpcError` in `amm-rpc`.
@@ -159,7 +159,7 @@ git add -A && git commit -m "chore: scaffold amm-rs workspace (amm-core no_std +
 - Create: `amm-core/src/primitives/asset.rs`
 
 **Interfaces:**
-- Produces: `ChainId(u64)` (`Copy`); `AssetId { chain: ChainId, token: B256 }` (`Copy, Hash, Ord`; `FromStr`/`Display` for `"chainid:0xaddr"`); `AssetAmount { asset: AssetId, raw: U256 }` (`Copy`; `new(asset, raw)`, `from_decimal(asset, decimals, &str)`, `checked_add`/`checked_sub -> Result<Self, QuoteError>`); `TokenMeta { decimals: u8, symbol: String }`. No `Pair`.
+- Produces: `ChainId(u64)` (`Copy`); `AssetId { chain: ChainId, token: B256 }` (`Copy, Hash, Ord`; `FromStr`/`Display` for `"chainid:0xaddr"`); `AssetAmount { asset: AssetId, raw: U256 }` (`Copy`; `new(asset, raw)`, `from_decimal`/`to_decimal_string` via alloy `parse_units`/`format_units`, `try_add`/`try_sub -> Result<Self, QuoteError>`); `TokenMeta { decimals: u8, symbol: String }`. No `Pair`.
 
 - [ ] **Step 1: Write failing tests**
 
@@ -603,7 +603,7 @@ fn compound_two_legs_50bps_floors_to_99() {
 Applied after auditing every task against the SDK research (Uniswap/Balancer/Curve, amms-rs) and semantic Rust principles. **These supersede the task bodies where they conflict.**
 
 - **C1 (T0, T5) — thiserror 2 is `no_std`.** thiserror 2.0 impls `core::error::Error` (Rust ≥1.81), so derive it unconditionally with `default-features = false`; DELETE the `#[cfg(not(feature="std"))]` manual `Display`. `thiserror` is a normal (non-optional) dep of `amm-core`, not gated behind `std`. *(Cargo files already fixed.)*
-- **C2 (T2, T11) — `Ratio` is `U512`-backed [correctness].** A Uniswap V3 price is `sqrtPriceX96²/2¹⁹²`; `sqrtPriceX96²` reaches ~2³²¹, exceeding `U256`. Store `Ratio { num: U512, den: U512 }` (reduced); constructors `new(U256,U256)`, `from_parts(U512,U512)`, and `from_q192_sqrt(sqrt_price_x96: U256)` for V3. `cmp`/`checked_mul`/`apply` use `U1024` scratch (`ruint::Uint<1024,16>`); `apply -> Option<U256>` returns `None` if the result exceeds `U256`. `quote()` stays on `uniswap_v3_math` fixed-point (fast); only `spot_price` builds the wide `Ratio`.
+- **C2 (T2, T11) — V3 prices exceed `U256` [correctness]. → SUPERSEDED by C18.** The problem stands (a V3 price `sqrtPriceX96²/2¹⁹²` reaches ~2³²¹); the resolution changed from a hand-rolled `U512` `Ratio` to `num_rational::BigRational` (arbitrary precision, no overflow). `from_q192_sqrt(sqrt_price_x96)` is now infallible. `quote()` still stays on `uniswap_v3_math` fixed-point; only `spot_price` builds the `Ratio`.
 - **C3 (T2) — `Ratio` implements `Ord`/`PartialOrd`, not a bare `cmp` method**; rename `mul` → `checked_mul(self, Ratio) -> Option<Ratio>` (no panicking `Mul`).
 - **C4 (T6) — `Pool::id(&self) -> &PoolId`** (borrow, don't clone a `String` per call).
 - **C5 (T7) — typed `Bps` in returns:** `Pricing::price_impact(&self, amount_in, to) -> Result<Bps, QuoteError>` (renamed from `price_impact_bps`); `Introspect::fee_bps(&self, ...) -> Option<Bps>`.
@@ -618,3 +618,22 @@ Applied after auditing every task against the SDK research (Uniswap/Balancer/Cur
 - **C14 (T4) — optional:** align `PoolKey.address → B256`; reconsider `PoolId`/`ExchangeId` cheapness later. Kept `String` for v1 (lookup/display key, not hot-path). Non-blocking.
 - **C15 (T8) — `Slippage::from_percent`** constructor for Balancer parity (alongside `from_bps`).
 - **C16 (T15) — `RpcError` has `#[from] QuoteError`** so a core-math failure during decode propagates cleanly.
+
+## Reuse audit (2026-08-04 — replace hand-rolled code with crates)
+
+Prefer well-tested crates over bespoke code ([[reuse-garden-rs-components]]); keep the code readable and small.
+
+- **C17 (T1) — decimals via alloy `utils`.** `AssetAmount::from_decimal` delegates to `alloy_primitives::utils::parse_units` (plus a 2-line guard rejecting excess fractional digits, since alloy silently truncates them); `to_decimal_string(decimals)` uses `format_units`. Deleted the hand-rolled `pow10`/`parse_u256`/manual split — and this supplies the decimal display previously deferred from Task 3. **(applied)**
+- Already reusing: `thiserror` (errors), `alloy_primitives::hex` + `B256::left_padding_from` (AssetId parse), `uniswap_v3_math` + `curve-math` (swap math), `ruint` via alloy (`U256`/`U512`/`U1024`).
+- **C18 — `Ratio` → `num-rational` (applied; supersedes C2).** Switched the hand-rolled `U512`/`U1024` rational to `num_rational::BigRational`, dropping the direct `ruint` dep and all width-juggling (~140 → ~80 lines). Correction to my earlier claim: `num-bigint`/`num-rational` 0.4 **do** support `no_std + alloc` — verified `cargo build -p amm-core --no-default-features` passes — so the `no_std` core is preserved. Reduction, comparison, and rounding are now the crate's.
+- Not worth replacing: `ChainId`/`Bps`/`Rounding`/`PoolKind`/`TokenMeta` are trivial newtypes/enums; a crate would add a dependency without reducing meaningful code.
+
+## Phase-2 update (2026-08-04 — library research + no_std removal)
+
+After a second crate-research pass (grounded in crates.io maturity) and the directive to drop `no_std` and maximize reuse. **Supersedes conflicting earlier text.**
+
+- **C19 — `no_std` DROPPED.** `amm-core` is plain `std`. Removed the `#![no_std]` attr, the `std`/`no_std` feature gating, and the no_std CI job; deps use default (std) features. **(applied)**
+- **C20 — `amm-rpc` uses alloy's NATIVE multicall (supersedes T15/T16 plumbing).** Use alloy 2.3 `provider.multicall()` (`MulticallBuilder`) with `.block(BlockId)` for pinned, failure-tolerant (`aggregate3`/`try_aggregate`) batched reads, plus optional `CallBatchLayer`. **Delete the planned hand-rolled `provider.rs`/`multicall.rs`/`retry.rs`.** Skip `alloy-multicall`/`ethcontract` (stale). `amm-rpc/src/` becomes `source.rs` (StateSource + RpcError) + per-protocol `protocols/*` decoders only.
+- **C21 — testing stack.** `proptest` (invariants) + `rstest` (golden-vector tables) + **recorded pinned-block fixtures** as the primary wei-exact differential vs the contract's own `QuoterV2`/`get_dy`, with **alloy-Anvil fork tests** as a feature-gated secondary. Added `rstest` dev-dep. **(applied to Cargo)**
+- **C22 — Curve via opt-in `curve` feature.** `curve-math` (BSL-1.1) is pulled ONLY by the `curve` feature; the core stays MIT/Apache; the license is documented at the dep and (to add) in the README. **(applied to Cargo)**
+- **C23 — keeps confirmed by research.** `num-rational`/`num-bigint` (rug/malachite are LGPL, dashu pre-1.0), alloy `parse_units`/`format_units` (rust_decimal too small at 28 digits), first-party thin primitives (uniswap-sdk-core breaks object-safety + pulls fastnum), `uniswap_v3_math` (V3), `proptest`. **V4** = `uniswap_v3_math` tick engine + thin hand-rolled fee wrapper (avoids uniswap-v4-sdk's entity model). **Hand-roll** (no maintained crate): V2 (trivial), Aerodrome/Solidly, Algebra, Trader Joe LB, Balancer-V2.
