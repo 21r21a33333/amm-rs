@@ -3,8 +3,7 @@
 //!
 //! A reverting pool read surfaces as `success = false` for that call rather than
 //! failing the whole batch — so one bad pool in a refresh does not sink the rest.
-//! Modeled on garden-rs's `Multicall` (a `Call`/`Result` batch) but read-only and
-//! block-pinned, which is all state fetching needs.
+//! It is read-only and block-pinned, which is all state fetching needs.
 
 use alloy::eips::BlockId;
 use alloy::primitives::{Address, Bytes, address};

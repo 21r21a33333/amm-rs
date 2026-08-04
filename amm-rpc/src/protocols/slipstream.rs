@@ -27,7 +27,7 @@ use amm_core::traits::pool::Pool;
 
 use crate::error::RpcError;
 use crate::multicall::{self, Call, CallResult};
-use crate::source::StateSource;
+use crate::source::{StateSource, pool_id};
 
 /// How many tick-spacings each side of the active tick to fetch (as V3).
 const TICK_WINDOW: i32 = 50;
@@ -97,12 +97,7 @@ fn decode_state(key: &PoolKey, results: &[CallResult]) -> Option<PoolState> {
     Some(PoolState {
         address,
         assets,
-        id: PoolId::new(&format!(
-            "{}:{}:{}",
-            key.chain.0,
-            key.exchange.as_str(),
-            key.address
-        )),
+        id: pool_id(key),
         sqrt_price_x96: U256::from(slot0.sqrtPriceX96),
         tick: slot0.tick.as_i32(),
         liquidity,

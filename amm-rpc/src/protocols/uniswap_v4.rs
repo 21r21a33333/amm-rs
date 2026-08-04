@@ -37,7 +37,7 @@ use amm_core::traits::pool::Pool;
 
 use crate::error::RpcError;
 use crate::multicall::{self, Call, CallResult};
-use crate::source::StateSource;
+use crate::source::{StateSource, pool_id};
 
 sol! {
     /// The five fields whose `abi.encode` hashes to a V4 `pool_id`.
@@ -162,12 +162,7 @@ impl<P: Provider> UniswapV4Source<P> {
                 _ => continue,
             };
             plans.push(PoolPlan {
-                id: PoolId::new(&format!(
-                    "{}:{}:{}",
-                    key.chain.0,
-                    key.exchange.as_str(),
-                    key.address
-                )),
+                id: pool_id(key),
                 pool_id: config.pool_id,
                 assets,
                 tick_spacing: config.tick_spacing,

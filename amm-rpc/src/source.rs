@@ -3,10 +3,21 @@
 
 use alloy::eips::BlockId;
 use amm_core::primitives::asset::{AssetId, ChainId};
-use amm_core::primitives::pool::PoolKey;
+use amm_core::primitives::pool::{PoolId, PoolKey};
 use amm_core::traits::pool::Pool;
 
 use crate::error::RpcError;
+
+/// The canonical identity for a fetched pool: `chain:exchange:address`. Shared by
+/// every source so the id format lives in one place.
+pub(crate) fn pool_id(key: &PoolKey) -> PoolId {
+    PoolId::new(&format!(
+        "{}:{}:{}",
+        key.chain.0,
+        key.exchange.as_str(),
+        key.address
+    ))
+}
 
 /// A source of on-chain pool state.
 ///

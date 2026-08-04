@@ -12,14 +12,14 @@ use alloy::providers::Provider;
 use alloy::sol;
 use alloy::sol_types::SolCall;
 use amm_core::primitives::asset::AssetId;
-use amm_core::primitives::pool::{PoolId, PoolKey};
+use amm_core::primitives::pool::PoolKey;
 use amm_core::protocols::aerodrome::stable::AerodromeStablePool;
 use amm_core::protocols::aerodrome::volatile::AerodromeVolatilePool;
 use amm_core::traits::pool::Pool;
 
 use crate::error::RpcError;
 use crate::multicall::{self, Call, CallResult};
-use crate::source::StateSource;
+use crate::source::{StateSource, pool_id};
 
 /// The number of calls batched per pool (see the module docs).
 const CALLS_PER_POOL: usize = 6;
@@ -134,12 +134,7 @@ fn build_pool(key: &PoolKey, state: &PoolState) -> Option<Box<dyn Pool>> {
         [a, b] => [*a, *b],
         _ => return None,
     };
-    let id = PoolId::new(&format!(
-        "{}:{}:{}",
-        key.chain.0,
-        key.exchange.as_str(),
-        key.address
-    ));
+    let id = pool_id(key);
     let reserves = [state.reserve0, state.reserve1];
     match state.stable {
         true => Some(Box::new(AerodromeStablePool::new(
