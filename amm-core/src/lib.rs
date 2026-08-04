@@ -10,5 +10,6 @@
 pub mod error;
 pub mod path;
 pub mod primitives;
+pub mod protocols;
 pub mod slippage;
 pub mod traits;
