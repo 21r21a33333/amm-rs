@@ -7,6 +7,7 @@
 //! construct the `amm-core` pool structs directly.
 
 pub mod error;
+pub mod protocols;
 pub mod provider;
 pub mod retry;
 pub mod source;
