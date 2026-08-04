@@ -56,6 +56,17 @@ impl Ratio {
         Ratio(BigRational::new(num, den))
     }
 
+    /// The Uniswap V3 sqrt price whose square is this ratio:
+    /// `floor(sqrt(self · 2¹⁹²))`. The exact inverse of [`Ratio::from_q192_sqrt`]
+    /// for perfect squares, flooring otherwise. `None` only if the result exceeds
+    /// `U256` (unreachable for any in-range price).
+    pub fn to_q192_sqrt(&self) -> Option<U256> {
+        // sqrtPriceX96 = floor( sqrt( numer · 2¹⁹² / denom ) ). numer ≥ 0 and
+        // denom > 0 (a non-negative reduced rational), so the root is well-defined.
+        let shifted = (self.0.numer().clone() << 192usize) / self.0.denom().clone();
+        from_bigint(&shifted.sqrt())
+    }
+
     /// The reciprocal. `None` if the ratio is zero.
     pub fn invert(self) -> Option<Ratio> {
         match self.0.is_zero() {
@@ -166,6 +177,25 @@ mod tests {
         // sqrtP = 2^96 → price = (2^96)^2 / 2^192 = 1
         let sqrt = U256::from(1u64) << 96;
         assert_eq!(Ratio::from_q192_sqrt(sqrt), r(1, 1));
+    }
+
+    #[test]
+    fn to_q192_sqrt_inverts_from_q192_sqrt_on_perfect_squares() {
+        let two_96 = U256::from(1u64) << 96; // sqrtP for price 1
+        assert_eq!(Ratio::from_q192_sqrt(two_96).to_q192_sqrt(), Some(two_96));
+        let two_97 = U256::from(1u64) << 97; // sqrtP for price 4
+        assert_eq!(r(4, 1).to_q192_sqrt(), Some(two_97));
+        assert_eq!(Ratio::from_q192_sqrt(two_97), r(4, 1));
+    }
+
+    #[test]
+    fn to_q192_sqrt_is_the_floor_of_the_exact_root() {
+        // price 2 has an irrational sqrt; `sp` must be the largest value whose
+        // square (as a price) does not exceed 2.
+        let two = r(2, 1);
+        let sp = two.to_q192_sqrt().unwrap();
+        assert!(Ratio::from_q192_sqrt(sp) <= two);
+        assert!(Ratio::from_q192_sqrt(sp + U256::from(1u64)) > two);
     }
 
     #[test]

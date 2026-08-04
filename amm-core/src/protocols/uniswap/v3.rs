@@ -18,6 +18,7 @@ use crate::primitives::price::Price;
 use crate::primitives::ratio::{Bps, Ratio};
 use crate::traits::exact_out::ExactOut;
 use crate::traits::introspect::Introspect;
+use crate::traits::limits::{LimitedQuote, Limits};
 use crate::traits::pool::Pool;
 use crate::traits::pricing::Pricing;
 
@@ -239,6 +240,45 @@ impl UniswapV3Pool {
             output: *to,
         })
     }
+
+    /// Convert a caller `Price` bound into a `sqrtPriceX96`, in the pool's
+    /// `token1/token0` orientation, clamped into the valid engine range.
+    ///
+    /// Accepts the limit in either orientation. `Err(AssetNotInPool)` if the
+    /// price is about assets this pool does not trade.
+    fn clamped_sqrt_limit(&self, limit: &Price) -> Result<U256, QuoteError> {
+        let (token0, token1) = (self.assets[0], self.assets[1]);
+        let ratio_10 = match (
+            limit.base() == token0 && limit.quote() == token1,
+            limit.base() == token1 && limit.quote() == token0,
+        ) {
+            (true, _) => limit.ratio().clone(),
+            (_, true) => limit
+                .ratio()
+                .clone()
+                .invert()
+                .ok_or(QuoteError::InsufficientLiquidity)?,
+            _ => {
+                return Err(QuoteError::AssetNotInPool {
+                    input: limit.base(),
+                    output: limit.quote(),
+                });
+            }
+        };
+        let raw = ratio_10.to_q192_sqrt().ok_or(QuoteError::Overflow)?;
+        let lo = uniswap_v3_math::tick_math::MIN_SQRT_RATIO + U256::from(1u64);
+        let hi = uniswap_v3_math::tick_math::MAX_SQRT_RATIO - U256::from(1u64);
+        Ok(raw.clamp(lo, hi))
+    }
+
+    /// Whether the price is already at or past `sqrt_limit` for this direction,
+    /// so no swap toward it is possible.
+    fn limit_already_reached(&self, zero_for_one: bool, sqrt_limit: U256) -> bool {
+        match zero_for_one {
+            true => sqrt_limit >= self.sqrt_price_x96, // price falls; limit is below
+            false => sqrt_limit <= self.sqrt_price_x96, // price rises; limit is above
+        }
+    }
 }
 
 /// The extreme sqrt price a full-range swap runs toward (one unit inside the
@@ -367,6 +407,47 @@ impl Introspect for UniswapV3Pool {
 
     fn kind(&self) -> PoolKind {
         PoolKind::UniswapV3
+    }
+}
+
+impl Limits for UniswapV3Pool {
+    fn max_amount_in(&self, from: &AssetId, to: &AssetId) -> Option<AssetAmount> {
+        let zero_for_one = two_asset_direction(&self.assets, from, to)?;
+        // I256::MAX exceeds any pool's absorbable input, so the swap halts at the
+        // price extreme; the consumed input is the bound. `compute_swap_step`'s
+        // internal `mul_div` is 512-bit, so I256::MAX cannot overflow it.
+        let outcome = self
+            .simulate(zero_for_one, I256::MAX, price_limit(zero_for_one))
+            .ok()?;
+        Some(AssetAmount::new(*from, outcome.amount_in))
+    }
+
+    fn quote_with_limit(
+        &self,
+        amount_in: &AssetAmount,
+        to: &AssetId,
+        limit: Price,
+    ) -> Result<LimitedQuote, QuoteError> {
+        let zero_for_one = self.direction(&amount_in.asset, to)?;
+        let spec = I256::from_raw(amount_in.raw);
+        if spec < I256::ZERO {
+            return Err(QuoteError::Overflow);
+        }
+        let sqrt_limit = self.clamped_sqrt_limit(&limit)?;
+        // If the price is already past the bound, nothing swaps toward it.
+        let outcome = match self.limit_already_reached(zero_for_one, sqrt_limit) {
+            true => SwapOutcome {
+                amount_in: U256::ZERO,
+                amount_out: U256::ZERO,
+                limited: true,
+            },
+            false => self.simulate(zero_for_one, spec, sqrt_limit)?,
+        };
+        Ok(LimitedQuote {
+            amount_in: AssetAmount::new(amount_in.asset, outcome.amount_in),
+            amount_out: AssetAmount::new(*to, outcome.amount_out),
+            limited: outcome.limited,
+        })
     }
 }
 
@@ -630,5 +711,88 @@ mod tests {
         assert_eq!(step_target(true, lo, hi), hi);
         // one_for_zero: price rises, limit is a ceiling → clamp DOWN (min)
         assert_eq!(step_target(false, lo, hi), lo);
+    }
+
+    // ── Limits (price-bounded quotes) ─────────────────────────────────────────
+
+    fn price(base: AssetId, quote: AssetId, n: u64, d: u64) -> Price {
+        Price::new(
+            base,
+            quote,
+            Ratio::new(U256::from(n), U256::from(d)).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn quote_with_limit_far_limit_fills_fully_like_a_plain_quote() {
+        // A permissive limit (price may fall far below current 1:1) never binds:
+        // the whole input is consumed and the output equals the unbounded quote.
+        let pool = full_range_pool();
+        let req = U256::from(1_000_000_000u64);
+        let far = price(usdc(), weth(), 1, 1_000_000);
+        let q = pool
+            .quote_with_limit(&AssetAmount::new(usdc(), req), &weth(), far)
+            .unwrap();
+        assert!(!q.limited);
+        assert_eq!(q.amount_in.raw, req);
+        let plain = pool.quote(&AssetAmount::new(usdc(), req), &weth()).unwrap();
+        assert_eq!(q.amount_out.raw, plain.raw);
+    }
+
+    #[test]
+    fn quote_with_limit_tight_limit_fills_partially() {
+        // A limit just below current price binds before a large input is spent:
+        // a partial fill, consuming some (but not all) input.
+        let pool = full_range_pool();
+        let req = U256::from(100_000_000_000_000_000u64); // 1e17 — would move price ~10%
+        let tight = price(usdc(), weth(), 9999, 10000); // 0.9999, just below 1:1
+        let q = pool
+            .quote_with_limit(&AssetAmount::new(usdc(), req), &weth(), tight)
+            .unwrap();
+        assert!(q.limited);
+        assert!(q.amount_in.raw > U256::ZERO && q.amount_in.raw < req);
+        assert!(q.amount_out.raw > U256::ZERO);
+    }
+
+    #[test]
+    fn quote_with_limit_price_already_past_swaps_nothing() {
+        // For USDC→WETH the price falls; a limit above current is already passed.
+        let pool = full_range_pool();
+        let above = price(usdc(), weth(), 2, 1);
+        let q = pool
+            .quote_with_limit(
+                &AssetAmount::new(usdc(), U256::from(1_000u64)),
+                &weth(),
+                above,
+            )
+            .unwrap();
+        assert!(q.limited);
+        assert_eq!(q.amount_in.raw, U256::ZERO);
+        assert_eq!(q.amount_out.raw, U256::ZERO);
+    }
+
+    #[test]
+    fn quote_with_limit_rejects_a_limit_about_other_assets() {
+        let pool = full_range_pool();
+        let bad = price(dai(), weth(), 1, 1);
+        assert!(matches!(
+            pool.quote_with_limit(
+                &AssetAmount::new(usdc(), U256::from(1_000u64)),
+                &weth(),
+                bad
+            ),
+            Err(QuoteError::AssetNotInPool { .. })
+        ));
+    }
+
+    #[test]
+    fn max_amount_in_is_bounded_and_gated_by_pair() {
+        let pool = full_range_pool();
+        let maxin = pool.max_amount_in(&usdc(), &weth()).unwrap();
+        assert!(maxin.raw > U256::ZERO);
+        assert_eq!(maxin.asset, usdc());
+        // Not the pool's pair → no bound.
+        assert_eq!(pool.max_amount_in(&usdc(), &dai()), None);
     }
 }
