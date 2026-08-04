@@ -8,5 +8,7 @@
 //! Modules are populated task-by-task per the implementation plan.
 
 pub mod error;
+pub mod path;
 pub mod primitives;
+pub mod slippage;
 pub mod traits;
