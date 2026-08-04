@@ -5,4 +5,5 @@
 //! they hold a snapshot of pool state and do no I/O (state fetching lives in the
 //! separate `amm-rpc` crate).
 
+#[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3"))]
 pub mod uniswap;

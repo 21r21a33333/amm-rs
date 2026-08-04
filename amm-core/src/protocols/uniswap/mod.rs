@@ -2,7 +2,10 @@
 //! (concentrated liquidity) land in later tasks and reuse the shared
 //! direction plumbing here.
 
+#[cfg(feature = "uniswap-v2")]
 pub mod v2;
+#[cfg(feature = "uniswap-v3")]
+pub mod v3;
 
 use crate::primitives::asset::AssetId;
 

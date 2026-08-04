@@ -14,7 +14,9 @@ jobs:
           components: rustfmt, clippy
       - name: fmt
         run: cargo fmt --all --check
+      - name: check (default features = empty)
+        run: cargo check --workspace --no-default-features
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: test
-        run: cargo test --workspace
+        run: cargo test --workspace --all-features
