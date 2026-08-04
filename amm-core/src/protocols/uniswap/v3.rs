@@ -1,47 +1,25 @@
 //! Uniswap V3 concentrated-liquidity quoter.
 //!
-//! Tick-crossing Q64.96 arithmetic is delegated to the `uniswap_v3_math` crate;
-//! this module supplies the swap loop, direction handling, and the mapping onto
-//! the core [`Pool`] trait. A single signed engine ([`UniswapV3Pool::simulate`])
-//! serves both exact-in and exact-out: `compute_swap_step` selects the mode from
-//! the sign of the specified amount, so exact-out is just a negative input.
+//! A thin adapter over the shared [`concentrated`](super::concentrated) tick
+//! engine: V3 resolves swap direction and feeds its single fee tier, and the
+//! engine does the Q64.96 tick-crossing math.
 
-use std::collections::HashMap;
+use alloy_primitives::U256;
 
-use alloy_primitives::{I256, U256};
-
+use super::concentrated::{self, SwapState};
 use super::two_asset_direction;
 use crate::error::QuoteError;
 use crate::primitives::asset::{AssetAmount, AssetId};
 use crate::primitives::pool::{PoolId, PoolKind};
 use crate::primitives::price::Price;
-use crate::primitives::ratio::{Bps, Ratio};
+use crate::primitives::ratio::Bps;
 use crate::traits::exact_out::ExactOut;
 use crate::traits::introspect::Introspect;
 use crate::traits::limits::{LimitedQuote, Limits};
 use crate::traits::pool::Pool;
 use crate::traits::pricing::Pricing;
 
-/// Liquidity bookkeeping for a single initialized tick.
-#[derive(Clone, Debug)]
-pub struct TickInfo {
-    /// Net liquidity added when the tick is crossed left-to-right.
-    pub liquidity_net: i128,
-    /// Whether the tick is initialized (carries a position boundary).
-    pub initialized: bool,
-}
-
-/// The tick state a V3 swap traverses: per-tick liquidity, the initialization
-/// bitmap, and the fee-tier tick spacing.
-#[derive(Clone, Debug)]
-pub struct TickData {
-    /// Initialized ticks keyed by tick index.
-    pub ticks: HashMap<i32, TickInfo>,
-    /// Tick-initialization bitmap words keyed by word position.
-    pub bitmap: HashMap<i16, U256>,
-    /// Tick spacing for this fee tier (e.g. 60 for the 0.30% tier).
-    pub spacing: i32,
-}
+pub use super::concentrated::{TickData, TickInfo};
 
 /// A Uniswap V3 concentrated-liquidity pool over two assets.
 ///
@@ -57,24 +35,6 @@ pub struct UniswapV3Pool {
     tick: i32,
     fee_pips: u32,
     tick_data: TickData,
-}
-
-/// The result of running the swap loop.
-struct SwapOutcome {
-    /// Total input consumed (including fees).
-    amount_in: U256,
-    /// Total output produced.
-    amount_out: U256,
-    /// `true` if the price limit was reached before the specified amount was
-    /// fully consumed (a partial fill).
-    limited: bool,
-}
-
-/// The next initialized-tick boundary reached in a step, with its price.
-struct NextTick {
-    tick: i32,
-    price: U256,
-    initialized: bool,
 }
 
 impl UniswapV3Pool {
@@ -99,137 +59,15 @@ impl UniswapV3Pool {
         }
     }
 
-    /// Run the tick-crossing swap loop toward `limit`.
-    ///
-    /// `amount_specified` is signed: positive is exact-in (drains toward zero as
-    /// input is consumed), negative is exact-out (rises toward zero as output is
-    /// produced). `compute_swap_step` picks the mode from that sign.
-    fn simulate(
-        &self,
-        zero_for_one: bool,
-        amount_specified: I256,
-        limit: U256,
-    ) -> Result<SwapOutcome, QuoteError> {
-        // A snapshot with no tick data cannot be priced.
-        if self.tick_data.ticks.is_empty() || self.tick_data.bitmap.is_empty() {
-            return Err(QuoteError::InsufficientLiquidity);
-        }
-
-        let exact_in = amount_specified >= I256::ZERO;
-        let mut remaining = amount_specified;
-        let mut sqrt = self.sqrt_price_x96;
-        let mut tick = self.tick;
-        let mut liquidity = self.liquidity;
-        let mut amount_in = U256::ZERO;
-        let mut amount_out = U256::ZERO;
-
-        while remaining != I256::ZERO && sqrt != limit {
-            let next = self.next_tick(tick, zero_for_one)?;
-            let target = step_target(zero_for_one, next.price, limit);
-
-            let (next_sqrt, step_in, step_out, step_fee) =
-                uniswap_v3_math::swap_math::compute_swap_step(
-                    sqrt,
-                    target,
-                    liquidity,
-                    remaining,
-                    self.fee_pips,
-                )
-                .map_err(|_| QuoteError::Overflow)?;
-
-            amount_in = amount_in
-                .checked_add(step_in)
-                .and_then(|v| v.checked_add(step_fee))
-                .ok_or(QuoteError::Overflow)?;
-            amount_out = amount_out
-                .checked_add(step_out)
-                .ok_or(QuoteError::Overflow)?;
-
-            // Move `remaining` toward zero. Step amounts are bounded by pool
-            // liquidity, so the signed arithmetic cannot genuinely overflow;
-            // `overflowing_*` keeps it panic-free regardless.
-            remaining = match exact_in {
-                true => {
-                    remaining
-                        .overflowing_sub(I256::from_raw(step_in.overflowing_add(step_fee).0))
-                        .0
-                }
-                false => remaining.overflowing_add(I256::from_raw(step_out)).0,
-            };
-
-            let price_start = sqrt;
-            sqrt = next_sqrt;
-            (tick, liquidity) =
-                self.advance_tick(tick, liquidity, zero_for_one, next, price_start, sqrt)?;
-        }
-
-        Ok(SwapOutcome {
-            amount_in,
-            amount_out,
-            limited: remaining != I256::ZERO,
-        })
-    }
-
-    /// Resolve the next initialized-tick boundary from the bitmap (clamped to the
-    /// valid tick range), with its sqrt price.
-    fn next_tick(&self, tick: i32, zero_for_one: bool) -> Result<NextTick, QuoteError> {
-        let (raw, initialized) =
-            uniswap_v3_math::tick_bitmap::next_initialized_tick_within_one_word(
-                &self.tick_data.bitmap,
-                tick,
-                self.tick_data.spacing,
-                zero_for_one,
-            )
-            .map_err(|_| QuoteError::InsufficientLiquidity)?;
-        let tick = raw.clamp(
-            uniswap_v3_math::tick_math::MIN_TICK,
-            uniswap_v3_math::tick_math::MAX_TICK,
-        );
-        let price = uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick(tick)
-            .map_err(|_| QuoteError::Overflow)?;
-        Ok(NextTick {
-            tick,
-            price,
-            initialized,
-        })
-    }
-
-    /// Advance the tick after a step:
-    ///   reached the boundary  → cross it (apply net liquidity) and step the tick;
-    ///   moved but not reached → recompute the tick from the new price;
-    ///   unchanged             → leave it.
-    fn advance_tick(
-        &self,
-        tick: i32,
-        liquidity: u128,
-        zero_for_one: bool,
-        next: NextTick,
-        price_start: U256,
-        sqrt_now: U256,
-    ) -> Result<(i32, u128), QuoteError> {
-        match (sqrt_now == next.price, sqrt_now != price_start) {
-            (true, _) => {
-                let liquidity = match next.initialized {
-                    true => {
-                        let net =
-                            tick_liquidity_net(&self.tick_data.ticks, next.tick, zero_for_one)
-                                .ok_or(QuoteError::InsufficientLiquidity)?;
-                        crossed_liquidity(liquidity, net).ok_or(QuoteError::Overflow)?
-                    }
-                    false => liquidity,
-                };
-                let tick = match zero_for_one {
-                    true => next.tick.wrapping_sub(1),
-                    false => next.tick,
-                };
-                Ok((tick, liquidity))
-            }
-            (false, true) => {
-                let tick = uniswap_v3_math::tick_math::get_tick_at_sqrt_ratio(sqrt_now)
-                    .map_err(|_| QuoteError::Overflow)?;
-                Ok((tick, liquidity))
-            }
-            (false, false) => Ok((tick, liquidity)),
+    /// The market snapshot handed to the shared engine. V3's fee is the same in
+    /// both directions.
+    fn state(&self) -> SwapState<'_> {
+        SwapState {
+            sqrt_price_x96: self.sqrt_price_x96,
+            tick: self.tick,
+            liquidity: self.liquidity,
+            fee_pips: self.fee_pips,
+            ticks: &self.tick_data,
         }
     }
 
@@ -240,92 +78,7 @@ impl UniswapV3Pool {
             output: *to,
         })
     }
-
-    /// Convert a caller `Price` bound into a `sqrtPriceX96`, in the pool's
-    /// `token1/token0` orientation, clamped into the valid engine range.
-    ///
-    /// Accepts the limit in either orientation. `Err(AssetNotInPool)` if the
-    /// price is about assets this pool does not trade.
-    fn clamped_sqrt_limit(&self, limit: &Price) -> Result<U256, QuoteError> {
-        let (token0, token1) = (self.assets[0], self.assets[1]);
-        let ratio_10 = match (
-            limit.base() == token0 && limit.quote() == token1,
-            limit.base() == token1 && limit.quote() == token0,
-        ) {
-            (true, _) => limit.ratio().clone(),
-            (_, true) => limit
-                .ratio()
-                .clone()
-                .invert()
-                .ok_or(QuoteError::InsufficientLiquidity)?,
-            _ => {
-                return Err(QuoteError::AssetNotInPool {
-                    input: limit.base(),
-                    output: limit.quote(),
-                });
-            }
-        };
-        let raw = ratio_10.to_q192_sqrt().ok_or(QuoteError::Overflow)?;
-        let lo = uniswap_v3_math::tick_math::MIN_SQRT_RATIO + U256::from(1u64);
-        let hi = uniswap_v3_math::tick_math::MAX_SQRT_RATIO - U256::from(1u64);
-        Ok(raw.clamp(lo, hi))
-    }
-
-    /// Whether the price is already at or past `sqrt_limit` for this direction,
-    /// so no swap toward it is possible.
-    fn limit_already_reached(&self, zero_for_one: bool, sqrt_limit: U256) -> bool {
-        match zero_for_one {
-            true => sqrt_limit >= self.sqrt_price_x96, // price falls; limit is below
-            false => sqrt_limit <= self.sqrt_price_x96, // price rises; limit is above
-        }
-    }
 }
-
-/// The extreme sqrt price a full-range swap runs toward (one unit inside the
-/// valid range).
-fn price_limit(zero_for_one: bool) -> U256 {
-    match zero_for_one {
-        true => uniswap_v3_math::tick_math::MIN_SQRT_RATIO + U256::from(1u64),
-        false => uniswap_v3_math::tick_math::MAX_SQRT_RATIO - U256::from(1u64),
-    }
-}
-
-/// Target price for one step: the closer of the next tick boundary and the limit.
-/// `zero_for_one` prices fall (clamp up = `max`); otherwise they rise (clamp
-/// down = `min`).
-fn step_target(zero_for_one: bool, next_tick_price: U256, limit: U256) -> U256 {
-    match zero_for_one {
-        true => next_tick_price.max(limit),
-        false => next_tick_price.min(limit),
-    }
-}
-
-/// Net liquidity to apply when crossing `tick`, sign-adjusted for direction.
-///
-/// `None` when the tick is flagged initialized in the bitmap but absent from the
-/// synced tick data: the quote fails rather than silently pricing with zero net
-/// liquidity, which would misprice the swap.
-fn tick_liquidity_net(
-    ticks: &HashMap<i32, TickInfo>,
-    tick: i32,
-    zero_for_one: bool,
-) -> Option<i128> {
-    let net = ticks.get(&tick)?.liquidity_net;
-    Some(match zero_for_one {
-        true => -net,
-        false => net,
-    })
-}
-
-/// Liquidity after crossing an initialized tick — `None` on overflow/underflow.
-fn crossed_liquidity(liquidity: u128, liquidity_net: i128) -> Option<u128> {
-    match liquidity_net.is_negative() {
-        true => liquidity.checked_sub(liquidity_net.unsigned_abs()),
-        false => liquidity.checked_add(liquidity_net as u128),
-    }
-}
-
-// ─── Pool + extension trait impls ───────────────────────────────────────────
 
 impl Pool for UniswapV3Pool {
     fn id(&self) -> &PoolId {
@@ -338,19 +91,8 @@ impl Pool for UniswapV3Pool {
 
     fn quote(&self, amount_in: &AssetAmount, to: &AssetId) -> Result<AssetAmount, QuoteError> {
         let zero_for_one = self.direction(&amount_in.asset, to)?;
-        let spec = I256::from_raw(amount_in.raw);
-        // A U256 with bit 255 set is not a representable positive input.
-        match spec < I256::ZERO {
-            true => Err(QuoteError::Overflow),
-            false => {
-                let outcome = self.simulate(zero_for_one, spec, price_limit(zero_for_one))?;
-                // Nonzero input that yields nothing means the pool is dry.
-                match !amount_in.raw.is_zero() && outcome.amount_out.is_zero() {
-                    true => Err(QuoteError::InsufficientLiquidity),
-                    false => Ok(AssetAmount::new(*to, outcome.amount_out)),
-                }
-            }
-        }
+        let out = concentrated::amount_out(&self.state(), zero_for_one, amount_in.raw)?;
+        Ok(AssetAmount::new(*to, out))
     }
 }
 
@@ -361,35 +103,15 @@ impl ExactOut for UniswapV3Pool {
         from: &AssetId,
     ) -> Result<AssetAmount, QuoteError> {
         let zero_for_one = self.direction(from, &amount_out.asset)?;
-        let mag = I256::from_raw(amount_out.raw);
-        match mag < I256::ZERO {
-            true => Err(QuoteError::Overflow),
-            false => {
-                // Negative specified amount selects the exact-out path.
-                let outcome =
-                    self.simulate(zero_for_one, mag.wrapping_neg(), price_limit(zero_for_one))?;
-                // A partial fill means the pool cannot source the full output.
-                match outcome.limited {
-                    true => Err(QuoteError::InsufficientLiquidity),
-                    false => Ok(AssetAmount::new(*from, outcome.amount_in)),
-                }
-            }
-        }
+        let needed = concentrated::amount_in(&self.state(), zero_for_one, amount_out.raw)?;
+        Ok(AssetAmount::new(*from, needed))
     }
 }
 
 impl Pricing for UniswapV3Pool {
     fn spot_price(&self, base: &AssetId, quote: &AssetId) -> Result<Price, QuoteError> {
         let zero_for_one = self.direction(base, quote)?;
-        // sqrtPriceX96 encodes token1 per token0 = sqrtP² / 2¹⁹².
-        let token1_per_token0 = Ratio::from_q192_sqrt(self.sqrt_price_x96);
-        let ratio = match zero_for_one {
-            true => token1_per_token0,
-            false => token1_per_token0
-                .invert()
-                .ok_or(QuoteError::InsufficientLiquidity)?,
-        };
-        Price::new(*base, *quote, ratio).ok_or(QuoteError::InsufficientLiquidity)
+        concentrated::spot_price(base, quote, self.sqrt_price_x96, zero_for_one)
     }
 }
 
@@ -413,13 +135,8 @@ impl Introspect for UniswapV3Pool {
 impl Limits for UniswapV3Pool {
     fn max_amount_in(&self, from: &AssetId, to: &AssetId) -> Option<AssetAmount> {
         let zero_for_one = two_asset_direction(&self.assets, from, to)?;
-        // I256::MAX exceeds any pool's absorbable input, so the swap halts at the
-        // price extreme; the consumed input is the bound. `compute_swap_step`'s
-        // internal `mul_div` is 512-bit, so I256::MAX cannot overflow it.
-        let outcome = self
-            .simulate(zero_for_one, I256::MAX, price_limit(zero_for_one))
-            .ok()?;
-        Some(AssetAmount::new(*from, outcome.amount_in))
+        concentrated::max_amount_in(&self.state(), zero_for_one)
+            .map(|raw| AssetAmount::new(*from, raw))
     }
 
     fn quote_with_limit(
@@ -429,80 +146,39 @@ impl Limits for UniswapV3Pool {
         limit: Price,
     ) -> Result<LimitedQuote, QuoteError> {
         let zero_for_one = self.direction(&amount_in.asset, to)?;
-        let spec = I256::from_raw(amount_in.raw);
-        if spec < I256::ZERO {
-            return Err(QuoteError::Overflow);
-        }
-        let sqrt_limit = self.clamped_sqrt_limit(&limit)?;
-        // If the price is already past the bound, nothing swaps toward it.
-        let outcome = match self.limit_already_reached(zero_for_one, sqrt_limit) {
-            true => SwapOutcome {
-                amount_in: U256::ZERO,
-                amount_out: U256::ZERO,
-                limited: true,
-            },
-            false => self.simulate(zero_for_one, spec, sqrt_limit)?,
-        };
-        Ok(LimitedQuote {
-            amount_in: AssetAmount::new(amount_in.asset, outcome.amount_in),
-            amount_out: AssetAmount::new(*to, outcome.amount_out),
-            limited: outcome.limited,
-        })
+        concentrated::quote_with_limit(
+            &self.state(),
+            &self.assets,
+            zero_for_one,
+            amount_in,
+            to,
+            &limit,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::primitives::asset::ChainId;
-    use alloy_primitives::B256;
+    use crate::primitives::ratio::Ratio;
+    use crate::protocols::uniswap::concentrated::fixtures::{
+        SQRT_1_1, dai, full_range_ticks, usdc, weth,
+    };
+    use crate::protocols::uniswap::concentrated::set_tick_bit;
+    use std::collections::HashMap;
 
-    fn usdc() -> AssetId {
-        AssetId::new(ChainId(1), B256::left_padding_from(&[0x01]))
-    }
-    fn weth() -> AssetId {
-        AssetId::new(ChainId(1), B256::left_padding_from(&[0x02]))
-    }
-    fn dai() -> AssetId {
-        AssetId::new(ChainId(1), B256::left_padding_from(&[0x03]))
-    }
-
-    /// sqrtPriceX96 for tick 0 (price 1:1) = 2^96.
-    const SQRT_1_1: u128 = 79_228_162_514_264_337_593_543_950_336;
-
-    /// Set the initialization bit for `tick` in a V3 bitmap (test fixture).
-    fn set_bit(bitmap: &mut HashMap<i16, U256>, tick: i32, spacing: i32) {
-        let compressed = match tick < 0 && tick % spacing != 0 {
-            true => (tick / spacing) - 1,
-            false => tick / spacing,
-        };
-        let word = (compressed >> 8) as i16;
-        let bit = (compressed % 256) as u8;
-        *bitmap.entry(word).or_insert(U256::ZERO) |= U256::from(1u64) << bit;
+    fn price(base: AssetId, quote: AssetId, n: u64, d: u64) -> Price {
+        Price::new(
+            base,
+            quote,
+            Ratio::new(U256::from(n), U256::from(d)).unwrap(),
+        )
+        .unwrap()
     }
 
     /// A full-range USDC/WETH pool at tick 0 (1:1), 0.30% fee, 1e18 liquidity.
     fn full_range_pool() -> UniswapV3Pool {
-        let (lower, upper) = (-887_220i32, 887_220i32);
         let liq: i128 = 1_000_000_000_000_000_000;
-        let mut ticks = HashMap::new();
-        let mut bitmap = HashMap::new();
-        ticks.insert(
-            lower,
-            TickInfo {
-                liquidity_net: liq,
-                initialized: true,
-            },
-        );
-        ticks.insert(
-            upper,
-            TickInfo {
-                liquidity_net: -liq,
-                initialized: true,
-            },
-        );
-        set_bit(&mut bitmap, lower, 60);
-        set_bit(&mut bitmap, upper, 60);
         UniswapV3Pool::new(
             PoolId::new("1:univ3:0xfull"),
             [usdc(), weth()],
@@ -510,11 +186,7 @@ mod tests {
             liq as u128,
             0,
             3000,
-            TickData {
-                ticks,
-                bitmap,
-                spacing: 60,
-            },
+            full_range_ticks(liq),
         )
     }
 
@@ -538,7 +210,7 @@ mod tests {
                     initialized: true,
                 },
             );
-            set_bit(&mut bitmap, t, 60);
+            set_tick_bit(&mut bitmap, t, 60);
         }
         UniswapV3Pool::new(
             PoolId::new("1:univ3:0x2pos"),
@@ -557,8 +229,6 @@ mod tests {
 
     #[test]
     fn quote_at_parity_is_input_minus_fee() {
-        // At 1:1 with 0.30% fee, a small swap returns just under the input:
-        // strictly less than input, and within the fee band (> input·996/1000).
         let pool = full_range_pool();
         let amount_in = U256::from(1_000_000_000u64);
         let out = pool
@@ -572,23 +242,25 @@ mod tests {
     }
 
     #[test]
-    fn quote_both_directions_produce_output() {
+    fn quote_both_directions_stay_in_the_fee_band() {
+        // The reverse direction must map correctly and land in the same fee band
+        // as the forward one (input·996/1000 < out < input) on a symmetric pool.
         let pool = full_range_pool();
         let amount = U256::from(1_000_000_000u64);
-        let a = pool
-            .quote(&AssetAmount::new(usdc(), amount), &weth())
-            .unwrap();
-        let b = pool
-            .quote(&AssetAmount::new(weth(), amount), &usdc())
-            .unwrap();
-        assert!(a.raw > U256::ZERO && a.asset == weth());
-        assert!(b.raw > U256::ZERO && b.asset == usdc());
+        let lo = amount * U256::from(996u64) / U256::from(1000u64);
+        for (from, to) in [(usdc(), weth()), (weth(), usdc())] {
+            let out = pool.quote(&AssetAmount::new(from, amount), &to).unwrap();
+            assert_eq!(out.asset, to);
+            assert!(
+                out.raw < amount && out.raw > lo,
+                "out {} out of band",
+                out.raw
+            );
+        }
     }
 
     #[test]
     fn quote_crossing_a_tick_gets_a_worse_rate() {
-        // A swap large enough to cross tick -60 drops active liquidity 1e18 → 1e17,
-        // so its rate must be strictly worse than a tiny non-crossing swap.
         let pool = two_position_pool();
         let big_in = U256::from(5_000_000_000_000_000u64); // crosses -60
         let big_out = pool
@@ -609,8 +281,6 @@ mod tests {
 
     #[test]
     fn exact_out_input_actually_delivers_the_target() {
-        // The defining exact-out guarantee: feeding the computed input back through
-        // exact-in must yield at least the requested output.
         let pool = full_range_pool();
         let want_out = U256::from(500_000_000u64);
         let needed = pool
@@ -666,6 +336,44 @@ mod tests {
     }
 
     #[test]
+    fn quote_exceeding_total_liquidity_is_insufficient_not_a_partial_fill() {
+        // Liquidity confined to [-60, 60] with empty space below it. A huge input
+        // exhausts the band and runs the price to the extreme — a partial fill,
+        // which `quote` must reject rather than silently returning a short output.
+        let conc = 900_000_000_000_000_000i128; // 9e17 in [-60, 60] only
+        let mut ticks = HashMap::new();
+        let mut bitmap = HashMap::new();
+        for (t, net) in [(-60i32, conc), (60, -conc)] {
+            ticks.insert(
+                t,
+                TickInfo {
+                    liquidity_net: net,
+                    initialized: true,
+                },
+            );
+            set_tick_bit(&mut bitmap, t, 60);
+        }
+        let pool = UniswapV3Pool::new(
+            PoolId::new("1:univ3:0xnarrow"),
+            [usdc(), weth()],
+            U256::from(SQRT_1_1),
+            conc as u128,
+            0,
+            3000,
+            TickData {
+                ticks,
+                bitmap,
+                spacing: 60,
+            },
+        );
+        let huge = U256::from(1_000_000_000_000_000_000u64); // 1e18 ≫ band capacity (~2.7e15)
+        assert_eq!(
+            pool.quote(&AssetAmount::new(usdc(), huge), &weth()),
+            Err(QuoteError::InsufficientLiquidity)
+        );
+    }
+
+    #[test]
     fn fee_and_kind_introspection() {
         let pool = full_range_pool();
         assert_eq!(pool.fee_bps(&usdc(), &weth()), Some(Bps(30))); // 3000 pips
@@ -674,60 +382,8 @@ mod tests {
         assert_eq!(pool.kind(), PoolKind::UniswapV3);
     }
 
-    // ── swap-helper unit tests (tricky sign/clamp logic) ──────────────────────
-
-    #[test]
-    fn crossed_liquidity_adds_subtracts_and_underflows() {
-        assert_eq!(crossed_liquidity(1_000, 300), Some(1_300));
-        assert_eq!(crossed_liquidity(1_000, -300), Some(700));
-        assert_eq!(crossed_liquidity(100, -300), None); // underflow
-        // i128::MIN must not panic (a plain `-x` would overflow).
-        assert_eq!(
-            crossed_liquidity(u128::MAX, i128::MIN),
-            Some(u128::MAX - (1u128 << 127))
-        );
-    }
-
-    #[test]
-    fn tick_liquidity_net_signs_by_direction_and_flags_missing() {
-        let mut ticks = HashMap::new();
-        ticks.insert(
-            60,
-            TickInfo {
-                liquidity_net: 500,
-                initialized: true,
-            },
-        );
-        assert_eq!(tick_liquidity_net(&ticks, 60, false), Some(500));
-        assert_eq!(tick_liquidity_net(&ticks, 60, true), Some(-500));
-        // Initialized-but-missing must fail (never silently zero).
-        assert_eq!(tick_liquidity_net(&ticks, 120, false), None);
-    }
-
-    #[test]
-    fn step_target_picks_the_binding_bound() {
-        let (lo, hi) = (U256::from(100u64), U256::from(200u64));
-        // zero_for_one: price falls, limit is a floor → clamp UP (max)
-        assert_eq!(step_target(true, lo, hi), hi);
-        // one_for_zero: price rises, limit is a ceiling → clamp DOWN (min)
-        assert_eq!(step_target(false, lo, hi), lo);
-    }
-
-    // ── Limits (price-bounded quotes) ─────────────────────────────────────────
-
-    fn price(base: AssetId, quote: AssetId, n: u64, d: u64) -> Price {
-        Price::new(
-            base,
-            quote,
-            Ratio::new(U256::from(n), U256::from(d)).unwrap(),
-        )
-        .unwrap()
-    }
-
     #[test]
     fn quote_with_limit_far_limit_fills_fully_like_a_plain_quote() {
-        // A permissive limit (price may fall far below current 1:1) never binds:
-        // the whole input is consumed and the output equals the unbounded quote.
         let pool = full_range_pool();
         let req = U256::from(1_000_000_000u64);
         let far = price(usdc(), weth(), 1, 1_000_000);
@@ -742,8 +398,6 @@ mod tests {
 
     #[test]
     fn quote_with_limit_tight_limit_fills_partially() {
-        // A limit just below current price binds before a large input is spent:
-        // a partial fill, consuming some (but not all) input.
         let pool = full_range_pool();
         let req = U256::from(100_000_000_000_000_000u64); // 1e17 — would move price ~10%
         let tight = price(usdc(), weth(), 9999, 10000); // 0.9999, just below 1:1
@@ -757,7 +411,6 @@ mod tests {
 
     #[test]
     fn quote_with_limit_price_already_past_swaps_nothing() {
-        // For USDC→WETH the price falls; a limit above current is already passed.
         let pool = full_range_pool();
         let above = price(usdc(), weth(), 2, 1);
         let q = pool
@@ -792,7 +445,6 @@ mod tests {
         let maxin = pool.max_amount_in(&usdc(), &weth()).unwrap();
         assert!(maxin.raw > U256::ZERO);
         assert_eq!(maxin.asset, usdc());
-        // Not the pool's pair → no bound.
         assert_eq!(pool.max_amount_in(&usdc(), &dai()), None);
     }
 }

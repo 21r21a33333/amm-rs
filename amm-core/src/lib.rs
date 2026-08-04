@@ -5,7 +5,8 @@
 //! quoters. It has zero network dependencies; on-chain state fetching lives in
 //! the separate `amm-rpc` crate.
 //!
-//! Modules are populated task-by-task per the implementation plan.
+//! Protocol quoters are opt-in via Cargo features (`uniswap-v2`, `uniswap-v3`,
+//! `uniswap-v4`, `curve`, `aerodrome`); the default build enables none.
 
 pub mod error;
 pub mod path;

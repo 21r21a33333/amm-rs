@@ -1,11 +1,15 @@
-//! Uniswap-family quoters (2-asset AMMs): V2 (constant product); V3/V4
-//! (concentrated liquidity) land in later tasks and reuse the shared
-//! direction plumbing here.
+//! Uniswap-family quoters (2-asset AMMs): V2 (constant product) and V3/V4
+//! (concentrated liquidity, sharing an internal tick engine). The shared
+//! two-asset direction plumbing lives here.
 
+#[cfg(any(feature = "uniswap-v3", feature = "uniswap-v4"))]
+mod concentrated;
 #[cfg(feature = "uniswap-v2")]
 pub mod v2;
 #[cfg(feature = "uniswap-v3")]
 pub mod v3;
+#[cfg(feature = "uniswap-v4")]
+pub mod v4;
 
 use crate::primitives::asset::AssetId;
 
