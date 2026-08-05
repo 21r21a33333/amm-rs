@@ -13,11 +13,22 @@
 //!    within a bounded ppm for concentrated liquidity (our fetch reconstructs a
 //!    finite tick window, so very large swaps can diverge slightly).
 //!
-//! Improvements over a one-shot differential harness: every pool is probed at
-//! **multiple sizes in both directions**, and results are **collected into a
-//! report** (worst-case ppm printed, all mismatches surfaced at once rather than
-//! failing on the first). Pool addresses that a factory owns (Aerodrome,
-//! Slipstream) are looked up on-chain rather than hardcoded.
+//! **Every exposed pool function is exercised**, not just exact-in `quote`:
+//! - **exact-in** vs the on-chain quoter — WEI-EXACT for small in-window swaps
+//!   (the precision claim); bounded-ppm for larger concentrated swaps, where the
+//!   only divergence is the finite tick-window fetch, not a precision error.
+//! - **exact-out** (`quote_exact_out`) is proven exactly minimal wei-by-wei: the
+//!   input it returns delivers at least the target, and one wei less under-fills.
+//!   Since `quote` is itself wei-exact against the chain, this pins exact-out to
+//!   the wei too.
+//! - **fee / reserve / spot-price / limits** (`Introspect`/`Pricing`/`Limits`,
+//!   reached via the `dyn Pool` capability accessors) are checked reachable and
+//!   family-consistent.
+//!
+//! Every pool is probed at **multiple sizes in both directions**, and results
+//! are **collected into a report** (worst-case ppm printed, all mismatches
+//! surfaced at once). Factory-owned pool addresses (Aerodrome, Slipstream) are
+//! looked up on-chain rather than hardcoded.
 //!
 //! Gated: each test returns early unless its RPC env var is set.
 //! - Ethereum: `AMM_RPC_FORK_URL`
@@ -189,6 +200,19 @@ impl Report {
         }
     }
 
+    /// A boolean invariant check (exact-out tightness, capability presence, …).
+    fn pass(&mut self, label: &str, ok: bool, note: &str) {
+        self.checks += 1;
+        let status = match ok {
+            true => "ok",
+            false => "MISMATCH",
+        };
+        println!("  [{status}] {label}: {note}");
+        if !ok {
+            self.fails.push(format!("{label}: {note}"));
+        }
+    }
+
     fn finish(self, family: &str) {
         println!(
             "{family}: {} checks, worst {} ppm, {} failure(s)",
@@ -236,6 +260,94 @@ fn key2(exchange: &str, chain: u64, pool: Address, a: Address, b: Address) -> Po
     }
 }
 
+/// Exercise every exposed pool function on a live, refreshed `&dyn Pool` with
+/// **wei-precise** invariants — the evidence that no exposed function introduces
+/// a precision error:
+///
+/// - **exact-out is exactly minimal**: the input `quote_exact_out` returns must
+///   deliver at least the target (never under-fills) AND one wei less must
+///   under-fill (never over-charges). Since `quote` itself is wei-exact against
+///   the on-chain contract (asserted separately), this pins exact-out to the
+///   wei against the chain too.
+/// - **fee / reserve / spot-price / limits** are reachable via `&dyn Pool` and
+///   self-consistent with the pool family.
+///
+/// `concentrated` selects the reserve (`None`) and limits (`Some`) expectations.
+fn verify_capabilities(
+    report: &mut Report,
+    pool: &dyn Pool,
+    chain: u64,
+    from: Address,
+    to: Address,
+    out_target: U256,
+    concentrated: bool,
+) {
+    let (fa, ta) = (asset(chain, from), asset(chain, to));
+    let quote = |input: U256| {
+        pool.quote(&AssetAmount::new(fa, input), &ta)
+            .map(|a| a.raw)
+            .unwrap_or(U256::ZERO)
+    };
+
+    // ── exact-out returns the minimal sufficient input (wei-precise) ─────────
+    let exact_out = pool.as_exact_out().expect("pool exposes exact-out");
+    match exact_out.quote_exact_out(&AssetAmount::new(ta, out_target), &fa) {
+        Ok(need) => {
+            report.pass(
+                "exact-out delivers >= target",
+                quote(need.raw) >= out_target,
+                &format!(
+                    "need {} -> {} (target {out_target})",
+                    need.raw,
+                    quote(need.raw)
+                ),
+            );
+            if !need.raw.is_zero() {
+                let less = quote(need.raw - U256::from(1u64));
+                report.pass(
+                    "exact-out input is minimal (one wei less under-fills)",
+                    less < out_target,
+                    &format!("need-1 -> {less} (target {out_target})"),
+                );
+            }
+        }
+        Err(e) => report.pass("exact-out quotes", false, &format!("{e:?}")),
+    }
+
+    // ── introspection: fee + reserve reachable and family-consistent ─────────
+    let introspect = pool.as_introspect().expect("pool exposes introspection");
+    report.pass(
+        "fee_bps is reported",
+        introspect.fee_bps(&fa, &ta).is_some(),
+        "",
+    );
+    let has_reserve = introspect.reserve(&fa).is_some();
+    report.pass(
+        "reserve matches pool family",
+        has_reserve != concentrated,
+        &format!("reserve.is_some()={has_reserve}, concentrated={concentrated}"),
+    );
+
+    // ── spot price reachable (where the pool reports one) ────────────────────
+    if let Some(pricing) = pool.as_pricing() {
+        report.pass(
+            "spot_price quotes",
+            pricing.spot_price(&fa, &ta).is_ok(),
+            "",
+        );
+    }
+
+    // ── limits: concentrated pools bound the absorbable input ────────────────
+    if concentrated {
+        let limits = pool.as_limits().expect("concentrated pool exposes limits");
+        report.pass(
+            "max_amount_in is bounded",
+            limits.max_amount_in(&fa, &ta).is_some(),
+            "",
+        );
+    }
+}
+
 /// Our exact-in quote, in base units.
 fn quote_out(pool: &dyn Pool, from: Address, to: Address, chain: u64, amount: U256) -> U256 {
     pool.quote(
@@ -261,6 +373,10 @@ const K_USDC: u128 = 1_000_000_000; // 1_000 USDC (6 dec)
 const BIG_USDC: u128 = 100_000_000_000; // 100_000 USDC
 const E18: u128 = 1_000_000_000_000_000_000; // 1 WETH
 const TENTH_E18: u128 = 100_000_000_000_000_000; // 0.1 WETH
+// Tiny swaps that stay inside the active tick — a concentrated quote is
+// WEI-EXACT against the on-chain quoter here (no window truncation).
+const SMALL_USDC: u128 = 1_000_000; // 1 USDC
+const SMALL_WETH: u128 = 1_000_000_000_000_000; // 0.001 WETH
 
 // ─── Uniswap V2 (Ethereum) ──────────────────────────────────────────────────
 
@@ -296,8 +412,22 @@ async fn diff_uniswap_v2_usdc_weth() {
             .unwrap()
             .last()
             .unwrap();
-        report.wei(&format!("v2 {from:#x}->{to:#x} {amount}"), ours, theirs);
+        report.wei(
+            &format!("v2 exact-in {from:#x}->{to:#x} {amount}"),
+            ours,
+            theirs,
+        );
     }
+    // exact-out, fee, reserve, spot-price — all wei-precise.
+    verify_capabilities(
+        &mut report,
+        pool,
+        ETH_CHAIN,
+        USDC,
+        WETH,
+        U256::from(SMALL_WETH),
+        false,
+    );
     report.finish("uniswap-v2");
 }
 
@@ -320,10 +450,13 @@ async fn diff_uniswap_v3_usdc_weth() {
     let pool = pools[0].as_ref();
 
     let mut report = Report::default();
-    for (from, to, amount) in [
-        (USDC, WETH, U256::from(K_USDC)),
-        (USDC, WETH, U256::from(BIG_USDC)),
-        (WETH, USDC, U256::from(E18)),
+    // Small in-window swaps must be WEI-EXACT vs QuoterV2; larger swaps stay
+    // within a bounded ppm (the finite tick-window fetch, not a precision error).
+    for (from, to, amount, wei_exact) in [
+        (USDC, WETH, U256::from(SMALL_USDC), true),
+        (WETH, USDC, U256::from(SMALL_WETH), true),
+        (USDC, WETH, U256::from(K_USDC), false),
+        (USDC, WETH, U256::from(BIG_USDC), false),
     ] {
         let ours = quote_out(pool, from, to, ETH_CHAIN, amount);
         let params = IUniV3Quoter::QuoteExactInputSingleParams {
@@ -338,13 +471,21 @@ async fn diff_uniswap_v3_usdc_weth() {
         let theirs = IUniV3Quoter::quoteExactInputSingleCall::abi_decode_returns(&ret)
             .unwrap()
             .amountOut;
-        report.ppm(
-            &format!("v3 {from:#x}->{to:#x} {amount}"),
-            ours,
-            theirs,
-            200,
-        );
+        let label = format!("v3 exact-in {from:#x}->{to:#x} {amount}");
+        match wei_exact {
+            true => report.wei(&label, ours, theirs),
+            false => report.ppm(&label, ours, theirs, 200),
+        }
     }
+    verify_capabilities(
+        &mut report,
+        pool,
+        ETH_CHAIN,
+        USDC,
+        WETH,
+        U256::from(SMALL_WETH),
+        true,
+    );
     report.finish("uniswap-v3");
 }
 
@@ -389,12 +530,13 @@ async fn diff_uniswap_v4_eth_usdc() {
     let pool = pools[0].as_ref();
 
     let mut report = Report::default();
-    // (from_native, to, amount, zeroForOne). ETH is currency0, so ETH->USDC is
-    // zeroForOne = true.
-    for (from, to, amount, zero_for_one) in [
-        (Address::ZERO, USDC, U256::from(TENTH_E18), true),
-        (Address::ZERO, USDC, U256::from(E18), true),
-        (USDC, Address::ZERO, U256::from(K_USDC), false),
+    // (from, to, amount, zeroForOne, wei_exact). ETH is currency0, so ETH->USDC
+    // is zeroForOne = true. Small in-window swaps are WEI-EXACT vs the V4 Quoter.
+    for (from, to, amount, zero_for_one, wei_exact) in [
+        (Address::ZERO, USDC, U256::from(SMALL_WETH), true, true),
+        (Address::ZERO, USDC, U256::from(TENTH_E18), true, false),
+        (Address::ZERO, USDC, U256::from(E18), true, false),
+        (USDC, Address::ZERO, U256::from(K_USDC), false, false),
     ] {
         let (from_asset, to_asset) = match from == Address::ZERO {
             true => (eth, usdc),
@@ -421,14 +563,22 @@ async fn diff_uniswap_v4_eth_usdc() {
         let theirs = IV4Quoter::quoteExactInputSingleCall::abi_decode_returns(&ret)
             .unwrap()
             .amountOut;
-        report.ppm(
-            &format!("v4 {from:#x}->{to:#x} {amount}"),
-            ours,
-            theirs,
-            200,
-        );
-        let _ = (from, to);
+        let label = format!("v4 exact-in {from:#x}->{to:#x} {amount}");
+        match wei_exact {
+            true => report.wei(&label, ours, theirs),
+            false => report.ppm(&label, ours, theirs, 200),
+        }
     }
+    // ETH (currency0) -> USDC exact-out, plus fee/reserve/spot/limits.
+    verify_capabilities(
+        &mut report,
+        pool,
+        ETH_CHAIN,
+        Address::ZERO,
+        USDC,
+        U256::from(SMALL_USDC),
+        true,
+    );
     report.finish("uniswap-v4");
 }
 
@@ -442,6 +592,8 @@ struct AeroCase {
     b: Address,
     stable: bool,
     probes: &'static [(Address, Address, u128)],
+    /// A small `b` amount for the exact-out round-trip (in `b`'s base units).
+    out_target: u128,
 }
 
 async fn resolve_aero_pool(
@@ -483,6 +635,7 @@ async fn diff_aerodrome_v2() {
             b: BASE_WETH,
             stable: false,
             probes: &[(BASE_USDC, BASE_WETH, K_USDC), (BASE_WETH, BASE_USDC, E18)],
+            out_target: SMALL_WETH,
         },
         AeroCase {
             label: "stable USDC/USDbC",
@@ -493,6 +646,7 @@ async fn diff_aerodrome_v2() {
                 (BASE_USDC, BASE_USDBC, K_USDC),
                 (BASE_USDBC, BASE_USDC, K_USDC),
             ],
+            out_target: SMALL_USDC,
         },
     ];
 
@@ -502,6 +656,7 @@ async fn diff_aerodrome_v2() {
         b,
         stable,
         probes,
+        out_target,
     } in cases
     {
         let Some(pool_addr) = resolve_aero_pool(&fork, factory, a, b, stable).await else {
@@ -526,11 +681,20 @@ async fn diff_aerodrome_v2() {
             let ret = fork.reference(pool_addr, calldata).await;
             let theirs = IAeroQuote::getAmountOutCall::abi_decode_returns(&ret).unwrap();
             report.wei(
-                &format!("aero {label} {from:#x}->{to:#x} {amount}"),
+                &format!("aero {label} exact-in {from:#x}->{to:#x} {amount}"),
                 ours,
                 theirs,
             );
         }
+        verify_capabilities(
+            &mut report,
+            pool,
+            BASE_CHAIN,
+            a,
+            b,
+            U256::from(out_target),
+            false,
+        );
     }
     report.finish("aerodrome-v2");
 }
@@ -572,9 +736,11 @@ async fn diff_aerodrome_slipstream() {
     let pool = pools[0].as_ref();
 
     let mut report = Report::default();
-    for (from, to, amount) in [
-        (BASE_USDC, BASE_WETH, U256::from(K_USDC)),
-        (BASE_WETH, BASE_USDC, U256::from(TENTH_E18)),
+    for (from, to, amount, wei_exact) in [
+        (BASE_USDC, BASE_WETH, U256::from(SMALL_USDC), true),
+        (BASE_WETH, BASE_USDC, U256::from(SMALL_WETH), true),
+        (BASE_USDC, BASE_WETH, U256::from(K_USDC), false),
+        (BASE_WETH, BASE_USDC, U256::from(TENTH_E18), false),
     ] {
         let ours = quote_out(pool, from, to, BASE_CHAIN, amount);
         let params = ISlipstreamQuoter::QuoteExactInputSingleParams {
@@ -589,13 +755,21 @@ async fn diff_aerodrome_slipstream() {
         let theirs = ISlipstreamQuoter::quoteExactInputSingleCall::abi_decode_returns(&ret)
             .unwrap()
             .amountOut;
-        report.ppm(
-            &format!("slipstream {from:#x}->{to:#x} {amount}"),
-            ours,
-            theirs,
-            200,
-        );
+        let label = format!("slipstream exact-in {from:#x}->{to:#x} {amount}");
+        match wei_exact {
+            true => report.wei(&label, ours, theirs),
+            false => report.ppm(&label, ours, theirs, 200),
+        }
     }
+    verify_capabilities(
+        &mut report,
+        pool,
+        BASE_CHAIN,
+        BASE_USDC,
+        BASE_WETH,
+        U256::from(SMALL_WETH),
+        true,
+    );
     report.finish("aerodrome-slipstream");
 }
 
@@ -687,6 +861,19 @@ mod curve {
             false => ICurveGetDyUint::get_dyCall::abi_decode_returns(&ret).unwrap(),
         };
         report.wei(case.label, ours, theirs);
+
+        // exact-out (minimal round-trip), fee, reserve, spot-price — wei-precise.
+        let dec_j = case.coins[case.j].1;
+        let out_target = U256::from(10u128.pow(dec_j as u32));
+        verify_capabilities(
+            report,
+            pools[0].as_ref(),
+            ETH_CHAIN,
+            ci,
+            cj,
+            out_target,
+            false,
+        );
     }
 
     // Curve mainnet tokens.

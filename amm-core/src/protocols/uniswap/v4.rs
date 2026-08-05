@@ -328,7 +328,10 @@ mod tests {
         // direct call, wei-for-wei.
         let want = AssetAmount::new(weth(), U256::from(1_000_000u64));
         assert_eq!(
-            dynamic.as_exact_out().unwrap().quote_exact_out(&want, &usdc()),
+            dynamic
+                .as_exact_out()
+                .unwrap()
+                .quote_exact_out(&want, &usdc()),
             pool.quote_exact_out(&want, &usdc()),
         );
     }
