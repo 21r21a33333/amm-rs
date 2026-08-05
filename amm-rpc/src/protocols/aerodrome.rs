@@ -11,12 +11,13 @@ use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use amm_core::primitives::asset::AssetId;
-use amm_core::primitives::pool::PoolKey;
+use amm_core::primitives::asset::{AssetId, ChainId};
+use amm_core::primitives::pool::{ExchangeId, PoolKey};
 use amm_core::protocols::aerodrome::stable::AerodromeStablePool;
 use amm_core::protocols::aerodrome::volatile::AerodromeVolatilePool;
 use amm_core::traits::pool::Pool;
 
+use crate::discover;
 use crate::error::RpcError;
 use crate::multicall::{self, Call, CallResult};
 use crate::source::{StateSource, pool_id};
@@ -33,6 +34,7 @@ sol! {
     #[sol(rpc)]
     interface IAerodromeFactory {
         function getFee(address pool, bool stable) external view returns (uint256);
+        function getPool(address tokenA, address tokenB, bool stable) external view returns (address pool);
     }
     #[sol(rpc)]
     interface IErc20 {
@@ -42,8 +44,8 @@ sol! {
 
 /// A [`StateSource`] for Aerodrome volatile + stable pools over a provider `P`.
 ///
-/// `refresh` is implemented; `discover` (factory `getPool` enumeration) is a
-/// follow-up. Slipstream (concentrated) pools are handled by the V3-family
+/// Both `refresh` and `discover` (factory `getPool` over both stable flags) are
+/// implemented. Slipstream (concentrated) pools are handled by the Slipstream
 /// source, not here.
 pub struct AerodromeSource<P> {
     provider: P,
@@ -157,12 +159,43 @@ fn build_pool(key: &PoolKey, state: &PoolState) -> Option<Box<dyn Pool>> {
 impl<P: Provider + Send + Sync> StateSource for AerodromeSource<P> {
     async fn discover(
         &self,
-        _chain: &amm_core::primitives::asset::ChainId,
-        _assets: &[AssetId],
+        chain: &ChainId,
+        assets: &[AssetId],
     ) -> Result<Vec<PoolKey>, RpcError> {
-        Err(RpcError::Internal(
-            "AerodromeSource::discover is not yet implemented; build PoolKeys from a subgraph or config".into(),
-        ))
+        // One getPool(a, b, stable) per (address-sorted pair × {volatile, stable}).
+        let mut calls = Vec::new();
+        let mut meta: Vec<(AssetId, AssetId)> = Vec::new();
+        for (t0, t1) in discover::sorted_pairs(assets) {
+            for stable in [false, true] {
+                calls.push(Call {
+                    target: self.factory,
+                    call_data: IAerodromeFactory::getPoolCall {
+                        tokenA: discover::asset_address(&t0),
+                        tokenB: discover::asset_address(&t1),
+                        stable,
+                    }
+                    .abi_encode()
+                    .into(),
+                });
+                meta.push((t0, t1));
+            }
+        }
+        let results = multicall::aggregate3(&self.provider, calls, BlockId::latest()).await?;
+
+        Ok(meta
+            .into_iter()
+            .zip(results)
+            .filter_map(|((t0, t1), result)| {
+                let addr = discover::decode_pool_address(&result)?;
+                Some(PoolKey {
+                    exchange: ExchangeId::new("aerodrome"),
+                    chain: *chain,
+                    address: addr.to_string(),
+                    assets: vec![t0, t1],
+                    fee_bps: None,
+                })
+            })
+            .collect())
     }
 
     async fn refresh(&self, keys: &[PoolKey], at: BlockId) -> Result<Vec<Box<dyn Pool>>, RpcError> {

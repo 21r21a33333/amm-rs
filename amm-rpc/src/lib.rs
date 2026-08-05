@@ -6,6 +6,7 @@
 //! pool state (subgraph, DB, fixtures) can skip this crate entirely and
 //! construct the `amm-core` pool structs directly.
 
+mod discover;
 pub mod error;
 pub mod multicall;
 pub mod protocols;

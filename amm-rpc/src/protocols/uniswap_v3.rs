@@ -9,15 +9,18 @@
 //! the fetch; swaps that would cross beyond it are not represented.
 
 use alloy::eips::BlockId;
+use alloy::primitives::aliases::U24;
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use amm_core::primitives::asset::AssetId;
-use amm_core::primitives::pool::{PoolId, PoolKey};
+use amm_core::primitives::asset::{AssetId, ChainId};
+use amm_core::primitives::pool::{ExchangeId, PoolId, PoolKey};
+use amm_core::primitives::ratio::Bps;
 use amm_core::protocols::uniswap::v3::{TickData, TickInfo, UniswapV3Pool};
 use amm_core::traits::pool::Pool;
 
+use crate::discover;
 use crate::error::RpcError;
 use crate::multicall::{self, Call, CallResult};
 use crate::source::{StateSource, pool_id};
@@ -47,21 +50,42 @@ sol! {
             uint160 secondsPerLiquidityOutsideX128, uint32 secondsOutside, bool initialized
         );
     }
+    #[sol(rpc)]
+    interface IUniswapV3Factory {
+        function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool);
+    }
 }
 
 /// A [`StateSource`] for Uniswap V3 pools over a provider `P`.
 ///
-/// `refresh` is implemented (self-contained — it reads fee and tick spacing
-/// on-chain, so a [`PoolKey`] needs only the address and its two assets).
-/// `discover` is a follow-up.
+/// `refresh` is self-contained (reads fee and tick spacing on-chain, so a
+/// [`PoolKey`] needs only the address and its two assets). `discover` (factory
+/// `getPool` enumeration) requires a factory + fee tiers — construct with
+/// [`with_factory`](Self::with_factory).
 pub struct UniswapV3Source<P> {
     provider: P,
+    factory: Option<Address>,
+    fee_tiers: Vec<u32>,
 }
 
 impl<P: Provider> UniswapV3Source<P> {
-    /// Wrap a provider as a Uniswap V3 state source.
+    /// Wrap a provider for refresh-only use (`discover` errors without a factory).
     pub fn new(provider: P) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            factory: None,
+            fee_tiers: Vec::new(),
+        }
+    }
+
+    /// Wrap a provider plus the V3 `factory` and the `fee_tiers` (pips) to scan,
+    /// so `discover` can enumerate pools via `getPool`.
+    pub fn with_factory(provider: P, factory: Address, fee_tiers: Vec<u32>) -> Self {
+        Self {
+            provider,
+            factory: Some(factory),
+            fee_tiers,
+        }
     }
 }
 
@@ -193,12 +217,48 @@ fn build_pool(state: PoolState, ticks: Vec<(i32, TickInfo)>) -> Box<dyn Pool> {
 impl<P: Provider + Send + Sync> StateSource for UniswapV3Source<P> {
     async fn discover(
         &self,
-        _chain: &amm_core::primitives::asset::ChainId,
-        _assets: &[AssetId],
+        chain: &ChainId,
+        assets: &[AssetId],
     ) -> Result<Vec<PoolKey>, RpcError> {
-        Err(RpcError::Internal(
-            "UniswapV3Source::discover is not yet implemented; build PoolKeys from a subgraph or config".into(),
-        ))
+        let Some(factory) = self.factory else {
+            return Err(RpcError::Internal(
+                "UniswapV3Source::discover requires a factory; construct with with_factory".into(),
+            ));
+        };
+        // One getPool(a, b, fee) per (address-sorted pair × fee tier).
+        let mut calls = Vec::new();
+        let mut meta: Vec<(AssetId, AssetId, u32)> = Vec::new();
+        for (t0, t1) in discover::sorted_pairs(assets) {
+            for &fee in &self.fee_tiers {
+                calls.push(Call {
+                    target: factory,
+                    call_data: IUniswapV3Factory::getPoolCall {
+                        tokenA: discover::asset_address(&t0),
+                        tokenB: discover::asset_address(&t1),
+                        fee: U24::from(fee),
+                    }
+                    .abi_encode()
+                    .into(),
+                });
+                meta.push((t0, t1, fee));
+            }
+        }
+        let results = multicall::aggregate3(&self.provider, calls, BlockId::latest()).await?;
+
+        Ok(meta
+            .into_iter()
+            .zip(results)
+            .filter_map(|((t0, t1, fee), result)| {
+                let addr = discover::decode_pool_address(&result)?;
+                Some(PoolKey {
+                    exchange: ExchangeId::new("uniswap-v3"),
+                    chain: *chain,
+                    address: addr.to_string(),
+                    assets: vec![t0, t1],
+                    fee_bps: Some(Bps((fee / 100) as u16)),
+                })
+            })
+            .collect())
     }
 
     async fn refresh(&self, keys: &[PoolKey], at: BlockId) -> Result<Vec<Box<dyn Pool>>, RpcError> {

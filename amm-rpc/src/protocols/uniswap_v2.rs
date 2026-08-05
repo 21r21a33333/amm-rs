@@ -10,11 +10,13 @@ use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use amm_core::primitives::asset::AssetId;
-use amm_core::primitives::pool::{PoolId, PoolKey};
+use amm_core::primitives::asset::{AssetId, ChainId};
+use amm_core::primitives::pool::{ExchangeId, PoolId, PoolKey};
+use amm_core::primitives::ratio::Bps;
 use amm_core::protocols::uniswap::v2::UniswapV2Pool;
 use amm_core::traits::pool::Pool;
 
+use crate::discover;
 use crate::error::RpcError;
 use crate::multicall::{self, Call};
 use crate::source::StateSource;
@@ -27,20 +29,40 @@ sol! {
     interface IUniswapV2Pair {
         function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
     }
+    #[sol(rpc)]
+    interface IUniswapV2Factory {
+        function getPair(address tokenA, address tokenB) external view returns (address pair);
+    }
 }
 
 /// A [`StateSource`] for Uniswap V2 (and V2-fork) pools over a provider `P`.
 ///
-/// `refresh` is implemented; `discover` (factory `getPair` enumeration) is a
-/// follow-up — construct [`PoolKey`]s from a subgraph or config for now.
+/// `refresh` works with any source. `discover` (factory `getPair` enumeration)
+/// requires a factory + fee — construct with [`with_factory`](Self::with_factory).
 pub struct UniswapV2Source<P> {
     provider: P,
+    factory: Option<Address>,
+    fee_bps: u32,
 }
 
 impl<P: Provider> UniswapV2Source<P> {
-    /// Wrap a provider as a Uniswap V2 state source.
+    /// Wrap a provider for refresh-only use (`discover` errors without a factory).
     pub fn new(provider: P) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            factory: None,
+            fee_bps: DEFAULT_FEE_BPS,
+        }
+    }
+
+    /// Wrap a provider plus the V2 `factory` and the pools' swap `fee_bps`, so
+    /// `discover` can enumerate pools via `getPair`.
+    pub fn with_factory(provider: P, factory: Address, fee_bps: u32) -> Self {
+        Self {
+            provider,
+            factory: Some(factory),
+            fee_bps,
+        }
     }
 }
 
@@ -71,12 +93,44 @@ fn build_pool(key: &PoolKey, reserve0: U256, reserve1: U256) -> Option<Box<dyn P
 impl<P: Provider + Send + Sync> StateSource for UniswapV2Source<P> {
     async fn discover(
         &self,
-        _chain: &amm_core::primitives::asset::ChainId,
-        _assets: &[AssetId],
+        chain: &ChainId,
+        assets: &[AssetId],
     ) -> Result<Vec<PoolKey>, RpcError> {
-        Err(RpcError::Internal(
-            "UniswapV2Source::discover is not yet implemented; build PoolKeys from a subgraph or config".into(),
-        ))
+        let Some(factory) = self.factory else {
+            return Err(RpcError::Internal(
+                "UniswapV2Source::discover requires a factory; construct with with_factory".into(),
+            ));
+        };
+        let pairs = discover::sorted_pairs(assets);
+        let calls: Vec<Call> = pairs
+            .iter()
+            .map(|(t0, t1)| Call {
+                target: factory,
+                call_data: IUniswapV2Factory::getPairCall {
+                    tokenA: discover::asset_address(t0),
+                    tokenB: discover::asset_address(t1),
+                }
+                .abi_encode()
+                .into(),
+            })
+            .collect();
+        let results = multicall::aggregate3(&self.provider, calls, BlockId::latest()).await?;
+
+        let fee = Bps(self.fee_bps as u16);
+        Ok(pairs
+            .into_iter()
+            .zip(results)
+            .filter_map(|((t0, t1), result)| {
+                let addr = discover::decode_pool_address(&result)?;
+                Some(PoolKey {
+                    exchange: ExchangeId::new("uniswap-v2"),
+                    chain: *chain,
+                    address: addr.to_string(),
+                    assets: vec![t0, t1],
+                    fee_bps: Some(fee),
+                })
+            })
+            .collect())
     }
 
     async fn refresh(&self, keys: &[PoolKey], at: BlockId) -> Result<Vec<Box<dyn Pool>>, RpcError> {
