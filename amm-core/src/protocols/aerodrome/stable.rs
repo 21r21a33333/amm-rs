@@ -308,6 +308,13 @@ impl Pool for AerodromeStablePool {
         let out = self.amount_out(amount_in.raw, &s)?;
         Ok(AssetAmount::new(*to, out))
     }
+
+    fn as_exact_out(&self) -> Option<&dyn ExactOut> {
+        Some(self)
+    }
+    fn as_introspect(&self) -> Option<&dyn Introspect> {
+        Some(self)
+    }
 }
 
 impl ExactOut for AerodromeStablePool {

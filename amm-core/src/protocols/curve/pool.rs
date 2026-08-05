@@ -79,6 +79,16 @@ impl Pool for CurvePool {
             }
         }
     }
+
+    fn as_exact_out(&self) -> Option<&dyn ExactOut> {
+        Some(self)
+    }
+    fn as_pricing(&self) -> Option<&dyn Pricing> {
+        Some(self)
+    }
+    fn as_introspect(&self) -> Option<&dyn Introspect> {
+        Some(self)
+    }
 }
 
 impl ExactOut for CurvePool {

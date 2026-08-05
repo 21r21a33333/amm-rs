@@ -94,6 +94,19 @@ impl Pool for UniswapV3Pool {
         let out = concentrated::amount_out(&self.state(), zero_for_one, amount_in.raw)?;
         Ok(AssetAmount::new(*to, out))
     }
+
+    fn as_exact_out(&self) -> Option<&dyn ExactOut> {
+        Some(self)
+    }
+    fn as_pricing(&self) -> Option<&dyn Pricing> {
+        Some(self)
+    }
+    fn as_introspect(&self) -> Option<&dyn Introspect> {
+        Some(self)
+    }
+    fn as_limits(&self) -> Option<&dyn Limits> {
+        Some(self)
+    }
 }
 
 impl ExactOut for UniswapV3Pool {

@@ -150,6 +150,19 @@ impl Pool for UniswapV4Pool {
         let out = concentrated::amount_out(&self.state(zero_for_one), zero_for_one, amount_in.raw)?;
         Ok(AssetAmount::new(*to, out))
     }
+
+    fn as_exact_out(&self) -> Option<&dyn ExactOut> {
+        Some(self)
+    }
+    fn as_pricing(&self) -> Option<&dyn Pricing> {
+        Some(self)
+    }
+    fn as_introspect(&self) -> Option<&dyn Introspect> {
+        Some(self)
+    }
+    fn as_limits(&self) -> Option<&dyn Limits> {
+        Some(self)
+    }
 }
 
 impl ExactOut for UniswapV4Pool {
@@ -300,5 +313,23 @@ mod tests {
             Err(QuoteError::Unsupported)
         );
         assert!(pool.max_amount_in(&usdc(), &weth()).is_none());
+    }
+
+    #[test]
+    fn capability_accessors_expose_extension_traits_via_dyn_pool() {
+        let pool = full_range_pool(3000, 3000, Hooks::None);
+        let dynamic: &dyn Pool = &pool;
+        // V4 implements every extension trait, each reachable from a `&dyn Pool`.
+        assert!(dynamic.as_exact_out().is_some());
+        assert!(dynamic.as_pricing().is_some());
+        assert!(dynamic.as_introspect().is_some());
+        assert!(dynamic.as_limits().is_some());
+        // The handle is the real thing: exact-out via the accessor equals the
+        // direct call, wei-for-wei.
+        let want = AssetAmount::new(weth(), U256::from(1_000_000u64));
+        assert_eq!(
+            dynamic.as_exact_out().unwrap().quote_exact_out(&want, &usdc()),
+            pool.quote_exact_out(&want, &usdc()),
+        );
     }
 }

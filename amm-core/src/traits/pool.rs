@@ -4,6 +4,10 @@
 use crate::error::QuoteError;
 use crate::primitives::asset::{AssetAmount, AssetId};
 use crate::primitives::pool::PoolId;
+use crate::traits::exact_out::ExactOut;
+use crate::traits::introspect::Introspect;
+use crate::traits::limits::Limits;
+use crate::traits::pricing::Pricing;
 
 /// An AMM pool that can quote swaps.
 ///
@@ -11,7 +15,8 @@ use crate::primitives::pool::PoolId;
 /// generics, no `async`), so a heterogeneous set of pools can be held as
 /// `Box<dyn Pool>` and any third party can implement it for their own AMM
 /// without touching this crate. Richer capabilities (exact-out, spot price,
-/// price impact, limits) live in opt-in extension traits.
+/// price impact, limits) live in opt-in extension traits, reachable from a
+/// `dyn Pool` via the `as_*` accessors below.
 pub trait Pool: Send + Sync {
     /// This pool's stable identifier.
     fn id(&self) -> &PoolId;
@@ -25,6 +30,28 @@ pub trait Pool: Send + Sync {
     /// Returns [`QuoteError::AssetNotInPool`] if the pool does not trade the
     /// `amount_in.asset -> to` pair.
     fn quote(&self, amount_in: &AssetAmount, to: &AssetId) -> Result<AssetAmount, QuoteError>;
+
+    /// This pool as an [`ExactOut`] quoter, or `None` if it doesn't support
+    /// reverse quoting. Lets a consumer holding `&dyn Pool` reach the opt-in
+    /// capabilities; implementing pools override to return `Some(self)`.
+    fn as_exact_out(&self) -> Option<&dyn ExactOut> {
+        None
+    }
+
+    /// This pool as a [`Pricing`] source (spot price / price impact), or `None`.
+    fn as_pricing(&self) -> Option<&dyn Pricing> {
+        None
+    }
+
+    /// This pool as an [`Introspect`] source (fee / reserve / kind), or `None`.
+    fn as_introspect(&self) -> Option<&dyn Introspect> {
+        None
+    }
+
+    /// This pool as a [`Limits`] source (sizing / price-bounded quotes), or `None`.
+    fn as_limits(&self) -> Option<&dyn Limits> {
+        None
+    }
 }
 
 /// Compile-time guarantee that `Pool` stays object-safe (`dyn`-compatible):
