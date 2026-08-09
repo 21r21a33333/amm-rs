@@ -1,6 +1,6 @@
 # amm-rs — Execution & Wallet Design
 
-**Status:** Phase-1 design settled (4 review questions resolved §5); Phase-2 (wallet) deferred pending external research. Ready for implementation planning.
+**Status:** Phase-1 design settled and hardened by a four-stream external review (2026-08-09, §2c) benchmarking against Uniswap SDK / alloy 2.3 / 0x / Balancer / Rust API Guidelines; Phase-2 (wallet) deferred pending external research. Plan to be regenerated to match §2c/E17–E20.
 **Date:** 2026-08-07
 **Supersedes:** the `amm-execution` phase deferred in [2026-08-04-amm-library-design.md](2026-08-04-amm-library-design.md) (non-goal "Execution / calldata").
 
@@ -30,6 +30,9 @@
 - Route *optimization* / path-finding — out of scope, as in the quoting spec.
 - CEX order APIs — arb-router's concern, architecturally unrelated (REST/WebSocket vs tx-building).
 - Non-EVM encoders — the boundary stays chain-family-agnostic, but only EVM is implemented.
+- **Fee-on-transfer / rebasing tokens** (E20) — standard-ERC-20 assumption; no FoT metadata or guard. Un-swappable on V3/V4/Curve by contract design regardless; V2/Aerodrome supporting-variant encoding is a later add.
+- **Gas estimation & simulation** — need an RPC; the build stays pure. Gas is the wallet layer's job; revert-reason decoding lives in the test layer.
+- **Referrer / integrator fees, Permit2 typed-data construction** — designed-for-later (a typed hole), not built in v1.
 
 ---
 
@@ -50,6 +53,32 @@
 | E14 | Options ergonomics | **Slippage required (no `Default`)**; every other option safe-defaulted; fluent dependency-free builder | A silent slippage default is an MEV footgun; safe-by-construction |
 | E15 | API idioms | `#[non_exhaustive]` public enums/structs; enums over bare `bool`/`Option` (`Recipient`, `Deadline`, `ApprovalMode`); newtypes for domain values | Future-proof semver; no boolean blindness; make illegal states unrepresentable |
 | E16 | Idiomatic sweep | **Dedicated review-and-refactor phase** across the whole codebase (§4) | Apply E14/E15 principles uniformly to existing quoting code, benchmarked against alloy/Uniswap-SDK/other Rust libs |
+| E17 | Quote→build bridge | A minimal **`Route { hops, fee_tiers, trade_type }`** value between quote and build (not a bare scalar `quoted_out`) | Matches Uniswap `Trade` / Balancer `query()→buildCall`; future-proofs multi-hop as an additive layer, not a rewrite |
+| E18 | Build output | `build_swap` returns a rich **`PreparedSwap { tx, min_received, approval, price_impact }`**, not a bare `UnsignedTx` | Echoes values already computed; hands the caller the approval **spender** (the #1 real revert cause) and guard values without re-deriving (0x/Balancer pattern) |
+| E19 | Clock/identity | **Pure clockless build** — `build_swap` requires an absolute `Deadline::AtTimestamp` + explicit `Recipient::To`, typed-errors the rest; a thin **`resolve(opts, now, sender)`** edge helper turns `ttl`/sender into absolutes | Keeps the builder pure/testable (v3-sdk design); no silent `U256::MAX` deadline sentinel (an MEV footgun) |
+| E20 | Fee-on-transfer | **Out of scope for v1** — standard ERC-20 assumption, no FoT metadata or guard | Offline detection is impossible; V3/V4/Curve contracts reject FoT by design anyway; V2/Aerodrome supporting-variant encoding is a clean later add |
+| E21 | Approval modeling | `PreparedSwap.approval` is **`Option`** (`None` for native input); `ApprovalRequirement` carries **`reset_first`** for USDT/KNC-class tokens (`require(allowance==0 \|\| amount==0)`) | `min_allowance == 0` as a "nothing to approve" sentinel is the illegal-state E15 forbids; the zero-first reset is a real revert class every SDK handles |
+| E22 | Exact-out guard | `PreparedSwap.max_spent: Option<AssetAmount>` surfaces the exact-out input ceiling (`max_amount_in`) directly | On exact-out the slippage guard is the *input* max; echoing it (not just burying it in calldata) is symmetric with `min_received` for exact-in |
+
+### 2d. Review round 2 (2026-08-09) — fixes verified against alloy 2.3 source
+
+A second adversarial pass (post-regeneration) verified 8/9 alloy calls against the installed source and folded these fixes into the plan:
+- **`Deadline::None` removed** — it silently encoded `U256::MAX` (unbounded deadline = the MEV footgun E19 forbids). `ExecutionOptions::new` defaults `deadline` to `FromNow(default_ttl)`, so an *unresolved* build **errors** (`UnresolvedDeadline`) rather than shipping "never expires". `AtBlock` on a timestamp-bound router → `UnresolvedDeadline`, not `UnsupportedProtocol`.
+- **`ForkExec::submit` returns the receipt** (`ExecOutput { status, gas_used, effective_gas_price }`), not `bool` — needed for the native-out proof.
+- **Native-out wei-exact** uses a **zero-gas-price** submission (`max_fee = priority = 0`) so the ETH balance delta equals the quote exactly (gas doesn't perturb it).
+- **`req.with_from(from)`** (not `req.from(...)`, which is a field); `resolve()` uses `saturating_add`; `fund_erc20` writes the **full-word** slot value (not a truncated low byte); `Cargo.toml` gains alloy `network`/`rpc-types`/`serde` + a declared `serde` feature (else `--all-features` no-ops the derives); exact-out `min_received` is built as `AssetAmount::new(output, raw)`; `build_swap_exact_out` guards `route.trade_type == ExactOut`.
+
+### 2c. Review refinements (2026-08-09, benchmarked vs Uniswap SDK / alloy 2.3 / 0x / Balancer / Rust API Guidelines)
+
+Applied after a four-stream external review of the Phase-1 design:
+- **Dispatch:** `as_executable` drops the `PoolKind` pre-gate and simply tries `downcast_ref::<Concrete>()` per known type — `TypeId` is the real safety check, and `kind()` lives on `Introspect` not `Pool`, so gating on it was fragile.
+- **`Executable` is sealed** (C-SEALED): the pool set stays open, but the encoder trait is closed so no downstream impl bypasses `as_executable`.
+- **`BuildError`** gains `UnresolvedRecipient` / `UnresolvedDeadline`, a **structured** `MissingChainConfig { chain, what: MissingAddr }` (not a `&'static str`), and `#[source]`/`#[from]` chains (mirroring `alloy::contract::Error`). The dead `SlippageUnderflow` marker is dropped.
+- **Common traits:** `Currency`/`CurrencyAmount`/`UnsignedTx` derive `Hash` + feature-gated `Serialize`/`Deserialize` (`UnsignedTx` crosses into the Redis-backed wallet); `Currency` gets `Display`. Matches `AssetId`'s trait set (C-COMMON-TRAITS).
+- **`From<&UnsignedTx> for TransactionRequest`** bridge — the one place to reuse alloy's type instead of reinventing the last mile.
+- **`Pool: Any ⇒ 'static`** is documented on the trait as a conscious constraint (blocks a future borrowing pool).
+- **V2 rejects a `Some(price_limit)`** rather than silently dropping it; the single-hop-only `sqrtPriceLimit` invariant is enforced.
+- **Builder:** hand-rolled `new(slippage).with_*()` confirmed idiomatic — **reject** `bon`/`typed-builder`/typestate (over-engineering for one required field).
 | E10 | Exact-out | **In scope** for Phase 1 | `quote_exact_out` already exists; the build is symmetric |
 | E11 | Multi-hop | **Deferred** to a follow-up | Single-hop suffices; arb-router composes routes itself |
 | E12 | Rename timing | Land execution **inside `amm-rpc` first**; do the `amm-rpc → amm-client` rename as a final isolated commit | Keeps execution diffs reviewable, not buried under a rename |
@@ -98,15 +127,44 @@ pub struct UnsignedTx {
 /// intent IN THE TYPE — there is no separate NativeMode flag, so intent can never
 /// disagree with the asset. Mirrors the Uniswap SDK's `Currency` model. Keeping
 /// `Native` and `Token(weth)` distinct lets a caller choose ETH *or* WETH output.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]        // + Display; + serde behind the feature
 #[non_exhaustive]
 pub enum Currency {
     Native,            // the chain's native coin (ETH) — wrapped/unwrapped automatically
     Token(AssetId),    // an ERC-20, addressed directly
 }
 
-/// An amount of a Currency (mirrors amm-core's AssetAmount).
+/// An amount of a Currency (mirrors amm-core's AssetAmount). Derives Hash + serde.
 pub struct CurrencyAmount { pub currency: Currency, pub raw: U256 }
+
+/// The quote→build bridge: the route the swap takes plus its direction. For
+/// single-hop v1 `hops` is one pool; it generalizes to multi-hop additively.
+#[non_exhaustive]
+pub struct Route {
+    pub hops: Vec<AssetId>,        // token path (>= 2 for single-hop: [in, out])
+    pub fee_tiers: Vec<u32>,       // per-hop fee (V3/V4); empty for V2/Curve
+    pub trade_type: TradeType,     // ExactIn | ExactOut
+}
+
+/// What the build step produces: the unsigned tx plus everything the caller
+/// needs to sign safely without re-deriving it (0x/Balancer pattern).
+#[non_exhaustive]
+pub struct PreparedSwap {
+    pub tx: UnsignedTx,
+    pub min_received: AssetAmount,          // exact-in: slippage floor; exact-out: the target
+    pub max_spent: Option<AssetAmount>,     // exact-out: the slippage input ceiling (E22)
+    pub approval: Option<ApprovalRequirement>, // None when nothing to approve (native input) (E21)
+    pub price_impact: Option<Bps>,          // echoed when computable
+}
+
+/// The allowance the swap needs before it can succeed — the #1 real revert cause.
+#[non_exhaustive]
+pub struct ApprovalRequirement {
+    pub spender: Address,          // router / Permit2 to approve
+    pub token: AssetId,            // the sell token
+    pub min_allowance: U256,       // >= the amount the swap pulls
+    pub reset_first: bool,         // USDT/KNC-class tokens require allowance→0 before a new non-zero set (E21)
+}
 
 /// Safe-by-construction build options. Slippage is REQUIRED (no `Default` invents
 /// one — a silent slippage default is an MEV footgun); every other field has a
@@ -116,30 +174,37 @@ pub struct CurrencyAmount { pub currency: Currency, pub raw: U256 }
 pub struct ExecutionOptions {
     pub recipient: Recipient,         // Sender (default) | To(Address) — enum, not Option<Address>
     pub slippage: Slippage,           // required; reuse amm-core's value object
-    pub deadline: Deadline,           // FromNow(Duration) | AtTimestamp(u64) | AtBlock(u64) | None
+    pub deadline: Deadline,           // FromNow(Duration, default) | AtTimestamp(u64) | AtBlock(u64) — no "None" (E19)
     pub price_limit: Option<Price>,   // genuinely optional → Option; V3/V4/Slipstream sqrtPriceLimit
     pub approval: ApprovalMode,       // AssumeApproved (default) | Erc20 | Permit2 { signature }
 }
 
-pub trait Executable {
+/// Sealed (C-SEALED): the pool set is open, but only in-crate types encode, so
+/// dispatch stays single-source-of-truth. `build_swap` requires an absolute
+/// deadline + explicit recipient (E19) — resolve `ttl`/sender at the edge first.
+pub trait Executable: private::Sealed {
     fn build_swap(
         &self,
-        ctx: &ChainConfig,             // weth + native sentinel + per-protocol routers for this chain
+        ctx: &ChainConfig,             // weth + native sentinel + per-protocol routers
         amount_in: CurrencyAmount,
         to: Currency,
-        quoted_out: &AssetAmount,      // from Pool::quote() — still WETH/AssetId-denominated
+        route: &Route,                 // hops + fee tiers + trade_type (E17)
+        quoted_out: &AssetAmount,      // from Pool::quote(); slippage floor applied inside
         opts: &ExecutionOptions,
-    ) -> Result<UnsignedTx, BuildError>;
+    ) -> Result<PreparedSwap, BuildError>;
 
     fn build_swap_exact_out(
         &self,
         ctx: &ChainConfig,
         amount_out: CurrencyAmount,
         from: Currency,
+        route: &Route,
         quoted_in: &AssetAmount,       // from ExactOut::quote_exact_out()
         opts: &ExecutionOptions,
-    ) -> Result<UnsignedTx, BuildError>;
+    ) -> Result<PreparedSwap, BuildError>;
 }
+
+impl From<&UnsignedTx> for alloy::rpc::types::TransactionRequest { /* to/value/input/chain_id */ }
 ```
 
 The builder resolves `Currency::Native → ctx.weth` for the actual pool swap and derives wrap/unwrap from which side is `Native`:
@@ -152,21 +217,21 @@ WETH → USDC: in Token(weth),   to Token(usdc)  ⇒ plain ERC-20 swap, no wrap/
 `amm-client` provides the bridge from a fetched `Box<dyn Pool>` to its encoder:
 
 ```rust
-// upcast to Any, then downcast to the concrete type PoolKind names
+// upcast to Any, then try each known concrete type. No PoolKind gate: downcast_ref's
+// TypeId check IS the safety, and kind() lives on Introspect (not Pool), so gating on
+// it was fragile. Order is cheap (one TypeId compare each) and short-circuits.
 pub fn as_executable(pool: &dyn Pool) -> Option<&dyn Executable> {
     let any: &dyn core::any::Any = pool;   // stable trait upcast (Rust ≥ 1.86)
-    match pool.kind() {
-        PoolKind::UniswapV2  => any.downcast_ref::<UniswapV2Pool>().map(|p| p as &dyn Executable),
-        PoolKind::UniswapV3  => any.downcast_ref::<UniswapV3Pool>().map(|p| p as &dyn Executable),
-        PoolKind::UniswapV4  => any.downcast_ref::<UniswapV4Pool>().map(|p| p as &dyn Executable),
-        PoolKind::Curve      => any.downcast_ref::<CurvePool>().map(|p| p as &dyn Executable),
-        PoolKind::Aerodrome | PoolKind::Slipstream => /* … */ None,
-        _ => None,
-    }
+    if let Some(p) = any.downcast_ref::<UniswapV2Pool>() { return Some(p); }
+    if let Some(p) = any.downcast_ref::<UniswapV3Pool>() { return Some(p); }
+    if let Some(p) = any.downcast_ref::<UniswapV4Pool>() { return Some(p); }
+    if let Some(p) = any.downcast_ref::<CurvePool>()     { return Some(p); }
+    // … Aerodrome / Slipstream …
+    None
 }
 ```
 
-Hot-path cost: one `PoolKind` integer compare + one `TypeId` (128-bit) compare, then the normal vtable call for the encode — negligible next to the ABI encoding itself.
+Hot-path cost: a few `TypeId` (128-bit) compares, then the normal vtable call for the encode — negligible next to the ABI encoding itself.
 
 This keeps the `dyn Pool` quoting API (which arb-router consumes) **untouched**, adds execution as a pure superset, and reuses each pool's stored identity — no parallel identity structs.
 
@@ -192,22 +257,44 @@ The only protocol needing an `amm-core` struct change. A V4 swap must reconstruc
 
 ### 3.5 Cross-cutting concerns
 
-- **Approvals** (`ApprovalMode`): the build layer stays pure. `AssumeApproved` emits only the swap; `Erc20Approve` signals the caller/Phase-2 to prepend an approve; `Permit2 { signature }` inlines the permit. Permit2-first matches Uniswap/0x/Balancer.
+- **Approvals** — the build layer stays pure but is now *informative*: every `PreparedSwap` carries an `ApprovalRequirement { spender, token, min_allowance }` so the caller knows exactly what to approve (the #1 real revert cause) without reverse-engineering it from calldata. `ApprovalMode` still controls encoding: `AssumeApproved` emits only the swap; `Erc20` signals a prepended approve; `Permit2 { signature }` inlines the permit. Permit2 typed-data *construction* (building the EIP-712 to sign) is deferred to a later phase.
+- **Fee-on-transfer tokens: out of scope for v1** (E20). Standard-ERC-20 assumption; no metadata or guard. A FoT token would revert on V3/V4/Curve by contract design and mis-quote on V2 — documented, not handled. Tests use non-FoT pairs so the wei-exact proof holds.
+- **Deadline / recipient resolution** (E19): `build_swap` is pure and clockless — it requires `Deadline::AtTimestamp` + `Recipient::To`, returning `UnresolvedDeadline`/`UnresolvedRecipient` for the relative/implicit variants. A thin edge helper `resolve(opts, now, sender) -> ExecutionOptions` turns `FromNow(ttl)`/`Sender` into absolutes (v2-sdk's ttl-vs-absolute split), so no silent `U256::MAX` deadline ever reaches the chain.
+- **`price_limit`** is honored by V3/V4/Slipstream and **rejected** (`UnsupportedProtocol`) by V2/Curve rather than silently dropped; enforced single-hop-only.
 - **Native ETH** (`Currency::Native`) — **both directions in Phase 1**, driven by the type, not a flag: a `Native` *input* sets `UnsignedTx.value` and routes through the wrapping path (Universal Router for V4/UR-capable, or the router's ETH entrypoint for V2/V3); a `Native` *output* appends an unwrap so the recipient gets raw ETH. The builder resolves `Native → ctx.weth` for the pool swap.
-- **Slippage:** `build_swap` applies `slippage.min_amount_out(quoted_out)`; `build_swap_exact_out` applies `slippage.max_amount_in(quoted_in)`. The caller never computes the bound.
+- **Slippage:** `build_swap` applies `slippage.min_amount_out(quoted_out)` (clamped ≥ 0); `build_swap_exact_out` applies `slippage.max_amount_in(quoted_in)`. The caller never computes the bound, and the applied floor is echoed back as `PreparedSwap.min_received`. For native exact-out, `UnsignedTx.value` is the **`max_amount_in`** (not the nominal), so the router refunds the unused ETH.
 - **Config** (`ChainConfig`, `#[non_exhaustive]`): `{ chain, weth, native_sentinel, routers }`, keyed per chain — mirrors how `amm-rpc` holds factory addresses. `weth` is what `Currency::Native` resolves to; `native_sentinel` is what native encodes as on-chain, **defaulting to `address(0)`** (V4/UR convention) but overridable for ecosystems using a different placeholder (e.g. `0xEeeE…EEeE`). `routers` holds the v2/v3 routers, Universal Router, PoolManager, and Permit2 addresses.
 
 ### 3.6 Error handling
 
-`BuildError` (typed, no panics — same discipline as `QuoteError`):
-`UnsupportedProtocol`, `MissingChainConfig { chain, what }`, `SlippageUnderflow`, `NativeMismatch` (native intent vs the assets actually swapped), `AssetNotInPool`, `Overflow`.
+`BuildError` (typed, `#[non_exhaustive]`, no panics — same discipline as `QuoteError`, with `#[source]`/`#[from]` chains like `alloy::contract::Error`):
+`UnsupportedProtocol`, `MissingChainConfig { chain: ChainId, what: MissingAddr }` (structured, not a string — `MissingAddr` is an enum: `V2Router | V3Router | UniversalRouter | PoolManager | Permit2 | Weth`), `UnresolvedRecipient`, `UnresolvedDeadline`, `NativeMismatch` (native on both sides), `AssetNotInPool { input, output }`, `Overflow`. (The dead `SlippageUnderflow` marker from the draft is dropped — `Slippage::min_amount_out` saturates to zero, so it never fires.)
 
-### 3.7 Testing — on-chain execution proof is MANDATORY
+### 3.7 Testing — differential execution on a managed fork is MANDATORY
 
-The bar: **every pool's built calldata must be proven on-chain**, not just byte-compared. A build that encodes the wrong index type or ABI variant can revert or misroute funds; only actual execution catches that.
+The bar: **every pool's built calldata must be proven on-chain to deliver the quoted amount**, not just byte-compared and not just "a swap happened." A build that encodes the wrong index type or ABI variant can revert or misroute funds; only real execution catches that. The gold standard is **differential execution**:
 
-- **On-chain execution test per pool (mandatory, gating):** submit/simulate the built `UnsignedTx` against a forked node (`eth_call` for output-equality, and a state-changing `eth_sendTransaction`/`eth_simulateV1` where balance deltas must be checked), asserting the recipient receives the quoted output (wei-exact where the protocol is deterministic) and no revert. No protocol lands without this.
-- **Golden calldata vectors:** encode a known swap per protocol, assert bytes against a real router transaction pulled from chain (fast, deterministic regression guard).
+```
+fetch pool → our quote Q → build UnsignedTx → submit on a forked node
+          → decode actual on-chain output O → assert O == Q (wei-exact)
+```
+
+This is strictly stronger than a `minOut = 0` / `balance > 0` smoke test — it closes the loop between quoting (already proven wei-exact by `differential.rs`) and building.
+
+**`ForkExec` harness** — a lean, self-contained execution harness in amm-rs (not coupled to any external app harness). It exposes exactly what an execution test needs and manages the fork lifecycle:
+- `ForkExec<P: Provider>` — **generic** over the provider (don't hand-type alloy's nested filler stack). Built via `ProviderBuilder::new().connect_anvil_with_config(|a| a.fork(url).fork_block_number(B))` (the current alloy 2.3 method — `on_anvil_with_config` is deprecated). Dev-deps: alloy `provider-anvil-node` (spawn) **+** `provider-anvil-api` (cheatcodes) **+** `node-bindings`. No manual ports, sleeps, or leaked child processes.
+- `fund(who, asset, amount)` — instant funding via `anvil_set_storage_at` on the token's `balanceOf` slot. **Also `anvil_set_balance(who, 100 ETH)`** — an impersonated sender needs gas ETH or every tx fails "insufficient funds."
+- `approve(who, token, spender)` — impersonate + ERC-20 `approve`.
+- `submit(&UnsignedTx, from) -> ExecOutput` — a real tx from an impersonated `from`; decodes the router return **and** the recipient's balance delta. Takes `&UnsignedTx` (via the `From` bridge), not loose args.
+- `snapshot()` / `revert(id)` — `anvil_snapshot`/`anvil_revert` for **per-test isolation**.
+- **Same-block discipline:** the quote's reserves are fetched at the fork's *exact* block (assert `get_block_number() == B` and read through the fork provider), or the wei-exact assertion is an off-by-one flake.
+
+The Anvil backend is **swappable**: the same `ForkExec` interface can later run on in-process `revm` + `foundry-fork-db` (offline-reproducible, per-commit-CI speed) without touching the tests. Anvil-first for fidelity; revm later for scale.
+
+**Assertion precision** mirrors `differential.rs`: **wei-exact** for constant-product/stableswap (V2, Curve stable, Aerodrome); **bounded-ppm** for large concentrated-liquidity swaps (V3/V4/Slipstream), where the only divergence is our finite tick-window fetch, not an encoding error. Small in-window concentrated swaps are asserted wei-exact.
+
+- **Differential-execution test per pool (mandatory, gating):** the flow above via `ForkExec`, covering **all four directions the protocol supports** — exact-in ERC-20, exact-out ERC-20, native-in, native-out — not just exact-in. No protocol lands without on-chain proof of each. (The draft plan proved only 1 of 4; that was flagged and fixed.)
+- **Golden calldata vectors:** decode our own built calldata and assert every field (selector, path, `amountOutMin`/`amountInMax` = the slippage bound, recipient, deadline) — a fast, network-free regression guard.
 - **Unit:** slippage-bound application, native-in/out value+wrap/unwrap logic, approval-mode branching, exact-out symmetry — all network-free.
 
 ### 3.8 Curve — test-matrix-first, all 12 variants
