@@ -22,11 +22,12 @@ pub mod error;
 pub mod executable;
 pub mod options;
 pub mod prepared;
+pub mod protocols;
 pub mod types;
 
 pub use config::{ChainConfig, Routers};
 pub use error::{BuildError, MissingAddr};
-pub use executable::{as_executable, Executable};
-pub use options::{resolve, ApprovalMode, Deadline, ExecutionOptions, Recipient};
+pub use executable::{Executable, as_executable};
+pub use options::{ApprovalMode, Deadline, ExecutionOptions, Recipient, resolve};
 pub use prepared::{ApprovalRequirement, PreparedSwap, Route};
 pub use types::{Currency, CurrencyAmount, TradeType, UnsignedTx};

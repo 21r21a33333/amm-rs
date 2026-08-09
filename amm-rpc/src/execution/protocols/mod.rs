@@ -1,0 +1,7 @@
+//! Per-protocol swap encoders.
+//!
+//! Each sub-module implements [`crate::execution::executable::Executable`] for
+//! its pool type and provides the ABI-encoding machinery needed to produce a
+//! valid [`crate::execution::prepared::PreparedSwap`].
+
+pub mod uniswap_v2;

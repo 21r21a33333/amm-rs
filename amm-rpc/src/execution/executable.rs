@@ -5,6 +5,8 @@
 //! point: it tries a `downcast_ref` for each known concrete pool type and returns
 //! `None` for pools with no encoder yet registered.
 
+use core::any::Any;
+
 use amm_core::primitives::asset::AssetAmount;
 use amm_core::traits::pool::Pool;
 
@@ -22,9 +24,7 @@ mod private {
 }
 
 /// Re-export so downstream modules in this crate can write `impl Sealed for …`
-/// without reaching into the private module directly. Pre-staged for Task 8;
-/// unused until `impl Sealed for UniswapV2Pool` lands.
-#[allow(unused_imports)]
+/// without reaching into the private module directly.
 pub(crate) use private::Sealed;
 
 /// A pool that can encode an on-chain swap transaction.
@@ -73,12 +73,11 @@ pub trait Executable: private::Sealed {
 /// Tries each known concrete pool type via `downcast_ref` (TypeId is the
 /// safety check — no `PoolKind` gate needed). Returns `None` for pools whose
 /// `Executable` impl has not yet landed.
-///
-/// The `UniswapV2Pool` arm is activated in the next task, once
-/// `impl Executable for UniswapV2Pool` exists and compiles. Until then the
-/// body is intentionally `None` and the test below asserts that.
 pub fn as_executable(pool: &dyn Pool) -> Option<&dyn Executable> {
-    let _ = pool; // dispatch arms activated next task
+    let any: &dyn Any = pool;
+    if let Some(p) = any.downcast_ref::<amm_core::protocols::uniswap::v2::UniswapV2Pool>() {
+        return Some(p);
+    }
     None
 }
 
@@ -92,18 +91,13 @@ mod tests {
 
     use super::as_executable;
 
-    /// `as_executable` returns `None` until the `UniswapV2Pool` arm is activated
-    /// in the next task. This test will be replaced (not kept) at that point.
+    /// `as_executable` returns `Some` for a `UniswapV2Pool` — the dispatch arm
+    /// is active once `impl Executable for UniswapV2Pool` lands.
     #[test]
-    fn as_executable_is_none_before_v2_impl_lands() {
+    fn as_executable_is_some_for_v2_pool() {
         let a = AssetId::new(ChainId(1), B256::left_padding_from(&[1]));
         let b = AssetId::new(ChainId(1), B256::left_padding_from(&[2]));
-        let pool = UniswapV2Pool::new(
-            PoolId::new("1:univ2:0x"),
-            [a, b],
-            [U256::from(1u64); 2],
-            30,
-        );
-        assert!(as_executable(&pool as &dyn Pool).is_none());
+        let pool = UniswapV2Pool::new(PoolId::new("1:univ2:0x"), [a, b], [U256::from(1u64); 2], 30);
+        assert!(as_executable(&pool as &dyn Pool).is_some());
     }
 }
