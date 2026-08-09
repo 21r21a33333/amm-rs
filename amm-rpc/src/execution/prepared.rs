@@ -115,7 +115,10 @@ mod tests {
         let route = Route::new_single_hop(a, b, TradeType::ExactIn);
 
         assert_eq!(route.hops, vec![a, b], "hops should be [input, output]");
-        assert!(route.fee_tiers.is_empty(), "fee_tiers should be empty for new_single_hop");
+        assert!(
+            route.fee_tiers.is_empty(),
+            "fee_tiers should be empty for new_single_hop"
+        );
         assert_eq!(route.trade_type, TradeType::ExactIn);
     }
 

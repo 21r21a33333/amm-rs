@@ -172,23 +172,22 @@ mod tests {
     #[test]
     fn with_recipient_override_sticks() {
         let addr = Address::repeat_byte(0xab);
-        let opts = ExecutionOptions::new(slippage_50bps())
-            .with_recipient(Recipient::To(addr));
+        let opts = ExecutionOptions::new(slippage_50bps()).with_recipient(Recipient::To(addr));
         assert_eq!(opts.recipient, Recipient::To(addr));
     }
 
     #[test]
     fn with_deadline_override_sticks() {
-        let opts = ExecutionOptions::new(slippage_50bps())
-            .with_deadline(Deadline::AtBlock(999));
+        let opts = ExecutionOptions::new(slippage_50bps()).with_deadline(Deadline::AtBlock(999));
         assert_eq!(opts.deadline, Deadline::AtBlock(999));
     }
 
     #[test]
     fn with_approval_override_sticks() {
         let sig = Bytes::from(vec![0xde, 0xad]);
-        let opts = ExecutionOptions::new(slippage_50bps())
-            .with_approval(ApprovalMode::Permit2 { signature: sig.clone() });
+        let opts = ExecutionOptions::new(slippage_50bps()).with_approval(ApprovalMode::Permit2 {
+            signature: sig.clone(),
+        });
         assert_eq!(opts.approval, ApprovalMode::Permit2 { signature: sig });
     }
 
@@ -204,8 +203,7 @@ mod tests {
         let ratio = Ratio::new(U256::from(3u64), U256::from(1u64)).unwrap();
         let price = Price::new(base, quote, ratio).unwrap();
 
-        let opts = ExecutionOptions::new(slippage_50bps())
-            .with_price_limit(Some(price.clone()));
+        let opts = ExecutionOptions::new(slippage_50bps()).with_price_limit(Some(price.clone()));
         assert_eq!(opts.price_limit, Some(price));
     }
 
@@ -237,8 +235,7 @@ mod tests {
     fn resolve_is_noop_on_at_block_deadline() {
         let now = 1_000_000u64;
         let sender = Address::repeat_byte(0x33);
-        let opts = ExecutionOptions::new(slippage_50bps())
-            .with_deadline(Deadline::AtBlock(200));
+        let opts = ExecutionOptions::new(slippage_50bps()).with_deadline(Deadline::AtBlock(200));
         let resolved = resolve(opts, now, sender);
         assert_eq!(resolved.deadline, Deadline::AtBlock(200));
     }

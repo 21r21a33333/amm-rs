@@ -82,8 +82,7 @@ mod upcast_tests {
     fn dyn_pool_upcasts_to_any_and_downcasts_to_concrete() {
         let a = AssetId::new(ChainId(1), B256::left_padding_from(&[1]));
         let b = AssetId::new(ChainId(1), B256::left_padding_from(&[2]));
-        let pool =
-            UniswapV2Pool::new(PoolId::new("1:univ2:0x"), [a, b], [U256::from(1u64); 2], 30);
+        let pool = UniswapV2Pool::new(PoolId::new("1:univ2:0x"), [a, b], [U256::from(1u64); 2], 30);
         let any: &dyn core::any::Any = &pool as &dyn Pool;
         assert!(any.downcast_ref::<UniswapV2Pool>().is_some());
     }

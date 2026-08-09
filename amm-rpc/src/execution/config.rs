@@ -122,7 +122,10 @@ mod tests {
         assert!(
             matches!(
                 err,
-                BuildError::MissingChainConfig { what: MissingAddr::V2Router, .. }
+                BuildError::MissingChainConfig {
+                    what: MissingAddr::V2Router,
+                    ..
+                }
             ),
             "expected MissingChainConfig {{ what: V2Router, .. }}, got: {err:?}"
         );
@@ -131,8 +134,10 @@ mod tests {
     #[test]
     fn router_v2_present_returns_ok_address() {
         let addr = Address::repeat_byte(0xAB);
-        let cfg = ChainConfig::new(ChainId(1), test_weth())
-            .with_routers(Routers { v2: Some(addr), ..Default::default() });
+        let cfg = ChainConfig::new(ChainId(1), test_weth()).with_routers(Routers {
+            v2: Some(addr),
+            ..Default::default()
+        });
         assert_eq!(cfg.router_v2(), Ok(addr));
     }
 }

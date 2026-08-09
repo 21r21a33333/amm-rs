@@ -142,12 +142,16 @@ mod tests {
     fn currency_amount_hash_and_eq() {
         use std::collections::HashSet;
         let weth_asset = weth();
-        let a = CurrencyAmount { currency: Currency::Token(weth_asset), raw: U256::from(100u64) };
-        let b = CurrencyAmount { currency: Currency::Token(weth_asset), raw: U256::from(100u64) };
+        let a = CurrencyAmount {
+            currency: Currency::Token(weth_asset),
+            raw: U256::from(100u64),
+        };
+        let b = CurrencyAmount {
+            currency: Currency::Token(weth_asset),
+            raw: U256::from(100u64),
+        };
         let mut set = HashSet::new();
         set.insert(a);
         assert!(set.contains(&b));
     }
-
-
 }
