@@ -1,6 +1,8 @@
 //! The core [`Pool`] trait: the open, object-safe interface every AMM pool
 //! implements.
 
+use core::any::Any;
+
 use crate::error::QuoteError;
 use crate::primitives::asset::{AssetAmount, AssetId};
 use crate::primitives::pool::PoolId;
@@ -17,7 +19,11 @@ use crate::traits::pricing::Pricing;
 /// without touching this crate. Richer capabilities (exact-out, spot price,
 /// price impact, limits) live in opt-in extension traits, reachable from a
 /// `dyn Pool` via the `as_*` accessors below.
-pub trait Pool: Send + Sync {
+///
+/// NOTE: the `Any` supertrait imposes `Pool: 'static` — a pool may not borrow
+/// non-`'static` data. This enables `&dyn Pool → &dyn Any` downcast dispatch in
+/// downstream crates (amm-client). Removing it is a breaking change.
+pub trait Pool: Any + Send + Sync {
     /// This pool's stable identifier.
     fn id(&self) -> &PoolId;
 
@@ -59,3 +65,26 @@ pub trait Pool: Send + Sync {
 /// or a `Self: Sized`-free requirement) breaks it. Object-safety is load-bearing
 /// — `path::quote_path` and `amm-rpc` both hold `dyn Pool`.
 const _: fn(&dyn Pool) = |_| {};
+
+#[cfg(all(test, feature = "uniswap-v2"))]
+mod upcast_tests {
+    use super::*;
+    use crate::{
+        primitives::{
+            asset::{AssetId, ChainId},
+            pool::PoolId,
+        },
+        protocols::uniswap::v2::UniswapV2Pool,
+    };
+    use alloy_primitives::{B256, U256};
+
+    #[test]
+    fn dyn_pool_upcasts_to_any_and_downcasts_to_concrete() {
+        let a = AssetId::new(ChainId(1), B256::left_padding_from(&[1]));
+        let b = AssetId::new(ChainId(1), B256::left_padding_from(&[2]));
+        let pool =
+            UniswapV2Pool::new(PoolId::new("1:univ2:0x"), [a, b], [U256::from(1u64); 2], 30);
+        let any: &dyn core::any::Any = &pool as &dyn Pool;
+        assert!(any.downcast_ref::<UniswapV2Pool>().is_some());
+    }
+}
