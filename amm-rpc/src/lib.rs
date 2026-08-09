@@ -8,6 +8,7 @@
 
 mod discover;
 pub mod error;
+pub mod execution;
 pub mod multicall;
 pub mod protocols;
 pub mod provider;

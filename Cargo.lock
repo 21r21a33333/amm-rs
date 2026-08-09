@@ -682,6 +682,7 @@ dependencies = [
  "amm-core",
  "async-trait",
  "curve-adapter",
+ "serde",
  "thiserror",
  "tokio",
 ]
