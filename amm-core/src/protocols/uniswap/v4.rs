@@ -6,7 +6,7 @@
 //! protocol fee), and hooks — a pool whose hook alters the curve or sets a
 //! dynamic fee cannot be quoted statically and is refused.
 
-use alloy_primitives::{B256, U256};
+use alloy_primitives::{Address, B256, U256};
 
 use crate::error::QuoteError;
 use crate::primitives::asset::{AssetAmount, AssetId};
@@ -39,6 +39,16 @@ pub enum Hooks {
 /// `assets[0]`/`assets[1]` are the pool's `token0`/`token1`. Fees are stored
 /// per direction in pips (V4 protocol fees are per-direction), already compounded
 /// with the LP fee via [`UniswapV4Pool::combined_fee`].
+///
+/// The last three fields are the pool's on-chain **identity** — the `PoolKey`
+/// fields (`currency0`/`currency1` from `assets`, plus `key_fee`, `tick_spacing`,
+/// `hooks_address`) whose `abi.encode` hashes to `pool_id`. Quoting never needs
+/// them, but building a swap does: a V4 swap must reconstruct the full `PoolKey`.
+/// `key_fee` is the *static* pool-key fee (the value in the key), distinct from
+/// the live per-direction fees above — for a dynamic-fee pool they differ, and
+/// only the static one hashes to `pool_id`. `hooks_address` is kept separate from
+/// the `hooks` quoting flag: a `Hooks::None` pool can still carry a non-zero,
+/// price-neutral hook address that the `PoolKey` must include.
 #[derive(Clone, Debug)]
 pub struct UniswapV4Pool {
     id: PoolId,
@@ -51,13 +61,18 @@ pub struct UniswapV4Pool {
     fee_one_for_zero: u32,
     tick_data: TickData,
     hooks: Hooks,
+    key_fee: u32,
+    tick_spacing: i32,
+    hooks_address: Address,
 }
 
 impl UniswapV4Pool {
     /// Construct a pool from a slot0 + liquidity + tick-state snapshot.
     ///
     /// `fee_zero_for_one`/`fee_one_for_zero` are the effective per-direction fees
-    /// in pips (see [`UniswapV4Pool::combined_fee`]).
+    /// in pips (see [`UniswapV4Pool::combined_fee`]). `key_fee`, `tick_spacing`,
+    /// and `hooks_address` are the `PoolKey` identity fields a swap needs (see the
+    /// struct docs); they do not affect quoting.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: PoolId,
@@ -70,6 +85,9 @@ impl UniswapV4Pool {
         fee_one_for_zero: u32,
         tick_data: TickData,
         hooks: Hooks,
+        key_fee: u32,
+        tick_spacing: i32,
+        hooks_address: Address,
     ) -> Self {
         Self {
             id,
@@ -82,6 +100,9 @@ impl UniswapV4Pool {
             fee_one_for_zero,
             tick_data,
             hooks,
+            key_fee,
+            tick_spacing,
+            hooks_address,
         }
     }
 
@@ -96,6 +117,22 @@ impl UniswapV4Pool {
     /// The 32-byte V4 pool id (hash of the pool key).
     pub fn pool_id(&self) -> B256 {
         self.pool_id
+    }
+
+    /// The static pool-key fee (pips) — the `PoolKey.fee` value that hashes to
+    /// [`pool_id`](Self::pool_id), not the live effective fee used for quoting.
+    pub fn key_fee(&self) -> u32 {
+        self.key_fee
+    }
+
+    /// The pool's tick spacing (`PoolKey.tickSpacing`).
+    pub fn tick_spacing(&self) -> i32 {
+        self.tick_spacing
+    }
+
+    /// The pool's hook contract address (`PoolKey.hooks`; zero if none).
+    pub fn hooks_address(&self) -> Address {
+        self.hooks_address
     }
 
     /// The effective fee (pips) for this swap direction.
@@ -255,7 +292,18 @@ mod tests {
             fee_one_for_zero,
             full_range_ticks(liq),
             hooks,
+            3000,
+            60,
+            Address::ZERO,
         )
+    }
+
+    #[test]
+    fn identity_accessors_expose_the_pool_key_fields() {
+        let pool = full_range_pool(3000, 3000, Hooks::None);
+        assert_eq!(pool.key_fee(), 3000);
+        assert_eq!(pool.tick_spacing(), 60);
+        assert_eq!(pool.hooks_address(), Address::ZERO);
     }
 
     #[test]

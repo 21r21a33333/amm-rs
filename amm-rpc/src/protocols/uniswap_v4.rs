@@ -86,6 +86,9 @@ pub struct V4PoolConfig {
     pub tick_spacing: i32,
     /// Whether the pool's hook keeps quotes reproducible from static state.
     pub hooks: Hooks,
+    /// The hook contract address (`PoolKey.hooks`; zero if none). Retained for
+    /// swap building — a swap must reconstruct the full `PoolKey`.
+    pub hooks_address: Address,
 }
 
 impl V4PoolConfig {
@@ -116,6 +119,7 @@ impl V4PoolConfig {
             fee,
             tick_spacing,
             hooks,
+            hooks_address,
         }
     }
 }
@@ -165,8 +169,10 @@ impl<P: Provider> UniswapV4Source<P> {
                 id: pool_id(key),
                 pool_id: config.pool_id,
                 assets,
+                fee: config.fee,
                 tick_spacing: config.tick_spacing,
                 hooks: config.hooks,
+                hooks_address: config.hooks_address,
                 state_slot: pool_state_slot(config.pool_id),
             });
         }
@@ -180,8 +186,12 @@ struct PoolPlan {
     id: PoolId,
     pool_id: B256,
     assets: [AssetId; 2],
+    /// Static pool-key fee (pips) — for swap building, not quoting.
+    fee: u32,
     tick_spacing: i32,
     hooks: Hooks,
+    /// Hook contract address for the `PoolKey` — for swap building.
+    hooks_address: Address,
     state_slot: B256,
 }
 
@@ -321,6 +331,9 @@ fn build_pools(
                 fee_one_for_zero,
                 TickData::from_ticks(plan.tick_spacing, ticks),
                 plan.hooks,
+                plan.fee,
+                plan.tick_spacing,
+                plan.hooks_address,
             )) as Box<dyn Pool>
         })
         .collect()
@@ -550,8 +563,10 @@ mod tests {
             id: PoolId::new("1:uniswap-v4:0xfull"),
             pool_id: B256::repeat_byte(0xAA),
             assets: [usdc(), weth()],
+            fee: 3000,
             tick_spacing: 60,
             hooks: Hooks::None,
+            hooks_address: Address::ZERO,
             state_slot: B256::ZERO,
         };
         let state = PoolState {
@@ -586,6 +601,42 @@ mod tests {
             .unwrap();
         assert!(out.raw < amount_in);
         assert!(out.raw > amount_in * U256::from(996u64) / U256::from(1000u64));
+    }
+
+    /// The execution prerequisite: a built pool must retain every `PoolKey`
+    /// field, so a swap can reconstruct the key that hashes to its `pool_id`.
+    /// A *non-zero* hook address proves `hooks_address` is genuinely retained
+    /// (the old path derived the id from it, then dropped it).
+    #[test]
+    fn retained_identity_reconstructs_pool_id() {
+        let hook = address!("0x00000000000000000000000000000000cafe0000");
+        let config = V4PoolConfig::new(C0, C1, usdc(), weth(), 3000, 60, hook, Hooks::None);
+        let pool = UniswapV4Pool::new(
+            PoolId::new("1:uniswap-v4:x"),
+            config.pool_id,
+            [config.token0, config.token1],
+            U256::from(SQRT_1_1),
+            1,
+            0,
+            500,
+            500,
+            TickData::from_ticks(60, std::iter::empty()),
+            Hooks::None,
+            config.fee,
+            config.tick_spacing,
+            config.hooks_address,
+        );
+        // Rebuild the key from the pool's own identity accessors and confirm it
+        // hashes back to the stored id — i.e. the pool is swap-encodable.
+        let rederived = B256::from(derive_pool_id(
+            C0,
+            C1,
+            pool.key_fee(),
+            pool.tick_spacing(),
+            pool.hooks_address(),
+        ));
+        assert_eq!(rederived, config.pool_id);
+        assert_eq!(pool.hooks_address(), hook);
     }
 
     /// End-to-end refresh against a forked mainnet RPC. Gated: set
