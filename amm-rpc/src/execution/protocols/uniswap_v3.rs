@@ -12,26 +12,20 @@
 //! ETH before forwarding it.
 
 use alloy::primitives::aliases::U24;
-use alloy::primitives::{Address, U256, address};
+use alloy::primitives::{Address, Bytes};
 use alloy::{sol, sol_types::SolCall};
 use amm_core::primitives::asset::AssetAmount;
 use amm_core::protocols::uniswap::v3::UniswapV3Pool;
-use amm_core::traits::pool::Pool;
 
 use crate::execution::{
     config::ChainConfig,
     error::BuildError,
     executable::{Executable, Sealed},
-    multicall::encode_multicall,
     options::ExecutionOptions,
     prepared::{PreparedSwap, Route},
-    protocols::common,
-    types::{Currency, CurrencyAmount, TradeType},
+    protocols::swaprouter02::{self, SingleParams, SwapRouter02},
+    types::{Currency, CurrencyAmount},
 };
-
-/// Solidity `address(2)` — SwapRouter02 uses this sentinel to mean "keep funds
-/// in the router" so a subsequent `unwrapWETH9` call can forward them as ETH.
-const ADDRESS_THIS: Address = address!("0000000000000000000000000000000000000002");
 
 sol! {
     /// Minimal ABI surface for the Uniswap V3 SwapRouter02.
@@ -63,6 +57,50 @@ sol! {
     }
 }
 
+impl SwapRouter02 for UniswapV3Pool {
+    fn router(&self, ctx: &ChainConfig) -> Result<Address, BuildError> {
+        ctx.router_v3()
+    }
+
+    fn encode_exact_in(&self, p: &SingleParams) -> Result<Bytes, BuildError> {
+        let fee = U24::try_from(self.fee_pips()).map_err(|_| BuildError::Overflow)?;
+        Ok(ISwapRouter02::exactInputSingleCall {
+            params: ISwapRouter02::ExactInputSingleParams {
+                tokenIn: p.token_in,
+                tokenOut: p.token_out,
+                fee,
+                recipient: p.recipient,
+                amountIn: p.amount,
+                amountOutMinimum: p.limit_amount,
+                sqrtPriceLimitX96: p.sqrt_limit,
+            },
+        }
+        .abi_encode()
+        .into())
+    }
+
+    fn encode_exact_out(&self, p: &SingleParams) -> Result<Bytes, BuildError> {
+        let fee = U24::try_from(self.fee_pips()).map_err(|_| BuildError::Overflow)?;
+        Ok(ISwapRouter02::exactOutputSingleCall {
+            params: ISwapRouter02::ExactOutputSingleParams {
+                tokenIn: p.token_in,
+                tokenOut: p.token_out,
+                fee,
+                recipient: p.recipient,
+                amountOut: p.amount,
+                amountInMaximum: p.limit_amount,
+                sqrtPriceLimitX96: p.sqrt_limit,
+            },
+        }
+        .abi_encode()
+        .into())
+    }
+
+    fn deadline_in_multicall(&self) -> bool {
+        true
+    }
+}
+
 impl Sealed for UniswapV3Pool {}
 
 impl Executable for UniswapV3Pool {
@@ -75,118 +113,7 @@ impl Executable for UniswapV3Pool {
         quoted_out: &AssetAmount,
         opts: &ExecutionOptions,
     ) -> Result<PreparedSwap, BuildError> {
-        let r = common::resolve_swap(
-            ctx,
-            self,
-            amount_in.currency,
-            to,
-            route,
-            opts,
-            TradeType::ExactIn,
-        )?;
-        let sqrt_limit =
-            common::resolve_sqrt_limit(self.assets(), opts.price_limit.as_ref(), route.hops.len())?;
-
-        let min = opts.slippage.min_amount_out(quoted_out);
-        let router = ctx.router_v3()?;
-        let deadline_secs = u64::try_from(r.deadline).map_err(|_| BuildError::Overflow)?;
-        let fee = U24::try_from(self.fee_pips()).map_err(|_| BuildError::Overflow)?;
-
-        match (r.native_in, r.native_out) {
-            // Native → Native is always a configuration error.
-            (true, true) => Err(BuildError::NativeMismatch),
-
-            // Native-in exact-in (ETH → token): tokenIn = WETH, recipient = user,
-            // tx.value = amount_in.raw, no ERC-20 approval.
-            (true, false) => {
-                let params = ISwapRouter02::ExactInputSingleParams {
-                    tokenIn: common::evm_addr(&r.input),
-                    tokenOut: common::evm_addr(&r.output),
-                    fee,
-                    recipient: r.recipient,
-                    amountIn: amount_in.raw,
-                    amountOutMinimum: min.raw,
-                    sqrtPriceLimitX96: sqrt_limit,
-                };
-                let inner = ISwapRouter02::exactInputSingleCall { params }
-                    .abi_encode()
-                    .into();
-                let data = encode_multicall(Some(deadline_secs), vec![inner]);
-                Ok(common::prepared(
-                    ctx,
-                    router,
-                    data,
-                    // ETH is attached as msg.value; no ERC-20 transfer.
-                    amount_in.raw,
-                    min,
-                    None,
-                    // Native ETH sent as msg.value — no ERC-20 approval required.
-                    None,
-                ))
-            }
-
-            // Native-out exact-in (token → ETH): swap recipient = ADDRESS_THIS so the router
-            // holds the WETH, then unwrapWETH9 forwards it as ETH to the user.
-            (false, true) => {
-                let params = ISwapRouter02::ExactInputSingleParams {
-                    tokenIn: common::evm_addr(&r.input),
-                    tokenOut: common::evm_addr(&r.output),
-                    fee,
-                    // Route output to the router itself so unwrapWETH9 can act on it.
-                    recipient: ADDRESS_THIS,
-                    amountIn: amount_in.raw,
-                    amountOutMinimum: min.raw,
-                    sqrtPriceLimitX96: sqrt_limit,
-                };
-                let swap_call = ISwapRouter02::exactInputSingleCall { params }
-                    .abi_encode()
-                    .into();
-                let unwrap_call = ISwapRouter02::unwrapWETH9Call {
-                    amountMinimum: min.raw,
-                    recipient: r.recipient,
-                }
-                .abi_encode()
-                .into();
-                let data = encode_multicall(Some(deadline_secs), vec![swap_call, unwrap_call]);
-                // min_received.asset is WETH; the user actually receives unwrapped ETH —
-                // this matches the PreparedSwap doc (asset represents the on-chain token).
-                Ok(common::prepared(
-                    ctx,
-                    router,
-                    data,
-                    U256::ZERO,
-                    min,
-                    None,
-                    Some(common::erc20_approval(router, r.input, amount_in.raw)),
-                ))
-            }
-
-            // ERC-20 → ERC-20: direct exactInputSingle, no wrap/unwrap.
-            (false, false) => {
-                let params = ISwapRouter02::ExactInputSingleParams {
-                    tokenIn: common::evm_addr(&r.input),
-                    tokenOut: common::evm_addr(&r.output),
-                    fee,
-                    recipient: r.recipient,
-                    amountIn: amount_in.raw,
-                    amountOutMinimum: min.raw,
-                    sqrtPriceLimitX96: sqrt_limit,
-                };
-                let inner = ISwapRouter02::exactInputSingleCall { params }
-                    .abi_encode()
-                    .into();
-                let data = encode_multicall(Some(deadline_secs), vec![inner]);
-                Ok(common::prepared(
-                    ctx,
-                    router,
-                    data,
-                    U256::ZERO,
-                    min,
-                    None,
-                    Some(common::erc20_approval(router, r.input, amount_in.raw)),
-                ))
-            }
-        }
+        swaprouter02::build_exact_in(self, self, ctx, amount_in, to, route, quoted_out, opts)
     }
 
     fn build_swap_exact_out(
@@ -198,118 +125,7 @@ impl Executable for UniswapV3Pool {
         quoted_in: &AssetAmount,
         opts: &ExecutionOptions,
     ) -> Result<PreparedSwap, BuildError> {
-        let r = common::resolve_swap(
-            ctx,
-            self,
-            from,
-            amount_out.currency,
-            route,
-            opts,
-            TradeType::ExactOut,
-        )?;
-        let sqrt_limit =
-            common::resolve_sqrt_limit(self.assets(), opts.price_limit.as_ref(), route.hops.len())?;
-
-        let max = opts.slippage.max_amount_in(quoted_in);
-        let router = ctx.router_v3()?;
-        let deadline_secs = u64::try_from(r.deadline).map_err(|_| BuildError::Overflow)?;
-        let fee = U24::try_from(self.fee_pips()).map_err(|_| BuildError::Overflow)?;
-
-        match (r.native_in, r.native_out) {
-            // Native → Native: already rejected above; unreachable in practice.
-            (true, true) => Err(BuildError::NativeMismatch),
-
-            // Native-in exact-out (ETH → token): tx.value = max input ceiling; router
-            // refunds any unspent ETH via refundETH().
-            (true, false) => {
-                let params = ISwapRouter02::ExactOutputSingleParams {
-                    tokenIn: common::evm_addr(&r.input),
-                    tokenOut: common::evm_addr(&r.output),
-                    fee,
-                    recipient: r.recipient,
-                    amountOut: amount_out.raw,
-                    amountInMaximum: max.raw,
-                    sqrtPriceLimitX96: sqrt_limit,
-                };
-                let swap_call = ISwapRouter02::exactOutputSingleCall { params }
-                    .abi_encode()
-                    .into();
-                let refund_call = ISwapRouter02::refundETHCall {}.abi_encode().into();
-                let data = encode_multicall(Some(deadline_secs), vec![swap_call, refund_call]);
-                Ok(common::prepared(
-                    ctx,
-                    router,
-                    data,
-                    // Attach the ETH ceiling as msg.value; refundETH returns any surplus.
-                    max.raw,
-                    AssetAmount::new(r.output, amount_out.raw),
-                    Some(AssetAmount::new(r.input, max.raw)),
-                    // Native ETH sent as msg.value — no ERC-20 approval required.
-                    None,
-                ))
-            }
-
-            // Native-out exact-out (token → ETH): swap recipient = ADDRESS_THIS so the
-            // router holds the WETH, then unwrapWETH9 forwards the exact target amount as ETH.
-            (false, true) => {
-                let params = ISwapRouter02::ExactOutputSingleParams {
-                    tokenIn: common::evm_addr(&r.input),
-                    tokenOut: common::evm_addr(&r.output),
-                    fee,
-                    // Route output to the router itself so unwrapWETH9 can act on it.
-                    recipient: ADDRESS_THIS,
-                    amountOut: amount_out.raw,
-                    amountInMaximum: max.raw,
-                    sqrtPriceLimitX96: sqrt_limit,
-                };
-                let swap_call = ISwapRouter02::exactOutputSingleCall { params }
-                    .abi_encode()
-                    .into();
-                // Unwrap exactly the target amount (not the min — this is exact-out).
-                let unwrap_call = ISwapRouter02::unwrapWETH9Call {
-                    amountMinimum: amount_out.raw,
-                    recipient: r.recipient,
-                }
-                .abi_encode()
-                .into();
-                let data = encode_multicall(Some(deadline_secs), vec![swap_call, unwrap_call]);
-                Ok(common::prepared(
-                    ctx,
-                    router,
-                    data,
-                    U256::ZERO,
-                    AssetAmount::new(r.output, amount_out.raw),
-                    Some(AssetAmount::new(r.input, max.raw)),
-                    Some(common::erc20_approval(router, r.input, max.raw)),
-                ))
-            }
-
-            // ERC-20 → ERC-20: direct exactOutputSingle, no wrap/unwrap.
-            (false, false) => {
-                let params = ISwapRouter02::ExactOutputSingleParams {
-                    tokenIn: common::evm_addr(&r.input),
-                    tokenOut: common::evm_addr(&r.output),
-                    fee,
-                    recipient: r.recipient,
-                    amountOut: amount_out.raw,
-                    amountInMaximum: max.raw,
-                    sqrtPriceLimitX96: sqrt_limit,
-                };
-                let inner = ISwapRouter02::exactOutputSingleCall { params }
-                    .abi_encode()
-                    .into();
-                let data = encode_multicall(Some(deadline_secs), vec![inner]);
-                Ok(common::prepared(
-                    ctx,
-                    router,
-                    data,
-                    U256::ZERO,
-                    AssetAmount::new(r.output, amount_out.raw),
-                    Some(AssetAmount::new(r.input, max.raw)),
-                    Some(common::erc20_approval(router, r.input, max.raw)),
-                ))
-            }
-        }
+        swaprouter02::build_exact_out(self, self, ctx, amount_out, from, route, quoted_in, opts)
     }
 }
 
@@ -323,8 +139,9 @@ mod tests {
     use amm_core::protocols::uniswap::v3::{TickData, UniswapV3Pool};
     use amm_core::slippage::Slippage;
 
-    use super::{ADDRESS_THIS, ISwapRouter02};
+    use super::ISwapRouter02;
     use crate::execution::multicall::IMulticall;
+    use crate::execution::protocols::swaprouter02::ADDRESS_THIS;
     use crate::execution::{
         config::{ChainConfig, Routers},
         error::BuildError,
