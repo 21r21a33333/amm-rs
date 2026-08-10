@@ -21,6 +21,12 @@ pub enum MissingAddr {
     Permit2,
     /// Wrapped native token (WETH/WMATIC/…) contract.
     Weth,
+    /// Slipstream router contract.
+    SlipstreamRouter,
+    /// Aerodrome (Solidly) router contract.
+    AerodromeRouter,
+    /// Aerodrome (Solidly) factory contract.
+    AerodromeFactory,
 }
 
 /// All the ways a swap build step can fail before touching the network.

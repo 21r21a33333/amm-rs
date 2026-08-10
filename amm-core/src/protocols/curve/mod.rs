@@ -2,7 +2,11 @@
 //! covers every StableSwap and CryptoSwap variant. The N-asset coin-index
 //! resolution shared by the trait impls lives here.
 
+/// [`CurveInterface`] enum — the 4-way ABI family selector for `exchange` calls.
+pub mod interface;
 pub mod pool;
+
+pub use interface::CurveInterface;
 
 use crate::primitives::asset::AssetId;
 

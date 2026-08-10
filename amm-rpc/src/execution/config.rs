@@ -31,6 +31,12 @@ pub struct Routers {
     pub pool_manager: Option<Address>,
     /// Permit2 contract address.
     pub permit2: Option<Address>,
+    /// Slipstream router contract address.
+    pub slipstream: Option<Address>,
+    /// Aerodrome (Solidly) router contract address.
+    pub aerodrome: Option<Address>,
+    /// Aerodrome (Solidly) factory contract address.
+    pub aerodrome_factory: Option<Address>,
 }
 
 /// Per-chain address configuration required by the swap build layer.
@@ -97,6 +103,92 @@ impl ChainConfig {
             what: MissingAddr::V2Router,
         })
     }
+
+    /// Return the Uniswap V3 router address, or a typed error if unconfigured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::MissingChainConfig`] with
+    /// `what = MissingAddr::V3Router` when no V3 router address has been set.
+    pub fn router_v3(&self) -> Result<Address, BuildError> {
+        self.routers.v3.ok_or(BuildError::MissingChainConfig {
+            chain: self.chain,
+            what: MissingAddr::V3Router,
+        })
+    }
+
+    /// Return the Slipstream router address, or a typed error if unconfigured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::MissingChainConfig`] with
+    /// `what = MissingAddr::SlipstreamRouter` when no Slipstream router address has been set.
+    pub fn router_slipstream(&self) -> Result<Address, BuildError> {
+        self.routers
+            .slipstream
+            .ok_or(BuildError::MissingChainConfig {
+                chain: self.chain,
+                what: MissingAddr::SlipstreamRouter,
+            })
+    }
+
+    /// Return the Aerodrome (Solidly) router address, or a typed error if unconfigured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::MissingChainConfig`] with
+    /// `what = MissingAddr::AerodromeRouter` when no Aerodrome router address has been set.
+    pub fn router_aerodrome(&self) -> Result<Address, BuildError> {
+        self.routers
+            .aerodrome
+            .ok_or(BuildError::MissingChainConfig {
+                chain: self.chain,
+                what: MissingAddr::AerodromeRouter,
+            })
+    }
+
+    /// Return the Aerodrome (Solidly) factory address, or a typed error if unconfigured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::MissingChainConfig`] with
+    /// `what = MissingAddr::AerodromeFactory` when no Aerodrome factory address has been set.
+    pub fn aerodrome_factory(&self) -> Result<Address, BuildError> {
+        self.routers
+            .aerodrome_factory
+            .ok_or(BuildError::MissingChainConfig {
+                chain: self.chain,
+                what: MissingAddr::AerodromeFactory,
+            })
+    }
+
+    /// Return the Uniswap Universal Router address, or a typed error if unconfigured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::MissingChainConfig`] with
+    /// `what = MissingAddr::UniversalRouter` when no Universal Router address has been set.
+    pub fn router_universal(&self) -> Result<Address, BuildError> {
+        self.routers
+            .universal
+            .ok_or(BuildError::MissingChainConfig {
+                chain: self.chain,
+                what: MissingAddr::UniversalRouter,
+            })
+    }
+
+    /// Return the Permit2 contract address, or a typed error if unconfigured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::MissingChainConfig`] with
+    /// `what = MissingAddr::Permit2` when no Permit2 address has been set.
+    pub fn permit2(&self) -> Result<Address, BuildError> {
+        self.routers.permit2.ok_or(BuildError::MissingChainConfig {
+            chain: self.chain,
+            what: MissingAddr::Permit2,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -139,5 +231,161 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(cfg.router_v2(), Ok(addr));
+    }
+
+    #[test]
+    fn router_v3_missing_returns_missing_chain_config() {
+        let cfg = ChainConfig::new(ChainId(1), test_weth());
+        let err = cfg.router_v3().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BuildError::MissingChainConfig {
+                    what: MissingAddr::V3Router,
+                    ..
+                }
+            ),
+            "expected MissingChainConfig {{ what: V3Router, .. }}, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn router_v3_present_returns_ok_address() {
+        let addr = Address::repeat_byte(0xCD);
+        let cfg = ChainConfig::new(ChainId(1), test_weth()).with_routers(Routers {
+            v3: Some(addr),
+            ..Default::default()
+        });
+        assert_eq!(cfg.router_v3(), Ok(addr));
+    }
+
+    #[test]
+    fn router_slipstream_missing_returns_missing_chain_config() {
+        let cfg = ChainConfig::new(ChainId(1), test_weth());
+        let err = cfg.router_slipstream().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BuildError::MissingChainConfig {
+                    what: MissingAddr::SlipstreamRouter,
+                    ..
+                }
+            ),
+            "expected MissingChainConfig {{ what: SlipstreamRouter, .. }}, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn router_slipstream_present_returns_ok_address() {
+        let addr = Address::repeat_byte(0xEF);
+        let cfg = ChainConfig::new(ChainId(1), test_weth()).with_routers(Routers {
+            slipstream: Some(addr),
+            ..Default::default()
+        });
+        assert_eq!(cfg.router_slipstream(), Ok(addr));
+    }
+
+    #[test]
+    fn router_aerodrome_missing_returns_missing_chain_config() {
+        let cfg = ChainConfig::new(ChainId(1), test_weth());
+        let err = cfg.router_aerodrome().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BuildError::MissingChainConfig {
+                    what: MissingAddr::AerodromeRouter,
+                    ..
+                }
+            ),
+            "expected MissingChainConfig {{ what: AerodromeRouter, .. }}, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn router_aerodrome_present_returns_ok_address() {
+        let addr = Address::repeat_byte(0x12);
+        let cfg = ChainConfig::new(ChainId(1), test_weth()).with_routers(Routers {
+            aerodrome: Some(addr),
+            ..Default::default()
+        });
+        assert_eq!(cfg.router_aerodrome(), Ok(addr));
+    }
+
+    #[test]
+    fn aerodrome_factory_missing_returns_missing_chain_config() {
+        let cfg = ChainConfig::new(ChainId(1), test_weth());
+        let err = cfg.aerodrome_factory().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BuildError::MissingChainConfig {
+                    what: MissingAddr::AerodromeFactory,
+                    ..
+                }
+            ),
+            "expected MissingChainConfig {{ what: AerodromeFactory, .. }}, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn aerodrome_factory_present_returns_ok_address() {
+        let f = Address::repeat_byte(0x42);
+        let cfg = ChainConfig::new(ChainId(8453), test_weth()).with_routers(Routers {
+            aerodrome_factory: Some(f),
+            ..Default::default()
+        });
+        assert_eq!(cfg.aerodrome_factory(), Ok(f));
+    }
+
+    #[test]
+    fn router_universal_missing_returns_missing_chain_config() {
+        let cfg = ChainConfig::new(ChainId(1), test_weth());
+        let err = cfg.router_universal().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BuildError::MissingChainConfig {
+                    what: MissingAddr::UniversalRouter,
+                    ..
+                }
+            ),
+            "expected MissingChainConfig {{ what: UniversalRouter, .. }}, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn router_universal_present_returns_ok_address() {
+        let addr = Address::repeat_byte(0x34);
+        let cfg = ChainConfig::new(ChainId(1), test_weth()).with_routers(Routers {
+            universal: Some(addr),
+            ..Default::default()
+        });
+        assert_eq!(cfg.router_universal(), Ok(addr));
+    }
+
+    #[test]
+    fn permit2_missing_returns_missing_chain_config() {
+        let cfg = ChainConfig::new(ChainId(1), test_weth());
+        let err = cfg.permit2().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BuildError::MissingChainConfig {
+                    what: MissingAddr::Permit2,
+                    ..
+                }
+            ),
+            "expected MissingChainConfig {{ what: Permit2, .. }}, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn permit2_present_returns_ok_address() {
+        let addr = Address::repeat_byte(0x56);
+        let cfg = ChainConfig::new(ChainId(1), test_weth()).with_routers(Routers {
+            permit2: Some(addr),
+            ..Default::default()
+        });
+        assert_eq!(cfg.permit2(), Ok(addr));
     }
 }

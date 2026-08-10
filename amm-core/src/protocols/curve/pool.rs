@@ -2,10 +2,11 @@
 //! StableSwap and CryptoSwap variant. This wrapper adapts the chain-agnostic
 //! [`AssetId`] interface onto `curve_math::Pool`'s index-based math.
 
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
 use curve_math::Pool as CurveMathPool;
 
 use super::coin_indices;
+use super::interface::CurveInterface;
 use crate::error::QuoteError;
 use crate::primitives::asset::{AssetAmount, AssetId};
 use crate::primitives::pool::{PoolId, PoolKind};
@@ -30,13 +31,46 @@ pub struct CurvePool {
     id: PoolId,
     assets: Vec<AssetId>,
     inner: CurveMathPool,
+    pool_address: Option<Address>,
+    interface: Option<CurveInterface>,
 }
 
 impl CurvePool {
     /// Wrap a built `curve_math::Pool` with its coin ordering (`assets[k]` is
     /// coin index `k`).
     pub fn new(id: PoolId, assets: Vec<AssetId>, inner: CurveMathPool) -> Self {
-        Self { id, assets, inner }
+        Self {
+            id,
+            assets,
+            inner,
+            pool_address: None,
+            interface: None,
+        }
+    }
+
+    /// Attach the on-chain address and `exchange` ABI family the execution layer
+    /// needs. Called by the state source after `curve_adapter::build_pool`, which
+    /// cannot carry this metadata itself.
+    pub fn with_execution(mut self, address: Address, interface: CurveInterface) -> Self {
+        self.pool_address = Some(address);
+        self.interface = Some(interface);
+        self
+    }
+
+    /// The pool's on-chain address, if execution metadata has been attached.
+    pub fn pool_address(&self) -> Option<Address> {
+        self.pool_address
+    }
+
+    /// The `exchange` ABI family for this pool, if execution metadata has been attached.
+    pub fn interface(&self) -> Option<CurveInterface> {
+        self.interface
+    }
+
+    /// Coin positions `(i, j)` for a `from -> to` swap, or `None` if either coin is
+    /// absent. Public wrapper over the internal index resolution.
+    pub fn coin_indices(&self, from: &AssetId, to: &AssetId) -> Option<(usize, usize)> {
+        super::coin_indices(&self.assets, from, to)
     }
 
     /// Resolve `(i, j)` for a `from -> to` swap, or the not-in-pool error.
@@ -254,6 +288,20 @@ mod tests {
         );
         assert_eq!(pool.reserve(&weth()), None);
         assert_eq!(pool.kind(), PoolKind::CurveStable);
+    }
+
+    #[test]
+    fn execution_metadata_round_trips() {
+        use alloy_primitives::address;
+        let addr = address!("bEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7");
+        let pool = stable_3pool().with_execution(addr, CurveInterface::StableI128);
+        assert_eq!(pool.pool_address(), Some(addr));
+        assert_eq!(pool.interface(), Some(CurveInterface::StableI128));
+        // coin_indices resolves (i, j) from the two coins:
+        let (i, j) = pool
+            .coin_indices(&dai(), &usdc())
+            .expect("dai/usdc are coins");
+        assert_eq!((i, j), (0, 1));
     }
 
     #[test]
