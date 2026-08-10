@@ -96,6 +96,10 @@ pub fn as_executable(pool: &dyn Pool) -> Option<&dyn Executable> {
     {
         return Some(p);
     }
+    #[cfg(feature = "curve")]
+    if let Some(p) = any.downcast_ref::<amm_core::protocols::curve::pool::CurvePool>() {
+        return Some(p);
+    }
     None
 }
 

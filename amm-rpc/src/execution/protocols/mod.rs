@@ -6,6 +6,7 @@
 
 pub mod aerodrome;
 pub(crate) mod common;
+pub mod curve;
 pub mod slipstream;
 pub(crate) mod swaprouter02;
 pub mod uniswap_v2;
