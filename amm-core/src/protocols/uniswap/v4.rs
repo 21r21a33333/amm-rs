@@ -107,14 +107,15 @@ impl UniswapV4Pool {
     }
 
     /// V4's effective swap fee (pips): the protocol fee is taken first, then the
-    /// LP fee on the remainder. Ported byte-for-byte from v4-core's
+    /// LP fee on the remainder, matching v4-core's
     /// `ProtocolFeeLibrary.calculateSwapFee`:
-    /// `protocol + lp − ⌊protocol·lp / 1e6⌋` — subtracting a *floored* cross-term
-    /// rounds the composed fee **up**. (The algebraically equal
-    /// `protocol + lp·(1e6 − protocol)/1e6` floors the *other* term, which rounds
-    /// the composed fee down and lands 1 pip low; that 1-pip gap is a full ~1 ppm
-    /// of quote drift.) Both inputs are per-direction pip values; `protocol == 0`
-    /// collapses to the LP fee.
+    ///
+    /// `protocol + lp − ⌊protocol·lp / 1e6⌋`
+    ///
+    /// The cross-term must be *floored* (not the algebraically equal
+    /// `protocol + lp·(1e6 − protocol)/1e6`, which floors a different term and
+    /// yields a fee one pip lower). Both inputs are per-direction pip values;
+    /// `protocol == 0` collapses to the LP fee.
     pub fn combined_fee(lp_fee: u32, protocol_fee: u32) -> u32 {
         let (lp, pf) = (lp_fee as u64, protocol_fee as u64);
         (pf + lp - pf * lp / 1_000_000) as u32
@@ -314,13 +315,12 @@ mod tests {
 
     #[test]
     fn combined_fee_compounds_lp_and_protocol() {
-        // lp 500 + protocol 125: 125 + 500 − ⌊125·500/1e6⌋ = 625 − 0 = 625, per
-        // v4-core `calculateSwapFee`. (Flooring the *other* cross-term would give
-        // 624 — 1 pip low, the ~1 ppm V4 quote drift this fix closes.)
+        // lp 500 + protocol 125: 125 + 500 − ⌊125·500/1e6⌋ = 625, per v4-core
+        // `calculateSwapFee`. Flooring the other cross-term would give 624.
         assert_eq!(UniswapV4Pool::combined_fee(500, 125), 625);
-        // Rounding boundary — the real mainnet ETH/USDC pool (lp 500, protocol 253
-        // zeroForOne): 253 + 500 − ⌊253·500/1e6⌋ = 753 − 0 = 753. The naive form
-        // ⌊500·(1e6−253)/1e6⌋ + 253 = 752 is the divergent value.
+        // A pair whose cross-term forces the rounding boundary (lp 500,
+        // protocol 253): 253 + 500 − ⌊253·500/1e6⌋ = 753, where the other-term
+        // form ⌊500·(1e6−253)/1e6⌋ + 253 = 752.
         assert_eq!(UniswapV4Pool::combined_fee(500, 253), 753);
         // No protocol fee leaves the LP fee unchanged.
         assert_eq!(UniswapV4Pool::combined_fee(3000, 0), 3000);
