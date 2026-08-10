@@ -24,6 +24,7 @@ pub mod multicall;
 pub mod options;
 pub mod prepared;
 pub mod protocols;
+pub mod route_planner;
 pub mod types;
 
 pub use config::{ChainConfig, Routers};

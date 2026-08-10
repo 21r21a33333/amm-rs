@@ -47,6 +47,17 @@ sol! {
     }
 }
 
+// ── Permit2 interface (signature-free allowance path) ─────────────────────────
+
+sol! {
+    /// Permit2's on-chain allowance setter.  Called after the ERC-20 has
+    /// approved Permit2, this grants `spender` (e.g. the Universal Router) a
+    /// time-bounded allowance inside Permit2's own accounting.
+    interface IPermit2 {
+        function approve(address token, address spender, uint160 amount, uint48 expiration) external;
+    }
+}
+
 // ── Fork ─────────────────────────────────────────────────────────────────────
 
 /// The concrete `CacheDB` type used by [`Fork`].
@@ -214,6 +225,48 @@ impl<P: Provider + Clone> Fork<P> {
         assert!(
             self.execute_call(from, token, U256::ZERO, approve_data),
             "approve reverted"
+        );
+    }
+
+    /// Grant `spender` (e.g. the Universal Router) a Permit2 allowance for
+    /// `token` from `from`, using the two-step on-chain path (no EIP-712
+    /// signature): first issue a standard ERC-20 approval to the Permit2
+    /// contract, then call `Permit2.approve(token, spender, amount, expiration)`.
+    ///
+    /// `amount` must fit in `uint160` and `expiration` must fit in `uint48`.
+    ///
+    /// This helper is only exercised by the V4 fork proof; suppress dead-code
+    /// lint for test binaries that do not use it.
+    #[allow(dead_code)]
+    pub fn permit2_approve(
+        &mut self,
+        from: Address,
+        token: Address,
+        permit2: Address,
+        spender: Address,
+        amount: U256,
+        expiration: u64,
+    ) {
+        // Step 1: ERC-20 approve Permit2 to pull the token (use U256::MAX so
+        // Permit2 can satisfy any downstream call without a re-approval).
+        self.approve(from, token, permit2, U256::MAX);
+
+        // Step 2: Permit2.approve(token, spender, amount as uint160, expiration as uint48).
+        // U256→U160: use checked_from_limbs_slice (same pattern as production V3 encoder).
+        // u64→U48: the limb slice has exactly one u64; checked_from_limbs_slice validates the
+        // high bits are clear (i.e. value fits 48 bits).
+        use alloy::sol_types::SolCall as _;
+        let call = IPermit2::approveCall {
+            token,
+            spender,
+            amount: alloy::primitives::aliases::U160::checked_from_limbs_slice(amount.as_limbs())
+                .expect("amount must fit uint160 for Permit2.approve"),
+            expiration: alloy::primitives::aliases::U48::checked_from_limbs_slice(&[expiration])
+                .expect("expiration must fit uint48 for Permit2.approve"),
+        };
+        assert!(
+            self.execute_call(from, permit2, U256::ZERO, call.abi_encode().into()),
+            "Permit2.approve reverted"
         );
     }
 

@@ -100,6 +100,9 @@ pub fn as_executable(pool: &dyn Pool) -> Option<&dyn Executable> {
     if let Some(p) = any.downcast_ref::<amm_core::protocols::curve::pool::CurvePool>() {
         return Some(p);
     }
+    if let Some(p) = any.downcast_ref::<amm_core::protocols::uniswap::v4::UniswapV4Pool>() {
+        return Some(p);
+    }
     None
 }
 

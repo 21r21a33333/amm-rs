@@ -63,17 +63,19 @@ pub(crate) struct ResolvedSwap {
     pub native_out: bool,
 }
 
-/// Run the preamble shared by every encoder: trade-type guard, native↔native
-/// rejection, input/output resolution (Native→WETH), pool-membership+distinctness
-/// check, and recipient+deadline resolution.
-pub(crate) fn resolve_swap(
-    ctx: &ChainConfig,
+/// Like [`resolve_swap`], but resolves `Currency::Native` to `native_asset`
+/// instead of `ctx.weth`. Uniswap V4 passes `AssetId(B256::ZERO)` (address(0))
+/// because V4 treats native ETH as a first-class currency, not WETH.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_swap_with(
+    _ctx: &ChainConfig,
     pool: &dyn Pool,
     in_currency: Currency,
     out_currency: Currency,
     route: &Route,
     opts: &ExecutionOptions,
     expected: TradeType,
+    native_asset: AssetId,
 ) -> Result<ResolvedSwap, BuildError> {
     if route.trade_type != expected {
         return Err(BuildError::UnsupportedProtocol);
@@ -83,8 +85,14 @@ pub(crate) fn resolve_swap(
     if native_in && native_out {
         return Err(BuildError::NativeMismatch);
     }
-    let input = in_currency.resolve(ctx.weth);
-    let output = out_currency.resolve(ctx.weth);
+    let input = match in_currency {
+        Currency::Native => native_asset,
+        Currency::Token(a) => a,
+    };
+    let output = match out_currency {
+        Currency::Native => native_asset,
+        Currency::Token(a) => a,
+    };
     let assets = pool.assets();
     if !(assets.contains(&input) && assets.contains(&output) && input != output) {
         return Err(BuildError::AssetNotInPool { input, output });
@@ -99,6 +107,30 @@ pub(crate) fn resolve_swap(
         native_in,
         native_out,
     })
+}
+
+/// Run the preamble shared by every encoder: trade-type guard, native↔native
+/// rejection, input/output resolution (Native→WETH), pool-membership+distinctness
+/// check, and recipient+deadline resolution.
+pub(crate) fn resolve_swap(
+    ctx: &ChainConfig,
+    pool: &dyn Pool,
+    in_currency: Currency,
+    out_currency: Currency,
+    route: &Route,
+    opts: &ExecutionOptions,
+    expected: TradeType,
+) -> Result<ResolvedSwap, BuildError> {
+    resolve_swap_with(
+        ctx,
+        pool,
+        in_currency,
+        out_currency,
+        route,
+        opts,
+        expected,
+        ctx.weth,
+    )
 }
 
 /// Map the amm-core price converter's QuoteError into a BuildError.
@@ -312,6 +344,36 @@ mod tests {
         .expect("native-in resolve must succeed");
 
         assert_eq!(r.input, w, "Native input must resolve to WETH");
+        assert!(r.native_in, "native_in must be true");
+        assert!(!r.native_out, "native_out must be false");
+    }
+
+    #[test]
+    fn resolve_swap_with_native_in_resolves_to_zero_asset() {
+        // Construct a pool that has address(0) as currency0 (native V4 pool).
+        let zero_asset = AssetId::new(chain_id(), B256::ZERO);
+        let b = asset(0x02);
+        let p = pool(zero_asset, b);
+        let c = ctx();
+        let opts = opts_resolved(Address::repeat_byte(0x55), 9_999_999, 50);
+        let route = Route::new_single_hop(zero_asset, b, TradeType::ExactIn);
+
+        let r = super::resolve_swap_with(
+            &c,
+            &p,
+            Currency::Native,
+            Currency::Token(b),
+            &route,
+            &opts,
+            TradeType::ExactIn,
+            zero_asset,
+        )
+        .expect("resolve_swap_with native_asset=zero must succeed");
+
+        assert_eq!(
+            r.input, zero_asset,
+            "Native input must resolve to zero_asset"
+        );
         assert!(r.native_in, "native_in must be true");
         assert!(!r.native_out, "native_out must be false");
     }
