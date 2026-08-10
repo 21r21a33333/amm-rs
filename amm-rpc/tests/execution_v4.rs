@@ -52,11 +52,6 @@ const USDC_ADDR: Address = address!("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
 const USDC_SLOT: u64 = 9;
 /// WETH on Ethereum mainnet (used only as the wrapped-native identity in `ChainConfig`).
 const WETH_ADDR: Address = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
-/// Bound (parts-per-million) on the divergence between the off-chain V4 quote and
-/// the on-chain swap output. V4 is concentrated-liquidity, so the finite
-/// tick-window fetch + quote-vs-swap rounding leave a small, one-sided shortfall
-/// (spec §2 precision model). The on-chain output never exceeds the quote.
-const V4_PPM: u128 = 100;
 
 /// Pinned mainnet block. Unlike the other protocol proofs (block 20M), V4 must
 /// use a **post-launch** block — Uniswap V4 shipped to mainnet in early 2025, so
@@ -223,15 +218,13 @@ async fn wei_exact_v4_native_directions() {
         );
         let after = fork.erc20_balance(USDC_ADDR, sender);
 
-        // V4 concentrated liquidity: the off-chain quote and the on-chain swap
-        // diverge by the finite-tick-window + quote-vs-swap rounding (spec §2
-        // precision model). The on-chain output never exceeds the quote and the
-        // shortfall is bounded to V4_PPM.
+        // The off-chain quote reproduces V4's on-chain swap to the wei: the
+        // effective fee is the exact `ProtocolFeeLibrary.calculateSwapFee`
+        // composition and the swap-step math is V3-identical for that fee.
         let delta = after - before;
-        let tol = quoted.raw * U256::from(V4_PPM) / U256::from(1_000_000u64);
-        assert!(
-            delta <= quoted.raw && quoted.raw - delta <= tol,
-            "native-in: USDC delta {delta} must be <= and within {V4_PPM} ppm of quoted {}",
+        assert_eq!(
+            delta, quoted.raw,
+            "native-in: USDC delta {delta} must equal quoted {} to the wei",
             quoted.raw
         );
 
@@ -305,12 +298,11 @@ async fn wei_exact_v4_native_directions() {
         let after = fork.native_balance(sender);
 
         // gas_price=0 means the ETH delta is the pure swap output (no gas
-        // deduction). Same V4 concentrated-liquidity bound as native-in.
+        // deduction). Wei-exact against the quote, same as native-in.
         let delta = after - before;
-        let tol = quoted.raw * U256::from(V4_PPM) / U256::from(1_000_000u64);
-        assert!(
-            delta <= quoted.raw && quoted.raw - delta <= tol,
-            "native-out: ETH delta {delta} must be <= and within {V4_PPM} ppm of quoted {}",
+        assert_eq!(
+            delta, quoted.raw,
+            "native-out: ETH delta {delta} must equal quoted {} to the wei",
             quoted.raw
         );
 
