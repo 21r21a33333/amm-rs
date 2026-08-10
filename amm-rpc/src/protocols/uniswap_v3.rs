@@ -25,10 +25,14 @@ use crate::error::RpcError;
 use crate::multicall::{self, Call, CallResult};
 use crate::source::{StateSource, pool_id};
 
-/// How many tick-spacings each side of the active tick to fetch. 101 ticks per
-/// pool covers the liquidity a normal swap crosses; a fee tier's whole range is
-/// far larger, so very large swaps may be under-represented.
-const TICK_WINDOW: i32 = 50;
+/// Default tick-spacings each side of the active tick to fetch (101 ticks per
+/// pool). Covers the liquidity a normal swap crosses; a swap large enough to
+/// cross beyond the fetched window is refused ([`QuoteError::TickWindowExceeded`])
+/// rather than mis-priced. Override per source with
+/// [`with_tick_window`](UniswapV3Source::with_tick_window) to price larger swaps.
+///
+/// [`QuoteError::TickWindowExceeded`]: amm_core::error::QuoteError::TickWindowExceeded
+const DEFAULT_TICK_WINDOW: i32 = 50;
 
 /// Calls in round 1, per pool: `slot0`, `liquidity`, `fee`, `tickSpacing`.
 const ROUND1_CALLS: usize = 4;
@@ -66,6 +70,7 @@ pub struct UniswapV3Source<P> {
     provider: P,
     factory: Option<Address>,
     fee_tiers: Vec<u32>,
+    tick_window: i32,
 }
 
 impl<P: Provider> UniswapV3Source<P> {
@@ -75,6 +80,7 @@ impl<P: Provider> UniswapV3Source<P> {
             provider,
             factory: None,
             fee_tiers: Vec::new(),
+            tick_window: DEFAULT_TICK_WINDOW,
         }
     }
 
@@ -85,7 +91,17 @@ impl<P: Provider> UniswapV3Source<P> {
             provider,
             factory: Some(factory),
             fee_tiers,
+            tick_window: DEFAULT_TICK_WINDOW,
         }
+    }
+
+    /// Set how many tick-spacings each side of the active tick to fetch. A larger
+    /// window prices larger swaps exactly at the cost of more `ticks` calls per
+    /// refresh; beyond it, a swap is refused rather than mis-priced. Must be
+    /// positive.
+    pub fn with_tick_window(mut self, tick_window: i32) -> Self {
+        self.tick_window = tick_window.max(1);
+        self
     }
 }
 
@@ -152,12 +168,12 @@ fn round1_calls(keys: &[PoolKey]) -> (Vec<Call>, Vec<&PoolKey>) {
 
 /// Round 2: one `ticks(t)` per tick-spacing in the window around each pool's
 /// active tick. Returns the calls and, for each, `(state_index, tick)`.
-fn round2_calls(states: &[PoolState]) -> (Vec<Call>, Vec<(usize, i32)>) {
+fn round2_calls(states: &[PoolState], tick_window: i32) -> (Vec<Call>, Vec<(usize, i32)>) {
     let mut calls = Vec::new();
     let mut refs = Vec::new();
     for (idx, state) in states.iter().enumerate() {
         let center = (state.tick / state.tick_spacing) * state.tick_spacing;
-        for step in -TICK_WINDOW..=TICK_WINDOW {
+        for step in -tick_window..=tick_window {
             let tick = center + step * state.tick_spacing;
             let Ok(tick24) = alloy::primitives::aliases::I24::try_from(tick) else {
                 continue;
@@ -200,8 +216,9 @@ fn tick_windows(
 }
 
 /// Build a [`UniswapV3Pool`] from a decoded state and its tick window.
-fn build_pool(state: PoolState, ticks: Vec<(i32, TickInfo)>) -> Box<dyn Pool> {
-    let tick_data = TickData::from_ticks(state.tick_spacing, ticks);
+fn build_pool(state: PoolState, ticks: Vec<(i32, TickInfo)>, tick_window: i32) -> Box<dyn Pool> {
+    let tick_data =
+        TickData::from_ticks(state.tick_spacing, ticks).with_window_around(state.tick, tick_window);
     Box::new(UniswapV3Pool::new(
         state.id,
         state.assets,
@@ -275,14 +292,14 @@ impl<P: Provider + Send + Sync> StateSource for UniswapV3Source<P> {
             .collect();
 
         // Round 2 (same block): a tick window around each active tick.
-        let (round2_calls, refs) = round2_calls(&states);
+        let (round2_calls, refs) = round2_calls(&states, self.tick_window);
         let round2 = multicall::aggregate3(&self.provider, round2_calls, at).await?;
         let windows = tick_windows(states.len(), &round2, &refs);
 
         Ok(states
             .into_iter()
             .zip(windows)
-            .map(|(state, ticks)| build_pool(state, ticks))
+            .map(|(state, ticks)| build_pool(state, ticks, self.tick_window))
             .collect())
     }
 }
@@ -334,7 +351,7 @@ mod tests {
                 },
             ),
         ];
-        let pool = build_pool(state, ticks);
+        let pool = build_pool(state, ticks, DEFAULT_TICK_WINDOW);
         let amount_in = U256::from(1_000_000_000u64);
         let out = pool
             .quote(&AssetAmount::new(usdc(), amount_in), &weth())

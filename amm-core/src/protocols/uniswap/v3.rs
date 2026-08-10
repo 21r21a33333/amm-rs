@@ -244,6 +244,7 @@ mod tests {
                 ticks,
                 bitmap,
                 spacing: 60,
+                window: None,
             },
         )
     }
@@ -348,6 +349,7 @@ mod tests {
                 ticks: HashMap::new(),
                 bitmap: HashMap::new(),
                 spacing: 60,
+                window: None,
             },
         );
         assert_eq!(
@@ -385,6 +387,7 @@ mod tests {
                 ticks,
                 bitmap,
                 spacing: 60,
+                window: None,
             },
         );
         let huge = U256::from(1_000_000_000_000_000_000u64); // 1e18 ≫ band capacity (~2.7e15)

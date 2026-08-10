@@ -63,8 +63,13 @@ const LIQUIDITY_OFFSET: u64 = 3;
 /// `Pool.State.ticks` mapping offset within a pool's state struct.
 const TICKS_OFFSET: u64 = 4;
 
-/// How many tick-spacings each side of the active tick to fetch (as V3).
-const TICK_WINDOW: i32 = 50;
+/// Default tick-spacings each side of the active tick to fetch (as V3). Beyond
+/// the fetched window a swap is refused ([`QuoteError::TickWindowExceeded`])
+/// rather than mis-priced; override with
+/// [`with_tick_window`](UniswapV4Source::with_tick_window).
+///
+/// [`QuoteError::TickWindowExceeded`]: amm_core::error::QuoteError::TickWindowExceeded
+const DEFAULT_TICK_WINDOW: i32 = 50;
 
 /// Calls in round 1, per pool: `extsload(slot0)`, `extsload(liquidity)`.
 const ROUND1_CALLS: usize = 2;
@@ -134,6 +139,7 @@ pub struct UniswapV4Source<P> {
     provider: P,
     pool_manager: Address,
     pools: Vec<V4PoolConfig>,
+    tick_window: i32,
 }
 
 impl<P: Provider> UniswapV4Source<P> {
@@ -144,7 +150,17 @@ impl<P: Provider> UniswapV4Source<P> {
             provider,
             pool_manager,
             pools,
+            tick_window: DEFAULT_TICK_WINDOW,
         }
+    }
+
+    /// Set how many tick-spacings each side of the active tick to fetch. A larger
+    /// window prices larger swaps exactly at the cost of more tick reads per
+    /// refresh; beyond it, a swap is refused rather than mis-priced. Must be
+    /// positive.
+    pub fn with_tick_window(mut self, tick_window: i32) -> Self {
+        self.tick_window = tick_window.max(1);
+        self
     }
 
     /// Find the config a `PoolKey` refers to by its stored `pool_id` hex.
@@ -259,13 +275,14 @@ fn round2_calls(
     pool_manager: Address,
     plans: &[PoolPlan],
     states: &[PoolState],
+    tick_window: i32,
 ) -> (Vec<Call>, Vec<(usize, i32)>) {
     let mut calls = Vec::new();
     let mut refs = Vec::new();
     for (state_idx, state) in states.iter().enumerate() {
         let plan = &plans[state.plan_idx];
         let center = (state.tick / plan.tick_spacing) * plan.tick_spacing;
-        for step in -TICK_WINDOW..=TICK_WINDOW {
+        for step in -tick_window..=tick_window {
             let tick = center + step * plan.tick_spacing;
             calls.push(extsload_call(
                 pool_manager,
@@ -308,6 +325,7 @@ fn build_pools(
     plans: &[PoolPlan],
     states: Vec<PoolState>,
     windows: Vec<Vec<(i32, TickInfo)>>,
+    tick_window: i32,
 ) -> Vec<Box<dyn Pool>> {
     states
         .into_iter()
@@ -329,7 +347,8 @@ fn build_pools(
                 state.tick,
                 fee_zero_for_one,
                 fee_one_for_zero,
-                TickData::from_ticks(plan.tick_spacing, ticks),
+                TickData::from_ticks(plan.tick_spacing, ticks)
+                    .with_window_around(state.tick, tick_window),
                 plan.hooks,
                 plan.fee,
                 plan.tick_spacing,
@@ -472,11 +491,12 @@ impl<P: Provider + Send + Sync> StateSource for UniswapV4Source<P> {
         let states = decode_states(&plans, &round1);
 
         // Round 2 (same block): a tick window around each active tick.
-        let (round2_calls, refs) = round2_calls(self.pool_manager, &plans, &states);
+        let (round2_calls, refs) =
+            round2_calls(self.pool_manager, &plans, &states, self.tick_window);
         let round2 = multicall::aggregate3(&self.provider, round2_calls, at).await?;
         let windows = tick_windows(states.len(), &round2, &refs);
 
-        Ok(build_pools(&plans, states, windows))
+        Ok(build_pools(&plans, states, windows, self.tick_window))
     }
 }
 
@@ -593,7 +613,7 @@ mod tests {
                 },
             ),
         ];
-        let pools = build_pools(&[plan], vec![state], vec![ticks]);
+        let pools = build_pools(&[plan], vec![state], vec![ticks], DEFAULT_TICK_WINDOW);
         assert_eq!(pools.len(), 1);
         let amount_in = U256::from(1_000_000_000u64);
         let out = pools[0]

@@ -32,6 +32,12 @@ pub enum QuoteError {
     /// The pool has insufficient liquidity to serve the requested swap.
     #[error("insufficient liquidity")]
     InsufficientLiquidity,
+    /// The swap would cross beyond the fetched tick window, into ticks whose
+    /// liquidity was not fetched. The quote is refused rather than extrapolated
+    /// (extrapolation over-estimates output). Re-fetch the pool with a wider tick
+    /// window to price a swap this large.
+    #[error("swap exceeds the fetched tick window")]
+    TickWindowExceeded,
     /// A price limit was reached before the swap could complete.
     #[error("price limit crossed")]
     PriceLimitCrossed,

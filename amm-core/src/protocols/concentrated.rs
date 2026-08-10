@@ -37,13 +37,22 @@ pub struct TickData {
     pub bitmap: HashMap<i16, U256>,
     /// Tick spacing for this fee tier (e.g. 60 for the 0.30% tier).
     pub spacing: i32,
+    /// Inclusive `(min_tick, max_tick)` range that was actually fetched. A swap
+    /// crossing beyond it relies on liquidity we do not have, so the engine
+    /// refuses it ([`QuoteError::TickWindowExceeded`]) rather than extrapolating.
+    /// `None` means the full tick range is known (test fixtures, full-range
+    /// synthetic pools) — no window constraint.
+    pub window: Option<(i32, i32)>,
 }
 
 impl TickData {
     /// Build tick data from a set of initialized ticks, computing the
     /// initialization bitmap. `spacing` is the pool's tick spacing; each tick is
     /// expected to be a multiple of it. This is how a state fetcher assembles the
-    /// tick state a swap traverses.
+    /// tick state a swap traverses. The window is left unbounded ([`None`]); a
+    /// fetcher that fetched only a slice of ticks should call [`with_window`].
+    ///
+    /// [`with_window`]: TickData::with_window
     pub fn from_ticks(spacing: i32, ticks: impl IntoIterator<Item = (i32, TickInfo)>) -> TickData {
         let mut tick_map = HashMap::new();
         let mut bitmap: HashMap<i16, U256> = HashMap::new();
@@ -55,7 +64,28 @@ impl TickData {
             ticks: tick_map,
             bitmap,
             spacing,
+            window: None,
         }
+    }
+
+    /// Record the inclusive `(min_tick, max_tick)` range this tick data actually
+    /// covers. Beyond it the engine refuses to extrapolate rather than pricing
+    /// against liquidity that was never fetched.
+    pub fn with_window(mut self, min_tick: i32, max_tick: i32) -> TickData {
+        self.window = Some((min_tick, max_tick));
+        self
+    }
+
+    /// Record the window a fetch of `tick_window` spacings each side of
+    /// `active_tick` covers, clamped to the valid tick range. Every concentrated
+    /// state source fetches this shape, so it names the window in one place.
+    pub fn with_window_around(self, active_tick: i32, tick_window: i32) -> TickData {
+        use uniswap_v3_math::tick_math::{MAX_TICK, MIN_TICK};
+        let center = (active_tick / self.spacing) * self.spacing;
+        let span = tick_window.saturating_mul(self.spacing);
+        let min_tick = center.saturating_sub(span).max(MIN_TICK);
+        let max_tick = center.saturating_add(span).min(MAX_TICK);
+        self.with_window(min_tick, max_tick)
     }
 }
 
@@ -95,6 +125,12 @@ pub(crate) struct SwapOutcome {
     /// `true` if the price limit was reached before the specified amount was
     /// fully consumed (a partial fill).
     pub limited: bool,
+    /// `true` if the swap was stopped by the edge of the fetched tick window
+    /// (not the caller's price limit) with input still remaining — it needed
+    /// liquidity that was not fetched. Amount-exact callers turn this into
+    /// [`QuoteError::TickWindowExceeded`]; `max_amount_in` reads it as the
+    /// capacity of the window.
+    pub window_exhausted: bool,
 }
 
 /// The next initialized-tick boundary reached in a step, with its price.
@@ -122,6 +158,12 @@ pub(crate) fn simulate(
         return Err(QuoteError::InsufficientLiquidity);
     }
 
+    // Never price past the fetched tick window: bind the swap to the tighter of
+    // the caller's price limit and the window edge. Stopping at the window edge
+    // with input left means the swap wanted liquidity we did not fetch.
+    let window_edge = window_edge_price(state.ticks, zero_for_one)?;
+    let bind = tighter_price(zero_for_one, limit, window_edge);
+
     let exact_in = amount_specified >= I256::ZERO;
     let mut remaining = amount_specified;
     let mut sqrt = state.sqrt_price_x96;
@@ -130,9 +172,9 @@ pub(crate) fn simulate(
     let mut amount_in = U256::ZERO;
     let mut amount_out = U256::ZERO;
 
-    while remaining != I256::ZERO && sqrt != limit {
+    while remaining != I256::ZERO && sqrt != bind {
         let next = next_tick(state.ticks, tick, zero_for_one)?;
-        let target = step_target(zero_for_one, next.price, limit);
+        let target = step_target(zero_for_one, next.price, bind);
 
         let (next_sqrt, step_in, step_out, step_fee) =
             uniswap_v3_math::swap_math::compute_swap_step(
@@ -177,11 +219,52 @@ pub(crate) fn simulate(
         )?;
     }
 
+    // The window bound the swap iff it is strictly tighter than the caller's
+    // limit; stopping there with input left is a window exhaustion, not a
+    // price-limit fill.
+    let window_exhausted =
+        remaining != I256::ZERO && strictly_tighter_price(zero_for_one, window_edge, limit);
     Ok(SwapOutcome {
         amount_in,
         amount_out,
         limited: remaining != I256::ZERO,
+        window_exhausted,
     })
+}
+
+/// The sqrt price at the outer edge of the fetched tick window in the swap
+/// direction — the lowest price for a `zero_for_one` (falling) swap, the highest
+/// for a `one_for_zero` (rising) one. An unbounded window ([`None`]) yields the
+/// real tick-range extreme, so it never constrains the swap.
+fn window_edge_price(ticks: &TickData, zero_for_one: bool) -> Result<U256, QuoteError> {
+    match ticks.window {
+        None => Ok(price_limit(zero_for_one)),
+        Some((min_tick, max_tick)) => {
+            let edge = match zero_for_one {
+                true => min_tick,
+                false => max_tick,
+            };
+            uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick(edge)
+                .map_err(|_| QuoteError::Overflow)
+        }
+    }
+}
+
+/// The tighter (closer to the current price) of two sqrt-price bounds: the higher
+/// price when `zero_for_one` (prices fall), the lower otherwise.
+fn tighter_price(zero_for_one: bool, a: U256, b: U256) -> U256 {
+    match zero_for_one {
+        true => a.max(b),
+        false => a.min(b),
+    }
+}
+
+/// Whether `edge` is a strictly tighter bound than `limit` in the swap direction.
+fn strictly_tighter_price(zero_for_one: bool, edge: U256, limit: U256) -> bool {
+    match zero_for_one {
+        true => edge > limit,
+        false => edge < limit,
+    }
 }
 
 /// Resolve the next initialized-tick boundary from the bitmap (clamped to the
@@ -315,9 +398,10 @@ pub(crate) fn amount_out(
 ) -> Result<U256, QuoteError> {
     let spec = positive_i256(amount_in)?;
     let outcome = simulate(state, zero_for_one, spec, price_limit(zero_for_one))?;
-    match outcome.limited {
-        true => Err(QuoteError::InsufficientLiquidity),
-        false => Ok(outcome.amount_out),
+    match (outcome.window_exhausted, outcome.limited) {
+        (true, _) => Err(QuoteError::TickWindowExceeded),
+        (false, true) => Err(QuoteError::InsufficientLiquidity),
+        (false, false) => Ok(outcome.amount_out),
     }
 }
 
@@ -335,16 +419,19 @@ pub(crate) fn amount_in(
         mag.wrapping_neg(),
         price_limit(zero_for_one),
     )?;
-    match outcome.limited {
-        true => Err(QuoteError::InsufficientLiquidity),
-        false => Ok(outcome.amount_in),
+    match (outcome.window_exhausted, outcome.limited) {
+        (true, _) => Err(QuoteError::TickWindowExceeded),
+        (false, true) => Err(QuoteError::InsufficientLiquidity),
+        (false, false) => Ok(outcome.amount_in),
     }
 }
 
-/// The maximum input absorbable before the price reaches its extreme. `I256::MAX`
-/// exceeds any pool's absorbable input, so the swap halts at the extreme and the
-/// consumed input is the bound (`compute_swap_step`'s internal `mul_div` is
-/// 512-bit, so `I256::MAX` cannot overflow it).
+/// The largest input the fetched tick window can price: `I256::MAX` drives the
+/// swap to the tighter of the price extreme and the window edge, and the consumed
+/// input is the bound. A window exhaustion is the answer here, not an error (the
+/// amount-exact quotes treat it as [`QuoteError::TickWindowExceeded`] instead).
+/// `compute_swap_step`'s internal `mul_div` is 512-bit, so `I256::MAX` cannot
+/// overflow it.
 pub(crate) fn max_amount_in(state: &SwapState<'_>, zero_for_one: bool) -> Option<U256> {
     simulate(state, zero_for_one, I256::MAX, price_limit(zero_for_one))
         .ok()
@@ -386,9 +473,15 @@ pub(crate) fn quote_with_limit(
             amount_in: U256::ZERO,
             amount_out: U256::ZERO,
             limited: true,
+            window_exhausted: false,
         },
         false => simulate(state, zero_for_one, spec, sqrt_limit)?,
     };
+    // A user price limit inside the fetched window fills partially (honest); one
+    // beyond it cannot be priced without liquidity we never fetched.
+    if outcome.window_exhausted {
+        return Err(QuoteError::TickWindowExceeded);
+    }
     Ok(LimitedQuote {
         amount_in: AssetAmount::new(amount_in.asset, outcome.amount_in),
         amount_out: AssetAmount::new(*to, outcome.amount_out),
@@ -499,6 +592,7 @@ pub(crate) mod fixtures {
             ticks,
             bitmap,
             spacing: 60,
+            window: None,
         }
     }
 }
@@ -533,6 +627,60 @@ mod tests {
         assert_eq!(tick_liquidity_net(&ticks, 60, true), Some(-500));
         // Initialized-but-missing must fail (never silently zero).
         assert_eq!(tick_liquidity_net(&ticks, 120, false), None);
+    }
+
+    #[test]
+    fn tick_window_bounds_the_swap_and_reports_honest_capacity() {
+        use uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick;
+        let spacing = 60;
+        let (lo, hi) = (-600i32, 600i32);
+        let liq: u128 = 1_000_000_000_000_000_000; // 1e18
+        // Liquidity L active across [lo, hi]; the window is exactly that fetched
+        // range, so a zero_for_one swap (price falling toward `lo`) runs out of
+        // fetched ticks at `lo`.
+        let ticks = TickData::from_ticks(
+            spacing,
+            [
+                (
+                    lo,
+                    TickInfo {
+                        liquidity_net: liq as i128,
+                        initialized: true,
+                    },
+                ),
+                (
+                    hi,
+                    TickInfo {
+                        liquidity_net: -(liq as i128),
+                        initialized: true,
+                    },
+                ),
+            ],
+        )
+        .with_window(lo, hi);
+        let state = SwapState {
+            sqrt_price_x96: get_sqrt_ratio_at_tick(0).unwrap(),
+            tick: 0,
+            liquidity: liq,
+            fee_pips: 3000,
+            ticks: &ticks,
+        };
+
+        // max_amount_in is the window capacity: the input that drains to the
+        // window edge, bounded — not an unbounded drain to the tick-range extreme.
+        let cap = max_amount_in(&state, true).expect("finite window capacity");
+        assert!(
+            cap > U256::ZERO && cap < U256::from(u128::MAX),
+            "capacity must be finite, got {cap}"
+        );
+
+        // A swap within capacity prices normally...
+        assert!(amount_out(&state, true, cap / U256::from(2u64)).is_ok());
+        // ...one beyond the fetched window is refused, never extrapolated.
+        assert_eq!(
+            amount_out(&state, true, cap * U256::from(4u64)),
+            Err(QuoteError::TickWindowExceeded)
+        );
     }
 
     #[test]
