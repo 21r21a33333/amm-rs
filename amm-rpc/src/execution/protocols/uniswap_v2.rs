@@ -5,19 +5,19 @@
 //! exact-out entrypoints.
 //! The `sol!` macro derives ABI selectors and parameter layouts from the interface.
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::U256;
 use alloy::{sol, sol_types::SolCall};
-use amm_core::primitives::asset::{AssetAmount, AssetId};
+use amm_core::primitives::asset::AssetAmount;
 use amm_core::protocols::uniswap::v2::UniswapV2Pool;
-use amm_core::traits::pool::Pool;
 
 use crate::execution::{
     config::ChainConfig,
     error::BuildError,
     executable::{Executable, Sealed},
-    options::{Deadline, ExecutionOptions, Recipient},
-    prepared::{ApprovalRequirement, PreparedSwap, Route},
-    types::{Currency, CurrencyAmount, TradeType, UnsignedTx},
+    options::ExecutionOptions,
+    prepared::{PreparedSwap, Route},
+    protocols::common,
+    types::{Currency, CurrencyAmount, TradeType},
 };
 
 sol! {
@@ -71,43 +71,6 @@ sol! {
     }
 }
 
-/// Convert an [`AssetId`] to an EVM [`Address`] by taking the rightmost 20 bytes
-/// of the asset's 32-byte token identifier.
-pub(crate) fn evm_addr(a: &AssetId) -> Address {
-    Address::from_word(a.token)
-}
-
-/// Resolve a [`Recipient`] to a concrete EVM address.
-///
-/// # Errors
-///
-/// Returns [`BuildError::UnresolvedRecipient`] when the recipient is still the
-/// `Sender` placeholder — the caller must have resolved it via
-/// [`crate::execution::options::resolve`] first.
-pub(crate) fn resolve_recipient(r: &Recipient) -> Result<Address, BuildError> {
-    match r {
-        Recipient::To(a) => Ok(*a),
-        Recipient::Sender => Err(BuildError::UnresolvedRecipient),
-    }
-}
-
-/// Resolve a [`Deadline`] to a `U256` Unix timestamp for on-chain use.
-///
-/// # Errors
-///
-/// - [`BuildError::UnresolvedDeadline`] — `FromNow` or `AtBlock`: must be
-///   converted to an absolute timestamp by [`crate::execution::options::resolve`]
-///   before the build layer is called. `AtBlock` is rejected because V2 bounds
-///   by timestamp, so a block-number deadline cannot be converted here.
-pub(crate) fn resolve_deadline(d: &Deadline) -> Result<U256, BuildError> {
-    match d {
-        Deadline::AtTimestamp(t) => Ok(U256::from(*t)),
-        Deadline::FromNow(_) => Err(BuildError::UnresolvedDeadline),
-        // V2 uses a Unix timestamp; a block number cannot be resolved here.
-        Deadline::AtBlock(_) => Err(BuildError::UnresolvedDeadline),
-    }
-}
-
 impl Sealed for UniswapV2Pool {}
 
 impl Executable for UniswapV2Pool {
@@ -125,33 +88,21 @@ impl Executable for UniswapV2Pool {
             return Err(BuildError::UnsupportedProtocol);
         }
 
-        // Reject Native → Native before any pool or route checks.
-        if amount_in.currency.is_native() && to.is_native() {
-            return Err(BuildError::NativeMismatch);
-        }
-
-        let input = amount_in.currency.resolve(ctx.weth);
-        let output = to.resolve(ctx.weth);
-        let assets = self.assets();
-
-        // Both assets must be in this pool and distinct.
-        if !(assets.contains(&input) && assets.contains(&output) && input != output) {
-            return Err(BuildError::AssetNotInPool { input, output });
-        }
-
-        // Exact-out is the next task; reject non-ExactIn routes uniformly.
-        if route.trade_type != TradeType::ExactIn {
-            return Err(BuildError::UnsupportedProtocol);
-        }
-
+        let r = common::resolve_swap(
+            ctx,
+            self,
+            amount_in.currency,
+            to,
+            route,
+            opts,
+            TradeType::ExactIn,
+        )?;
         let min = opts.slippage.min_amount_out(quoted_out);
         let router = ctx.router_v2()?;
-        let recipient = resolve_recipient(&opts.recipient)?;
-        let deadline = resolve_deadline(&opts.deadline)?;
         // resolve() already maps Native → WETH, so the path is uniform across all arms.
-        let path = vec![evm_addr(&input), evm_addr(&output)];
+        let path = vec![common::evm_addr(&r.input), common::evm_addr(&r.output)];
 
-        match (amount_in.currency.is_native(), to.is_native()) {
+        match (r.native_in, r.native_out) {
             // Native → Native is always a configuration error.
             (true, true) => Err(BuildError::NativeMismatch),
 
@@ -160,23 +111,20 @@ impl Executable for UniswapV2Pool {
                 let call = IUniswapV2Router02::swapExactETHForTokensCall {
                     amountOutMin: min.raw,
                     path,
-                    to: recipient,
-                    deadline,
+                    to: r.recipient,
+                    deadline: r.deadline,
                 };
-                Ok(PreparedSwap {
-                    tx: UnsignedTx {
-                        chain: ctx.chain,
-                        to: router,
-                        data: call.abi_encode().into(),
-                        // Attach the ETH amount as msg.value; no ERC-20 transfer needed.
-                        value: amount_in.raw,
-                    },
-                    min_received: min,
-                    max_spent: None,
+                Ok(common::prepared(
+                    ctx,
+                    router,
+                    call.abi_encode().into(),
+                    // Attach the ETH amount as msg.value; no ERC-20 transfer needed.
+                    amount_in.raw,
+                    min,
+                    None,
                     // Native ETH is transferred as msg.value — no ERC-20 approval required.
-                    approval: None,
-                    price_impact: None,
-                })
+                    None,
+                ))
             }
 
             // Native-out (token → ETH): use swapExactTokensForETH; value = 0; approval required.
@@ -185,26 +133,18 @@ impl Executable for UniswapV2Pool {
                     amountIn: amount_in.raw,
                     amountOutMin: min.raw,
                     path,
-                    to: recipient,
-                    deadline,
+                    to: r.recipient,
+                    deadline: r.deadline,
                 };
-                Ok(PreparedSwap {
-                    tx: UnsignedTx {
-                        chain: ctx.chain,
-                        to: router,
-                        data: call.abi_encode().into(),
-                        value: U256::ZERO,
-                    },
-                    min_received: min,
-                    max_spent: None,
-                    approval: Some(ApprovalRequirement {
-                        spender: router,
-                        token: input,
-                        min_allowance: amount_in.raw,
-                        reset_first: false,
-                    }),
-                    price_impact: None,
-                })
+                Ok(common::prepared(
+                    ctx,
+                    router,
+                    call.abi_encode().into(),
+                    U256::ZERO,
+                    min,
+                    None,
+                    Some(common::erc20_approval(router, r.input, amount_in.raw)),
+                ))
             }
 
             // ERC-20 → ERC-20: use swapExactTokensForTokens; value = 0; approval required.
@@ -213,26 +153,18 @@ impl Executable for UniswapV2Pool {
                     amountIn: amount_in.raw,
                     amountOutMin: min.raw,
                     path,
-                    to: recipient,
-                    deadline,
+                    to: r.recipient,
+                    deadline: r.deadline,
                 };
-                Ok(PreparedSwap {
-                    tx: UnsignedTx {
-                        chain: ctx.chain,
-                        to: router,
-                        data: call.abi_encode().into(),
-                        value: U256::ZERO,
-                    },
-                    min_received: min,
-                    max_spent: None,
-                    approval: Some(ApprovalRequirement {
-                        spender: router,
-                        token: input,
-                        min_allowance: amount_in.raw,
-                        reset_first: false,
-                    }),
-                    price_impact: None,
-                })
+                Ok(common::prepared(
+                    ctx,
+                    router,
+                    call.abi_encode().into(),
+                    U256::ZERO,
+                    min,
+                    None,
+                    Some(common::erc20_approval(router, r.input, amount_in.raw)),
+                ))
             }
         }
     }
@@ -246,40 +178,28 @@ impl Executable for UniswapV2Pool {
         quoted_in: &AssetAmount,
         opts: &ExecutionOptions,
     ) -> Result<PreparedSwap, BuildError> {
-        // Exact-out routes only; reject any ExactIn route passed by mistake.
-        if route.trade_type != TradeType::ExactOut {
-            return Err(BuildError::UnsupportedProtocol);
-        }
-
         // V2 has no sqrtPriceLimit — reject any price limit up front.
         if opts.price_limit.is_some() {
             return Err(BuildError::UnsupportedProtocol);
         }
 
-        // Reject Native → Native before any pool or route checks.
-        if from.is_native() && amount_out.currency.is_native() {
-            return Err(BuildError::NativeMismatch);
-        }
-
-        let input = from.resolve(ctx.weth);
-        let output = amount_out.currency.resolve(ctx.weth);
-        let assets = self.assets();
-
-        // Both assets must be in this pool and distinct.
-        if !(assets.contains(&input) && assets.contains(&output) && input != output) {
-            return Err(BuildError::AssetNotInPool { input, output });
-        }
-
+        let r = common::resolve_swap(
+            ctx,
+            self,
+            from,
+            amount_out.currency,
+            route,
+            opts,
+            TradeType::ExactOut,
+        )?;
         // Slippage ceiling on the input side; router refunds any surplus ETH.
         let max = opts.slippage.max_amount_in(quoted_in);
         let router = ctx.router_v2()?;
-        let recipient = resolve_recipient(&opts.recipient)?;
-        let deadline = resolve_deadline(&opts.deadline)?;
         // resolve() already maps Native → WETH, so the path is uniform across all arms.
-        let path = vec![evm_addr(&input), evm_addr(&output)];
+        let path = vec![common::evm_addr(&r.input), common::evm_addr(&r.output)];
         let out = amount_out.raw;
 
-        match (from.is_native(), amount_out.currency.is_native()) {
+        match (r.native_in, r.native_out) {
             // Native → Native is always a configuration error.
             (true, true) => Err(BuildError::NativeMismatch),
 
@@ -289,23 +209,20 @@ impl Executable for UniswapV2Pool {
                 let call = IUniswapV2Router02::swapETHForExactTokensCall {
                     amountOut: out,
                     path,
-                    to: recipient,
-                    deadline,
+                    to: r.recipient,
+                    deadline: r.deadline,
                 };
-                Ok(PreparedSwap {
-                    tx: UnsignedTx {
-                        chain: ctx.chain,
-                        to: router,
-                        data: call.abi_encode().into(),
-                        // Attach the ETH ceiling as msg.value; router refunds the surplus.
-                        value: max.raw,
-                    },
-                    min_received: AssetAmount::new(output, out),
-                    max_spent: Some(AssetAmount::new(input, max.raw)),
+                Ok(common::prepared(
+                    ctx,
+                    router,
+                    call.abi_encode().into(),
+                    // Attach the ETH ceiling as msg.value; router refunds the surplus.
+                    max.raw,
+                    AssetAmount::new(r.output, out),
+                    Some(AssetAmount::new(r.input, max.raw)),
                     // Native ETH is transferred as msg.value — no ERC-20 approval required.
-                    approval: None,
-                    price_impact: None,
-                })
+                    None,
+                ))
             }
 
             // Native-out (token → ETH): use swapTokensForExactETH; value = 0; approval required.
@@ -314,26 +231,18 @@ impl Executable for UniswapV2Pool {
                     amountOut: out,
                     amountInMax: max.raw,
                     path,
-                    to: recipient,
-                    deadline,
+                    to: r.recipient,
+                    deadline: r.deadline,
                 };
-                Ok(PreparedSwap {
-                    tx: UnsignedTx {
-                        chain: ctx.chain,
-                        to: router,
-                        data: call.abi_encode().into(),
-                        value: U256::ZERO,
-                    },
-                    min_received: AssetAmount::new(output, out),
-                    max_spent: Some(AssetAmount::new(input, max.raw)),
-                    approval: Some(ApprovalRequirement {
-                        spender: router,
-                        token: input,
-                        min_allowance: max.raw,
-                        reset_first: false,
-                    }),
-                    price_impact: None,
-                })
+                Ok(common::prepared(
+                    ctx,
+                    router,
+                    call.abi_encode().into(),
+                    U256::ZERO,
+                    AssetAmount::new(r.output, out),
+                    Some(AssetAmount::new(r.input, max.raw)),
+                    Some(common::erc20_approval(router, r.input, max.raw)),
+                ))
             }
 
             // ERC-20 → ERC-20: use swapTokensForExactTokens; value = 0; approval required.
@@ -342,26 +251,18 @@ impl Executable for UniswapV2Pool {
                     amountOut: out,
                     amountInMax: max.raw,
                     path,
-                    to: recipient,
-                    deadline,
+                    to: r.recipient,
+                    deadline: r.deadline,
                 };
-                Ok(PreparedSwap {
-                    tx: UnsignedTx {
-                        chain: ctx.chain,
-                        to: router,
-                        data: call.abi_encode().into(),
-                        value: U256::ZERO,
-                    },
-                    min_received: AssetAmount::new(output, out),
-                    max_spent: Some(AssetAmount::new(input, max.raw)),
-                    approval: Some(ApprovalRequirement {
-                        spender: router,
-                        token: input,
-                        min_allowance: max.raw,
-                        reset_first: false,
-                    }),
-                    price_impact: None,
-                })
+                Ok(common::prepared(
+                    ctx,
+                    router,
+                    call.abi_encode().into(),
+                    U256::ZERO,
+                    AssetAmount::new(r.output, out),
+                    Some(AssetAmount::new(r.input, max.raw)),
+                    Some(common::erc20_approval(router, r.input, max.raw)),
+                ))
             }
         }
     }
@@ -478,7 +379,10 @@ mod tests {
         // path == [input, output]
         assert_eq!(
             decoded.path,
-            vec![super::evm_addr(&a), super::evm_addr(&b)],
+            vec![
+                crate::execution::protocols::common::evm_addr(&a),
+                crate::execution::protocols::common::evm_addr(&b)
+            ],
             "path must be [input, output]"
         );
 
@@ -802,7 +706,10 @@ mod tests {
         // path == [input, output]
         assert_eq!(
             decoded.path,
-            vec![super::evm_addr(&a), super::evm_addr(&b)],
+            vec![
+                crate::execution::protocols::common::evm_addr(&a),
+                crate::execution::protocols::common::evm_addr(&b)
+            ],
             "path must be [input, output]"
         );
 
@@ -916,7 +823,10 @@ mod tests {
         // path[0] must be WETH (resolved from Native).
         assert_eq!(
             decoded.path,
-            vec![super::evm_addr(&w), super::evm_addr(&b)],
+            vec![
+                crate::execution::protocols::common::evm_addr(&w),
+                crate::execution::protocols::common::evm_addr(&b)
+            ],
             "path must be [weth, output]"
         );
         assert_eq!(decoded.to, recipient, "recipient must round-trip");
@@ -990,7 +900,10 @@ mod tests {
         // path[0] must be WETH (resolved from Native).
         assert_eq!(
             decoded.path,
-            vec![super::evm_addr(&w), super::evm_addr(&b)],
+            vec![
+                crate::execution::protocols::common::evm_addr(&w),
+                crate::execution::protocols::common::evm_addr(&b)
+            ],
             "path must be [weth, output]"
         );
 
@@ -1075,7 +988,10 @@ mod tests {
         // path[last] must be WETH (resolved from Native).
         assert_eq!(
             decoded.path,
-            vec![super::evm_addr(&a), super::evm_addr(&w)],
+            vec![
+                crate::execution::protocols::common::evm_addr(&a),
+                crate::execution::protocols::common::evm_addr(&w)
+            ],
             "path must be [input, weth]"
         );
         assert_eq!(decoded.to, recipient, "recipient must round-trip");

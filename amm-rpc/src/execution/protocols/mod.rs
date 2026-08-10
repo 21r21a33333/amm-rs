@@ -4,5 +4,6 @@
 //! its pool type and provides the ABI-encoding machinery needed to produce a
 //! valid [`crate::execution::prepared::PreparedSwap`].
 
+pub(crate) mod common;
 pub mod uniswap_v2;
 pub mod uniswap_v3;
