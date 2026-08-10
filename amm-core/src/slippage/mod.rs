@@ -114,4 +114,41 @@ mod tests {
         assert_eq!(Slippage::from_bps(Bps(50)).compound(1).bps(), Bps(50));
         assert_eq!(Slippage::from_bps(Bps(50)).compound(0).bps(), Bps(0));
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// The guards round against the trader for every quote and tolerance:
+        /// min-out is the floor of `q·(1−tol)` and never exceeds `q`; max-in is
+        /// the ceil of `q·(1+tol)` and never falls below `q`.
+        #[test]
+        fn guards_round_against_the_trader(q in 0u64.., tol in 0u16..=10_000) {
+            let (qq, den) = (U256::from(q), U256::from(BPS_ONE));
+            let s = Slippage::from_bps(Bps(tol));
+            let min_out = s.min_amount_out(&amt(q)).raw;
+            let max_in = s.max_amount_in(&amt(q)).raw;
+
+            let num_out = U256::from(BPS_ONE - u64::from(tol));
+            let num_in = U256::from(BPS_ONE + u64::from(tol));
+            prop_assert_eq!(min_out, qq * num_out / den); // floor
+            prop_assert_eq!(max_in, (qq * num_in + den - U256::from(1u64)) / den); // ceil
+            prop_assert!(min_out <= qq);
+            prop_assert!(max_in >= qq);
+        }
+
+        /// A wider tolerance only ever loosens the guard.
+        #[test]
+        fn wider_tolerance_loosens_the_guard(q in 1u64.., t0 in 0u16..5_000, bump in 1u16..5_000) {
+            let (lo, hi) = (Slippage::from_bps(Bps(t0)), Slippage::from_bps(Bps(t0 + bump)));
+            prop_assert!(hi.min_amount_out(&amt(q)).raw <= lo.min_amount_out(&amt(q)).raw);
+            prop_assert!(hi.max_amount_in(&amt(q)).raw >= lo.max_amount_in(&amt(q)).raw);
+        }
+
+        /// Compounding over more hops never reduces the effective tolerance.
+        #[test]
+        fn compound_is_monotone_in_hops(tol in 0u16..=1_000, hops in 0usize..8) {
+            let s = Slippage::from_bps(Bps(tol));
+            prop_assert!(s.compound(hops + 1).bps().0 >= s.compound(hops).bps().0);
+        }
+    }
 }
