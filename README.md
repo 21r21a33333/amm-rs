@@ -1,6 +1,6 @@
 # amm-rs
 
-**Wei-exact swap quoting across Uniswap V2/V3/V4, Curve, and Aerodrome — behind one open, object-safe `Pool` trait.**
+**Wei-exact swap quoting and calldata construction across Uniswap V2/V3/V4, Curve, and Aerodrome — behind one open, object-safe `Pool` trait.**
 
 [![Crates.io][crates-badge]][crates-url]
 [![Docs.rs][docs-badge]][docs-url]
@@ -11,15 +11,17 @@
 [Documentation](docs/) · [Examples](#examples) · [Supported protocols](#supported-protocols) · [Architecture](docs/architecture.md)
 
 `amm-rs` computes AMM swap quotes that reproduce the on-chain contract **to the
-wei**. Every protocol sits behind the same object-safe `Pool` trait, so a router
-holds Uniswap, Curve, and Aerodrome pools in one `Vec<Box<dyn Pool>>` and adds a
-new AMM by implementing the trait in its own crate — no closed enum to fork.
+wei**, and builds the swap calldata to act on them. Every protocol sits behind
+the same object-safe `Pool` trait, so a router holds Uniswap, Curve, and
+Aerodrome pools in one `Vec<Box<dyn Pool>>` and adds a new AMM by implementing
+the trait in its own crate — no closed enum to fork.
 
-> ⚠️ **Not audited. Quoting only.** `amm-rs` computes swap quotes; it does not
-> execute trades or hold funds. Quotes are best-effort reproductions of on-chain
-> contract math and can diverge from live results (MEV, state changes between
-> block and execution, unsupported edge cases). **Verify against the chain before
-> acting on any quote.** No warranty; use at your own risk.
+> ⚠️ **Not audited.** `amm-rs` computes swap quotes and builds swap calldata; it
+> does not submit transactions or hold funds — you sign and send. Quotes are
+> best-effort reproductions of on-chain contract math and can diverge from live
+> results (MEV, state changes between block and execution, unsupported edge
+> cases). **Verify against the chain before acting on any quote.** No warranty;
+> use at your own risk.
 
 ## Installation
 
@@ -79,22 +81,51 @@ let pools = source.refresh(&[key], BlockId::latest()).await?; // one block-pinne
 let out = pools[0].quote(&AssetAmount::new(usdc, U256::from(1_000_000_000u64)), &weth)?;
 ```
 
-Runnable versions of both are in [`examples/`](#examples).
+Turn a quote into ready-to-sign calldata:
+
+```rust,ignore
+use amm_rpc::execution::{
+    as_executable, ChainConfig, Currency, CurrencyAmount, Deadline, ExecutionOptions,
+    Recipient, Route, TradeType,
+};
+
+let opts = ExecutionOptions::new(Slippage::from_bps(Bps(50)))   // 0.5% floor
+    .with_recipient(Recipient::To(sender))
+    .with_deadline(Deadline::AtTimestamp(deadline));
+let route = Route::new_single_hop(usdc, weth, TradeType::ExactIn);
+
+let prepared = as_executable(pools[0].as_ref())?.build_swap(
+    &cfg,                                                       // ChainConfig with router addresses
+    CurrencyAmount { currency: Currency::Token(usdc), raw: amount_in },
+    Currency::Token(weth),
+    &route,
+    &out,                                                       // the quote, for the slippage floor
+    &opts,
+)?;
+// prepared.tx       — the transaction (to / value / data) to sign and send
+// prepared.approval — any Permit2 / ERC-20 approval to grant first
+```
+
+Runnable versions are in [`examples/`](#examples).
 
 ## Supported protocols
 
-Every family has a pure quoter (`amm-core`) and an on-chain state source (`amm-rpc`).
+Every family has a pure quoter (`amm-core`), an on-chain state source, and a
+swap-calldata builder (`amm-rpc`).
 
-| Protocol   | Variants                                   | exact-in | exact-out | on-chain fetch |
-|------------|--------------------------------------------|:--------:|:---------:|:--------------:|
-| Uniswap    | V2, V3, V4                                  |    ✅    |    ✅     |      ✅        |
-| Curve      | all 12 (StableSwap + CryptoSwap)            |    ✅    |    ✅     |      ✅        |
-| Aerodrome  | volatile (vAMM), stable (sAMM), Slipstream  |    ✅    |    ✅     |      ✅        |
+| Protocol   | Variants                                   | exact-in | exact-out | on-chain fetch | calldata |
+|------------|--------------------------------------------|:--------:|:---------:|:--------------:|:--------:|
+| Uniswap    | V2, V3, V4                                  |    ✅    |    ✅     |      ✅        |    ✅    |
+| Curve      | all 12 (StableSwap + CryptoSwap)            |    ✅    |    ✅     |      ✅        |    ✅    |
+| Aerodrome  | volatile (vAMM), stable (sAMM), Slipstream  |    ✅    |    ✅     |      ✅        |    ✅    |
 
-Constant-product and stableswap quotes are wei-exact. Concentrated-liquidity
-quotes are exact over the tick data supplied; when fetched via `amm-rpc` they use
-a bounded tick window, exact for in-window sizes. See
-[docs/protocols.md](docs/protocols.md).
+Constant-product and stableswap quotes are wei-exact at every size; exact-out
+returns the wei-minimal input. Concentrated-liquidity quotes are wei-exact over
+the tick data supplied; when fetched via `amm-rpc` they use a bounded tick window
+(depth configurable per source), and a swap large enough to cross beyond it is
+**refused** rather than extrapolated — so a returned quote is never an
+over-estimate. Every calldata builder is proven to settle on-chain to the wei on
+mainnet/Base forks. See [docs/protocols.md](docs/protocols.md).
 
 ## Core concepts
 
@@ -110,13 +141,18 @@ a bounded tick window, exact for in-window sizes. See
   contract's arithmetic, not an approximation.
 - **Slippage & multi-hop paths.** `Slippage` bounds (with `compound` for
   multi-hop) and `path::quote_path` for chained routes.
+- **Executable calldata.** `amm-rpc` turns a quote into a ready-to-sign
+  transaction — recipient, deadline, slippage floor, and any Permit2/ERC-20
+  approval — routed through each protocol's canonical router (Universal Router,
+  SwapRouter02, the Curve pool, …). You sign and send.
 
 ## Crate layout
 
 - **`amm-core`** — pure quoting: primitives, traits, per-protocol quoters,
   slippage & path helpers. Minimal dependencies, no network.
-- **`amm-rpc`** — optional, `async`: `alloy`-backed on-chain state fetching that
-  turns chain state into quotable `amm-core` pools via one `StateSource` trait.
+- **`amm-rpc`** — optional, `async`: `alloy`-backed on-chain state fetching
+  (`StateSource`) that turns chain state into quotable `amm-core` pools, plus a
+  swap-calldata builder that turns a quote into a ready-to-sign transaction.
 
 ## Extending: add your own AMM
 
@@ -126,14 +162,22 @@ any router that consumes `Box<dyn Pool>`.
 
 ## Correctness
 
-Two layers, both in CI:
+Four layers:
 
 - **Golden-vector unit tests** — deterministic, no network; each quoter is
   checked against known on-chain values.
+- **Property-based invariants** ([`amm-core/tests/properties.rs`](amm-core/tests/properties.rs))
+  — over generated pool states: round-trip (`exact_out(exact_in(x)) ≤ x`, and
+  minimal to the wei), monotonicity, output bounded by liquidity, multi-tick
+  crossing, and slippage-guard rounding. Reaches the corners fixed fixtures miss.
 - **Live differential tests** ([`amm-rpc/tests/differential.rs`](amm-rpc/tests/differential.rs))
   — refresh a real pool and assert our quote equals the deployed contract's own
-  quote (`get_dy` / `getAmountOut` / a Quoter) at the same block, for every
-  exchange. Gated on an RPC endpoint.
+  quote (`get_dy` / `getAmountOut` / a Quoter) at the same block, swept by
+  liquidity fraction, for every exchange. Gated on an RPC endpoint.
+- **Execution fork proofs** ([`amm-rpc/tests/execution_*.rs`](amm-rpc/tests))
+  — build the calldata, run it against a mainnet/Base fork, and assert the
+  settled on-chain balance delta equals the quote to the wei. Gated on an RPC
+  endpoint.
 
 ## Examples
 
@@ -147,7 +191,7 @@ cargo run -p amm-rpc --example refresh_onchain
 
 ## Minimum supported Rust version (MSRV)
 
-Rust **1.85** (edition 2024). Raising the MSRV is a minor-version change.
+Rust **1.86** (edition 2024). Raising the MSRV is a minor-version change.
 
 ## Contributing
 
@@ -167,7 +211,7 @@ your option. The optional `curve` feature additionally pulls BSL-1.1 math; see
 [docs-url]: https://docs.rs/amm-core
 [ci-badge]: https://github.com/21r21a33333/amm-rs/actions/workflows/ci.yml/badge.svg
 [ci-url]: https://github.com/21r21a33333/amm-rs/actions/workflows/ci.yml
-[msrv-badge]: https://img.shields.io/badge/MSRV-1.85-blue.svg
+[msrv-badge]: https://img.shields.io/badge/MSRV-1.86-blue.svg
 [msrv-url]: #minimum-supported-rust-version-msrv
 [license-badge]: https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg
 [license-url]: #license
