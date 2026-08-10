@@ -20,6 +20,7 @@
 //! [`foundry_fork_db::SharedBackend`] calls `tokio::task::block_in_place`
 //! internally to park its RPC-polling thread.
 
+use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::{Address, Bytes, U256, keccak256};
 use alloy::providers::Provider;
 use alloy::sol;
@@ -95,11 +96,26 @@ where
         .join("revm-fork-cache");
     let cache_path = cache_dir.join(format!("{block}.json"));
 
+    // ── Fetch the pinned block's real timestamp ───────────────────────────────
+    // Timestamp 0 is unacceptable: Solidly/Aerodrome oracle arithmetic does
+    // `block.timestamp - lastTimestamp` in unchecked integer subtraction, so
+    // a zero timestamp against any real `lastTimestamp` (~1.7e9) would
+    // underflow and panic (EVM error 0x11).  Fetch the real value from the
+    // RPC; fall back to a sane non-zero sentinel only if the fetch fails.
+    let block_timestamp: u64 = provider
+        .get_block_by_number(BlockNumberOrTag::Number(block))
+        .await
+        .ok()
+        .flatten()
+        .map(|b| b.header.timestamp)
+        .unwrap_or(2_000_000_000u64);
+
     // ── BlockEnv pinned to `block` with zero basefee ──────────────────────────
     let block_env = BlockEnv {
         number: U256::from(block),
         basefee: 0u64,
         gas_limit: 30_000_000u64,
+        timestamp: U256::from(block_timestamp),
         ..Default::default()
     };
 
