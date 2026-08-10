@@ -10,7 +10,8 @@
 //! Native ETH is supported on pools where `currency0 == address(0)` (V4 native-first-class).
 //! On a **native-in** swap the caller sends `tx.value = amountIn` and no Permit2 approval is
 //! needed; on a **native-out** swap `tx.value = 0` and the token input is approved via Permit2.
-//! `price_limit` is deferred to a later task.
+//! A `price_limit` is unsupported: V4's Router swap actions carry no
+//! `sqrtPriceLimitX96` — slippage is bounded by `amountOutMinimum`/`amountInMaximum`.
 //! Approval spender is **Permit2**, not the router — V4 pulls via Permit2.
 
 use alloy::primitives::aliases::{I24, U24};
@@ -132,7 +133,8 @@ impl Executable for UniswapV4Pool {
     /// Native ETH is handled when the pool has `currency0 == address(0)`.  On a
     /// native-in swap `tx.value = amountIn` and no Permit2 approval is required;
     /// on a native-out swap `tx.value = 0` and Permit2 approves the token input.
-    /// A `price_limit` returns [`BuildError::UnsupportedProtocol`] (deferred).
+    /// A `price_limit` returns [`BuildError::UnsupportedProtocol`]: the V4 Router
+    /// swap actions carry no `sqrtPriceLimitX96` field (unlike V3).
     ///
     /// # Note — recipient delivery
     ///
@@ -166,8 +168,10 @@ impl Executable for UniswapV4Pool {
             native_asset,
         )?;
 
-        // price_limit is deferred: V4 single-hop CAN accept a limit, but that
-        // integration is out of scope for this task.
+        // V4's Router ExactInputSingle action has no sqrtPriceLimitX96 field
+        // (unlike V3): a per-swap price limit would require calling
+        // PoolManager.swap directly, which the Universal Router does not do.
+        // Slippage is bounded by amountOutMinimum below.
         if opts.price_limit.is_some() {
             return Err(BuildError::UnsupportedProtocol);
         }
@@ -241,7 +245,8 @@ impl Executable for UniswapV4Pool {
     /// Native ETH is handled when the pool has `currency0 == address(0)`.  On a
     /// native-in swap `tx.value = maxAmountIn` and no Permit2 approval is required;
     /// on a native-out swap `tx.value = 0` and Permit2 approves the token input.
-    /// A `price_limit` returns [`BuildError::UnsupportedProtocol`] (deferred).
+    /// A `price_limit` returns [`BuildError::UnsupportedProtocol`]: the V4 Router
+    /// swap actions carry no `sqrtPriceLimitX96` field (unlike V3).
     ///
     /// # Note — recipient delivery
     ///
@@ -275,7 +280,8 @@ impl Executable for UniswapV4Pool {
             native_asset,
         )?;
 
-        // price_limit deferred.
+        // No sqrtPriceLimitX96 on V4's Router actions (see build_swap);
+        // amountInMaximum bounds the exact-out swap instead.
         if opts.price_limit.is_some() {
             return Err(BuildError::UnsupportedProtocol);
         }
