@@ -1046,6 +1046,7 @@ dependencies = [
  "amm-core",
  "async-trait",
  "curve-adapter",
+ "curve-math",
  "eyre",
  "foundry-fork-db",
  "revm",
