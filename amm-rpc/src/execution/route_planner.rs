@@ -3,6 +3,13 @@
 //! Assembles `(command_byte, ABI-encoded input)` pairs and encodes them into an
 //! `execute(bytes commands, bytes[] inputs, uint256 deadline)` call understood by
 //! Uniswap's Universal Router (selector `0x3593564c`).
+//!
+//! The constants below are the full canonical Universal Router command set.
+//! `WRAP_ETH`, `UNWRAP_WETH`, `SWEEP`, and `PERMIT2_PERMIT` are forward-looking:
+//! they are not emitted by the current single-hop encoders (only `V4_SWAP` is used
+//! today — V4 native paths use `TAKE_ALL` on first-class `address(0)` rather than
+//! wrap/unwrap/sweep), but will be used by future multi-command routes (in-stream
+//! Permit2 permits, and WETH-pool wrap/unwrap/sweep cases).
 
 use alloy::primitives::{Bytes, U256};
 use alloy::{sol, sol_types::SolCall};
@@ -11,15 +18,27 @@ use alloy::{sol, sol_types::SolCall};
 pub const V4_SWAP: u8 = 0x10;
 
 /// Universal Router command byte: wrap native ETH into WETH.
+///
+/// Forward-looking — not emitted by the current single-hop encoders; reserved for
+/// future multi-command routes that target WETH pools.
 pub const WRAP_ETH: u8 = 0x0b;
 
 /// Universal Router command byte: unwrap WETH back to native ETH.
+///
+/// Forward-looking — not emitted by the current single-hop encoders; reserved for
+/// future multi-command routes that target WETH pools.
 pub const UNWRAP_WETH: u8 = 0x0c;
 
 /// Universal Router command byte: process a Permit2 `permit` approval.
+///
+/// Forward-looking — not emitted by the current single-hop encoders; reserved for
+/// future multi-command routes that embed an in-stream Permit2 permit.
 pub const PERMIT2_PERMIT: u8 = 0x0a;
 
 /// Universal Router command byte: sweep a token to a recipient.
+///
+/// Forward-looking — not emitted by the current single-hop encoders; reserved for
+/// future multi-command routes (e.g. post-unwrap dust sweep).
 pub const SWEEP: u8 = 0x04;
 
 sol! {

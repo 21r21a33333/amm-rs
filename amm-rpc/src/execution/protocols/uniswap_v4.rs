@@ -133,6 +133,16 @@ impl Executable for UniswapV4Pool {
     /// native-in swap `tx.value = amountIn` and no Permit2 approval is required;
     /// on a native-out swap `tx.value = 0` and Permit2 approves the token input.
     /// A `price_limit` returns [`BuildError::UnsupportedProtocol`] (deferred).
+    ///
+    /// # Note — recipient delivery
+    ///
+    /// V4 output is delivered via `TAKE_ALL` to the Universal Router's `msgSender()`,
+    /// which is the EOA that submits `execute` directly.  Consequently,
+    /// `Recipient::To(other)` where `other != sender` is **not** honored by this
+    /// single-hop encoder — `opts.recipient` is resolved (so `Recipient::Sender`
+    /// returns [`BuildError::UnresolvedRecipient`]) but the resolved address is not
+    /// threaded into the `TAKE_ALL` params.  Cross-recipient delivery is part of the
+    /// deferred `msg.sender`/multicall audit.
     fn build_swap(
         &self,
         ctx: &ChainConfig,
@@ -232,6 +242,16 @@ impl Executable for UniswapV4Pool {
     /// native-in swap `tx.value = maxAmountIn` and no Permit2 approval is required;
     /// on a native-out swap `tx.value = 0` and Permit2 approves the token input.
     /// A `price_limit` returns [`BuildError::UnsupportedProtocol`] (deferred).
+    ///
+    /// # Note — recipient delivery
+    ///
+    /// V4 output is delivered via `TAKE_ALL` to the Universal Router's `msgSender()`,
+    /// which is the EOA that submits `execute` directly.  Consequently,
+    /// `Recipient::To(other)` where `other != sender` is **not** honored by this
+    /// single-hop encoder — `opts.recipient` is resolved (so `Recipient::Sender`
+    /// returns [`BuildError::UnresolvedRecipient`]) but the resolved address is not
+    /// threaded into the `TAKE_ALL` params.  Cross-recipient delivery is part of the
+    /// deferred `msg.sender`/multicall audit.
     fn build_swap_exact_out(
         &self,
         ctx: &ChainConfig,
