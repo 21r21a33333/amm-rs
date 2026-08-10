@@ -132,10 +132,16 @@ impl ExactOut for CurvePool {
         from: &AssetId,
     ) -> Result<AssetAmount, QuoteError> {
         let (i, j) = self.indices(from, &amount_out.asset)?;
-        let needed = self
+        // curve-math's `get_amount_in` rounds the input up for safety; tighten it
+        // to the exact minimum against the forward `get_amount_out` (wei-exact vs
+        // the chain). Minimal, and never under-delivers.
+        let candidate = self
             .inner
             .get_amount_in(i, j, amount_out.raw)
             .ok_or(QuoteError::InsufficientLiquidity)?;
+        let needed = crate::protocols::minimal_exact_out_input(candidate, amount_out.raw, |dx| {
+            self.inner.get_amount_out(i, j, dx)
+        });
         Ok(AssetAmount::new(*from, needed))
     }
 }
@@ -144,10 +150,29 @@ impl Pricing for CurvePool {
     fn spot_price(&self, base: &AssetId, quote: &AssetId) -> Result<Price, QuoteError> {
         let (i, j) = self.indices(base, quote)?;
         // curve-math returns dy/dx as (numerator, denominator): coin j per coin i.
-        let (num, den) = self
-            .inner
-            .spot_price(i, j)
-            .ok_or(QuoteError::InsufficientLiquidity)?;
+        // Its analytic form is exact for StableSwap, but some CryptoSwap variants
+        // probe with a decimal-blind fixed dx that overflows low-decimal coins and
+        // returns `None`. Fall back to a reserve-relative marginal probe: dy/dx for
+        // a tiny dx sized off the input reserve (decimal-agnostic).
+        let (num, den) = match self.inner.spot_price(i, j) {
+            Some(p) => p,
+            None => {
+                let reserve = self
+                    .inner
+                    .balances()
+                    .get(i)
+                    .copied()
+                    .filter(|b| !b.is_zero())
+                    .ok_or(QuoteError::InsufficientLiquidity)?;
+                let dx = (reserve / U256::from(1_000_000u64)).max(U256::from(1u64));
+                let dy = self
+                    .inner
+                    .get_amount_out(i, j, dx)
+                    .filter(|d| !d.is_zero())
+                    .ok_or(QuoteError::InsufficientLiquidity)?;
+                (dy, dx)
+            }
+        };
         let ratio = Ratio::new(num, den).ok_or(QuoteError::InsufficientLiquidity)?;
         Price::new(*base, *quote, ratio).ok_or(QuoteError::InsufficientLiquidity)
     }
@@ -156,9 +181,14 @@ impl Pricing for CurvePool {
 impl Introspect for CurvePool {
     fn fee_bps(&self, source: &AssetId, destination: &AssetId) -> Option<Bps> {
         coin_indices(&self.assets, source, destination)?;
-        // StableSwap fee has a 1e10 denominator; CryptoSwap fees are dynamic
-        // (`fee()` is `None`) and not reducible to a static bps value.
-        let fee = self.inner.fee()?;
+        // StableSwap exposes a single static fee. CryptoSwap's fee is dynamic
+        // (mid_fee at balance rising toward out_fee as the pool skews), so report
+        // its `mid_fee` — the representative near-balance rate. Both share the 1e10
+        // denominator.
+        let fee = self
+            .inner
+            .fee()
+            .or_else(|| self.inner.crypto_fees().map(|(mid_fee, _, _)| mid_fee))?;
         let bps = fee / U256::from(FEE_PER_BP);
         Some(Bps(u16::try_from(bps).unwrap_or(u16::MAX)))
     }
@@ -248,6 +278,17 @@ mod tests {
             delivered.raw >= want,
             "exact-out input must cover the target"
         );
+        // ...and be minimal: one wei less must under-fill.
+        let under = pool
+            .quote(
+                &AssetAmount::new(dai(), needed.raw - U256::from(1u64)),
+                &usdc(),
+            )
+            .unwrap();
+        assert!(
+            under.raw < want,
+            "exact-out input must be minimal (one wei less under-fills)"
+        );
     }
 
     #[test]
@@ -305,11 +346,11 @@ mod tests {
     }
 
     #[test]
-    fn cryptoswap_pool_reports_crypto_kind_and_dynamic_fee() {
+    fn cryptoswap_pool_reports_crypto_kind_and_mid_fee() {
         // TwoCryptoStable is a CryptoSwap-interface pool that uses StableSwap math
         // and exposes no `gamma()`. It must still classify as CurveCrypto (via the
-        // crypto fee params) and report a dynamic (None) fee — the case that a
-        // `gamma()`-based discriminator would misclassify.
+        // crypto fee params) and report its `mid_fee` as the representative bps —
+        // the case that a `gamma()`-based discriminator would misclassify.
         let e18 = U256::from(1_000_000_000_000_000_000u64);
         let inner = CurveMathPool::TwoCryptoStable {
             balances: [e18, e18],
@@ -323,6 +364,7 @@ mod tests {
         };
         let pool = CurvePool::new(PoolId::new("1:curve:0x2crypto"), vec![dai(), usdc()], inner);
         assert_eq!(pool.kind(), PoolKind::CurveCrypto);
-        assert_eq!(pool.fee_bps(&dai(), &usdc()), None); // dynamic fee, not a static bps
+        // mid_fee 3_000_000 / 1e6 = 3 bps (the near-balance rate).
+        assert_eq!(pool.fee_bps(&dai(), &usdc()), Some(Bps(3)));
     }
 }

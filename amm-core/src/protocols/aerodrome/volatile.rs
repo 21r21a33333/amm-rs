@@ -87,11 +87,11 @@ impl AerodromeVolatilePool {
 
     /// Exact-out inverse: the *minimum* input that receives at least
     /// `amount_out`. The closed form (rounded up at both the constant-product
-    /// inverse and the fee gross-up) yields a guaranteed upper bound that may sit
-    /// 1–2 wei above the true minimum; it is then tightened against the exact
-    /// forward [`amount_out`](Self::amount_out) — stepping down while one wei less
-    /// still covers the target. That forward quote is wei-exact against the chain,
-    /// so the result is both minimal and never under-delivers.
+    /// inverse and the fee gross-up) yields a guaranteed upper bound, which
+    /// [`minimal_exact_out_input`](crate::protocols::minimal_exact_out_input)
+    /// tightens to the wei against the exact forward
+    /// [`amount_out`](Self::amount_out). That forward quote is wei-exact against
+    /// the chain, so the result is both minimal and never under-delivers.
     fn amount_in(
         &self,
         reserve_in: U256,
@@ -114,21 +114,18 @@ impl AerodromeVolatilePool {
                 match fee_factor == 0 {
                     true => Err(QuoteError::Overflow),
                     false => {
-                        let mut candidate = net_needed
+                        let candidate = net_needed
                             .checked_mul(U256::from(BPS_ONE))
                             .ok_or(QuoteError::Overflow)?
                             .checked_div(U256::from(fee_factor))
                             .ok_or(QuoteError::Overflow)?
                             .checked_add(U256::from(1u64))
                             .ok_or(QuoteError::Overflow)?;
-                        let one = U256::from(1u64);
-                        while candidate > one
-                            && self.amount_out(reserve_in, reserve_out, candidate - one)?
-                                >= amount_out
-                        {
-                            candidate -= one;
-                        }
-                        Ok(candidate)
+                        Ok(crate::protocols::minimal_exact_out_input(
+                            candidate,
+                            amount_out,
+                            |dx| self.amount_out(reserve_in, reserve_out, dx).ok(),
+                        ))
                     }
                 }
             }
