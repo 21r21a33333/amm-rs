@@ -78,6 +78,9 @@ pub fn as_executable(pool: &dyn Pool) -> Option<&dyn Executable> {
     if let Some(p) = any.downcast_ref::<amm_core::protocols::uniswap::v2::UniswapV2Pool>() {
         return Some(p);
     }
+    if let Some(p) = any.downcast_ref::<amm_core::protocols::uniswap::v3::UniswapV3Pool>() {
+        return Some(p);
+    }
     None
 }
 

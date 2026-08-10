@@ -9,6 +9,8 @@
 pub mod aerodrome;
 #[cfg(any(feature = "uniswap-v3", feature = "uniswap-v4", feature = "aerodrome"))]
 mod concentrated;
+#[cfg(any(feature = "uniswap-v3", feature = "uniswap-v4", feature = "aerodrome"))]
+pub use concentrated::sqrt_price_limit_x96;
 #[cfg(feature = "curve")]
 pub mod curve;
 #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3", feature = "uniswap-v4"))]

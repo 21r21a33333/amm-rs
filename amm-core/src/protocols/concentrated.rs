@@ -396,6 +396,18 @@ pub(crate) fn quote_with_limit(
     })
 }
 
+/// Convert a caller `Price` limit into a `sqrtPriceX96` bound in the pool's
+/// orientation, clamped to the valid engine range. The execution layer feeds
+/// this into a V3/Slipstream `sqrtPriceLimitX96` so the on-chain limit matches
+/// the quote-time limit exactly.
+///
+/// # Errors
+/// `QuoteError::AssetNotInPool` if the price is about assets this pool does not
+/// trade; `QuoteError::Overflow` / `InsufficientLiquidity` on a degenerate ratio.
+pub fn sqrt_price_limit_x96(assets: &[AssetId; 2], limit: &Price) -> Result<U256, QuoteError> {
+    clamped_sqrt_limit(assets, limit)
+}
+
 /// Convert a caller `Price` bound into a `sqrtPriceX96` in the pool's
 /// `token1/token0` orientation (accepting either input orientation), clamped
 /// into the valid engine range. `Err(AssetNotInPool)` if the price is about
@@ -542,5 +554,76 @@ mod tests {
         // one_for_zero (price rises): a limit at/below current is already passed.
         assert!(limit_already_reached(cur, false, U256::from(1_000u64)));
         assert!(!limit_already_reached(cur, false, U256::from(1_001u64)));
+    }
+
+    // ─── sqrt_price_limit_x96 public converter ───────────────────────────────
+
+    #[test]
+    fn sqrt_price_limit_x96_forward_orientation_is_nonzero_and_in_range() {
+        use crate::primitives::asset::{AssetId, ChainId};
+        use crate::primitives::price::Price;
+        use crate::primitives::ratio::Ratio;
+        use alloy_primitives::B256;
+
+        let a = AssetId::new(ChainId(1), B256::left_padding_from(&[0x01]));
+        let b = AssetId::new(ChainId(1), B256::left_padding_from(&[0x02]));
+        let ratio = Ratio::new(U256::from(2u64), U256::from(1u64)).unwrap();
+        let price = Price::new(a, b, ratio).unwrap();
+
+        let result =
+            sqrt_price_limit_x96(&[a, b], &price).expect("forward orientation must succeed");
+
+        assert!(result > U256::ZERO, "result must be non-zero");
+        let lo = uniswap_v3_math::tick_math::MIN_SQRT_RATIO;
+        let hi = uniswap_v3_math::tick_math::MAX_SQRT_RATIO;
+        assert!(result > lo, "result must be > MIN_SQRT_RATIO");
+        assert!(result < hi, "result must be < MAX_SQRT_RATIO");
+    }
+
+    #[test]
+    fn sqrt_price_limit_x96_inverted_orientation_also_succeeds() {
+        use crate::primitives::asset::{AssetId, ChainId};
+        use crate::primitives::price::Price;
+        use crate::primitives::ratio::Ratio;
+        use alloy_primitives::B256;
+
+        let a = AssetId::new(ChainId(1), B256::left_padding_from(&[0x01]));
+        let b = AssetId::new(ChainId(1), B256::left_padding_from(&[0x02]));
+        // Price expressed as b→a (inverted orientation); the converter inverts it.
+        let ratio = Ratio::new(U256::from(2u64), U256::from(1u64)).unwrap();
+        let price = Price::new(b, a, ratio).unwrap();
+
+        let result =
+            sqrt_price_limit_x96(&[a, b], &price).expect("inverted orientation must succeed");
+
+        assert!(result > U256::ZERO, "result must be non-zero");
+        let lo = uniswap_v3_math::tick_math::MIN_SQRT_RATIO;
+        let hi = uniswap_v3_math::tick_math::MAX_SQRT_RATIO;
+        assert!(result > lo, "result must be > MIN_SQRT_RATIO");
+        assert!(result < hi, "result must be < MAX_SQRT_RATIO");
+    }
+
+    #[test]
+    fn sqrt_price_limit_x96_unrelated_asset_returns_asset_not_in_pool() {
+        use crate::error::QuoteError;
+        use crate::primitives::asset::{AssetId, ChainId};
+        use crate::primitives::price::Price;
+        use crate::primitives::ratio::Ratio;
+        use alloy_primitives::B256;
+
+        let a = AssetId::new(ChainId(1), B256::left_padding_from(&[0x01]));
+        let b = AssetId::new(ChainId(1), B256::left_padding_from(&[0x02]));
+        let c = AssetId::new(ChainId(1), B256::left_padding_from(&[0x03]));
+        let d = AssetId::new(ChainId(1), B256::left_padding_from(&[0x04]));
+
+        // Price over assets (c, d) — not in pool [a, b].
+        let ratio = Ratio::new(U256::from(1u64), U256::from(1u64)).unwrap();
+        let price = Price::new(c, d, ratio).unwrap();
+
+        let result = sqrt_price_limit_x96(&[a, b], &price);
+        assert!(
+            matches!(result, Err(QuoteError::AssetNotInPool { .. })),
+            "expected AssetNotInPool, got: {result:?}"
+        );
     }
 }

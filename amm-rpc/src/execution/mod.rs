@@ -20,6 +20,7 @@
 pub mod config;
 pub mod error;
 pub mod executable;
+pub mod multicall;
 pub mod options;
 pub mod prepared;
 pub mod protocols;
