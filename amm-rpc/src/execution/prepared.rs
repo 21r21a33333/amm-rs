@@ -84,8 +84,14 @@ pub struct ApprovalRequirement {
 pub struct PreparedSwap {
     /// The signer-ready transaction to submit.
     pub tx: UnsignedTx,
-    /// The minimum output the caller will receive (exact-in: exact target;
-    /// exact-out: the floor after applying slippage).
+    /// The output the caller is guaranteed to receive.
+    ///
+    /// - **exact-in:** the slippage floor (`slippage.min_amount_out(quoted)`).
+    /// - **exact-out:** the exact target output (slippage bounds the *input*
+    ///   instead — see [`max_spent`](Self::max_spent)).
+    ///
+    /// For native-output swaps `.asset` is the wrapped identity (WETH); the
+    /// recipient receives the same amount of unwrapped native ETH.
     pub min_received: AssetAmount,
     /// The maximum input the caller will spend (exact-out trades only).
     pub max_spent: Option<AssetAmount>,
