@@ -21,6 +21,7 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 use amm_core::primitives::asset::AssetId;
 use amm_core::primitives::pool::PoolKey;
+use amm_core::protocols::curve::CurveInterface;
 use amm_core::protocols::curve::pool::CurvePool;
 use amm_core::traits::pool::Pool;
 use curve_adapter::{CurveVariant, RawPoolState, build_pool};
@@ -211,6 +212,29 @@ fn calls_for(config: &CurvePoolConfig) -> Vec<Call> {
     calls
 }
 
+/// Map the 12-way `CurveVariant` to the 4-way `CurveInterface` ABI family.
+///
+/// Two burn-in traps (spec §4.4):
+/// - `TwoCryptoNG`/`TwoCryptoStable` → `CryptoU256Receiver` (no `use_eth` param).
+/// - `TriCryptoNG` stays `CryptoU256UseEth` (has `use_eth`, not `CryptoU256Receiver`).
+fn interface_of(v: CurveVariant) -> CurveInterface {
+    match v {
+        CurveVariant::StableSwapV0
+        | CurveVariant::StableSwapV1
+        | CurveVariant::StableSwapV2
+        | CurveVariant::StableSwapSTETH
+        | CurveVariant::StableSwapMeta
+        | CurveVariant::StableSwapALend => CurveInterface::StableI128,
+        CurveVariant::StableSwapNG => CurveInterface::StableI128Ng,
+        CurveVariant::TwoCryptoV1 | CurveVariant::TriCryptoV1 | CurveVariant::TriCryptoNG => {
+            CurveInterface::CryptoU256UseEth
+        }
+        CurveVariant::TwoCryptoNG | CurveVariant::TwoCryptoStable => {
+            CurveInterface::CryptoU256Receiver
+        }
+    }
+}
+
 /// Decode one pool's result slice into a [`RawPoolState`] and build it. `None`
 /// if a required read reverted or the adapter rejects the state.
 fn build_curve_pool(config: &CurvePoolConfig, results: &[CallResult]) -> Option<Box<dyn Pool>> {
@@ -308,11 +332,14 @@ fn build_curve_pool(config: &CurvePoolConfig, results: &[CallResult]) -> Option<
     };
 
     let inner = build_pool(&raw).ok()?;
-    Some(Box::new(CurvePool::new(
-        amm_core::primitives::pool::PoolId::new(&config.address.to_string()),
-        config.coins.clone(),
-        inner,
-    )))
+    Some(Box::new(
+        CurvePool::new(
+            amm_core::primitives::pool::PoolId::new(&config.address.to_string()),
+            config.coins.clone(),
+            inner,
+        )
+        .with_execution(config.address, interface_of(config.variant)),
+    ))
 }
 
 /// A sequential reader over a pool's result slice, mirroring `calls_for`'s order.
@@ -420,6 +447,64 @@ mod tests {
     use super::*;
     use alloy::primitives::{B256, address};
     use amm_core::primitives::asset::{AssetAmount, ChainId};
+
+    #[test]
+    fn interface_of_covers_all_variants() {
+        // StableSwap plain variants → StableI128
+        assert_eq!(
+            interface_of(CurveVariant::StableSwapV0),
+            CurveInterface::StableI128
+        );
+        assert_eq!(
+            interface_of(CurveVariant::StableSwapV1),
+            CurveInterface::StableI128
+        );
+        assert_eq!(
+            interface_of(CurveVariant::StableSwapV2),
+            CurveInterface::StableI128
+        );
+        assert_eq!(
+            interface_of(CurveVariant::StableSwapSTETH),
+            CurveInterface::StableI128
+        );
+        // Burn-in trap: Meta and ALend stay on StableI128 (not NG)
+        assert_eq!(
+            interface_of(CurveVariant::StableSwapMeta),
+            CurveInterface::StableI128
+        );
+        assert_eq!(
+            interface_of(CurveVariant::StableSwapALend),
+            CurveInterface::StableI128
+        );
+        // StableSwap-NG → StableI128Ng
+        assert_eq!(
+            interface_of(CurveVariant::StableSwapNG),
+            CurveInterface::StableI128Ng
+        );
+        // CryptoSwap with use_eth → CryptoU256UseEth
+        assert_eq!(
+            interface_of(CurveVariant::TwoCryptoV1),
+            CurveInterface::CryptoU256UseEth
+        );
+        assert_eq!(
+            interface_of(CurveVariant::TriCryptoV1),
+            CurveInterface::CryptoU256UseEth
+        );
+        // Burn-in trap: TriCryptoNG stays CryptoU256UseEth (has use_eth), NOT Receiver
+        assert_eq!(
+            interface_of(CurveVariant::TriCryptoNG),
+            CurveInterface::CryptoU256UseEth
+        );
+        // Burn-in trap: TwoCryptoNG and TwoCryptoStable → CryptoU256Receiver (no use_eth)
+        assert_eq!(
+            interface_of(CurveVariant::TwoCryptoNG),
+            CurveInterface::CryptoU256Receiver
+        );
+        assert_eq!(
+            interface_of(CurveVariant::TwoCryptoStable),
+            CurveInterface::CryptoU256Receiver
+        );
+    }
 
     fn coin(byte: u8) -> AssetId {
         AssetId::new(ChainId(1), B256::left_padding_from(&[byte]))

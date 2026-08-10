@@ -85,9 +85,13 @@ impl AerodromeVolatilePool {
         }
     }
 
-    /// Closed-form exact-out inverse: the minimum input to receive at least
-    /// `amount_out`. Rounds up at both the constant-product and fee-gross-up
-    /// steps so the result always covers the target.
+    /// Exact-out inverse: the *minimum* input that receives at least
+    /// `amount_out`. The closed form (rounded up at both the constant-product
+    /// inverse and the fee gross-up) yields a guaranteed upper bound, which
+    /// [`minimal_exact_out_input`](crate::protocols::minimal_exact_out_input)
+    /// tightens to the wei against the exact forward
+    /// [`amount_out`](Self::amount_out). That forward quote is wei-exact against
+    /// the chain, so the result is both minimal and never under-delivers.
     fn amount_in(
         &self,
         reserve_in: U256,
@@ -109,13 +113,20 @@ impl AerodromeVolatilePool {
                     .ok_or(QuoteError::Overflow)?;
                 match fee_factor == 0 {
                     true => Err(QuoteError::Overflow),
-                    false => net_needed
-                        .checked_mul(U256::from(BPS_ONE))
-                        .ok_or(QuoteError::Overflow)?
-                        .checked_div(U256::from(fee_factor))
-                        .ok_or(QuoteError::Overflow)?
-                        .checked_add(U256::from(1u64))
-                        .ok_or(QuoteError::Overflow),
+                    false => {
+                        let candidate = net_needed
+                            .checked_mul(U256::from(BPS_ONE))
+                            .ok_or(QuoteError::Overflow)?
+                            .checked_div(U256::from(fee_factor))
+                            .ok_or(QuoteError::Overflow)?
+                            .checked_add(U256::from(1u64))
+                            .ok_or(QuoteError::Overflow)?;
+                        Ok(crate::protocols::minimal_exact_out_input(
+                            candidate,
+                            amount_out,
+                            |dx| self.amount_out(reserve_in, reserve_out, dx).ok(),
+                        ))
+                    }
                 }
             }
         }
@@ -256,6 +267,17 @@ mod tests {
         assert!(
             delivered.raw >= want,
             "exact-out input must cover the target"
+        );
+        // ...and be minimal: one wei less must under-fill.
+        let under = p
+            .quote(
+                &AssetAmount::new(usdc(), needed.raw - U256::from(1u64)),
+                &weth(),
+            )
+            .unwrap();
+        assert!(
+            under.raw < want,
+            "exact-out input must be minimal (one wei less under-fills)"
         );
     }
 

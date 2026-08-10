@@ -9,7 +9,8 @@ description = "Optional alloy-backed on-chain state fetching for amm-core pools.
 
 [dependencies]
 amm-core = { path = "../amm-core", features = ["uniswap-v2", "uniswap-v3", "uniswap-v4", "aerodrome"] }
-alloy = { version = "2.2.0", features = ["contract", "provider-http"] }
+alloy = { version = "2.3", features = ["contract", "provider-http", "network", "rpc-types", "serde"] }
+serde = { version = "1", features = ["derive"], optional = true }
 async-trait = "0.1"
 thiserror = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
@@ -22,9 +23,27 @@ curve-adapter = { git = "https://github.com/sunce86/curve-math", version = "0.1.
 # On-chain state fetching for Curve pools. Pulls curve-adapter + amm-core/curve
 # (BSL-1.1); off by default so the crate stays MIT/Apache unless opted in.
 curve = ["dep:curve-adapter", "amm-core/curve"]
+# Serde derives for all leaf value types (UnsignedTx, Currency, CurrencyAmount).
+serde = ["dep:serde", "amm-core/serde", "alloy/serde"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full", "test-util"] }
+alloy = { version = "2.3", features = [
+  "contract",
+  "provider-http",
+  "network",
+  "rpc-types",
+  "serde",
+] }
+alloy-provider = { version = "1", default-features = false, features = ["reqwest"] }
+alloy-rpc-client = { version = "1", default-features = false }
+alloy-rpc-types = "1.0.42"
+# Required to construct CurveMathPool fixtures in encoder unit tests (BSL-1.1;
+# already a transitive dep via curve-adapter + amm-core/curve).
+curve-math = { git = "https://github.com/sunce86/curve-math", features = ["swap"] }
+eyre = "0.6"
+foundry-fork-db = "0.16.0"
+revm = { version = "27.1.0", features = ["alloydb", "serde", "dev"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

@@ -10,13 +10,15 @@
 //!    **same** block `B`, routed through the crate's own `aggregate3` so it
 //!    observes the identical block,
 //! 4. asserts the two agree — to the wei for constant-product / stableswap, and
-//!    within a bounded ppm for concentrated liquidity (our fetch reconstructs a
-//!    finite tick window, so very large swaps can diverge slightly).
+//!    to the wei for concentrated liquidity within the fetched tick window; a
+//!    swap large enough to cross beyond that window is REFUSED
+//!    (`TickWindowExceeded`) rather than mis-priced (see the V3 liquidity-relative
+//!    sweep, which drives sizes past the window and asserts the refusal).
 //!
 //! **Every exposed pool function is exercised**, not just exact-in `quote`:
-//! - **exact-in** vs the on-chain quoter — WEI-EXACT for small in-window swaps
-//!   (the precision claim); bounded-ppm for larger concentrated swaps, where the
-//!   only divergence is the finite tick-window fetch, not a precision error.
+//! - **exact-in** vs the on-chain quoter — WEI-EXACT for in-window swaps (the
+//!   precision claim). A swap that would cross beyond the fetched tick window is
+//!   refused, never extrapolated (extrapolation over-estimates output).
 //! - **exact-out** (`quote_exact_out`) is proven exactly minimal wei-by-wei: the
 //!   input it returns delivers at least the target, and one wei less under-fills.
 //!   Since `quote` is itself wei-exact against the chain, this pins exact-out to
@@ -167,23 +169,14 @@ struct Report {
 }
 
 impl Report {
-    /// Wei-exact check (constant-product / stableswap).
+    /// Wei-exact check. Every quote this harness makes — constant-product,
+    /// stableswap, and in-window concentrated — is exact against the chain; there
+    /// is no bounded-ppm tolerance (a concentrated swap past the fetched window is
+    /// refused, not approximated). `worst_ppm` stays for the summary line, but a
+    /// nonzero value is a failure, never an accepted tolerance.
     fn wei(&mut self, label: &str, ours: U256, theirs: U256) {
         let ppm = ppm_delta(ours, theirs);
         self.record(label, ours, theirs, ppm, ours == theirs, "exact");
-    }
-
-    /// Bounded-ppm check (concentrated liquidity — finite tick window).
-    fn ppm(&mut self, label: &str, ours: U256, theirs: U256, max: u128) {
-        let ppm = ppm_delta(ours, theirs);
-        self.record(
-            label,
-            ours,
-            theirs,
-            ppm,
-            ppm <= max,
-            &format!("<= {max} ppm"),
-        );
     }
 
     fn record(&mut self, label: &str, ours: U256, theirs: U256, ppm: u128, ok: bool, bound: &str) {
@@ -358,6 +351,60 @@ fn quote_out(pool: &dyn Pool, from: Address, to: Address, chain: u64, amount: U2
     .raw
 }
 
+/// Liquidity-relative probe fractions `(num, den)` of a pool's depth. A
+/// concentrated pool is swept across its window edge (past 100%) to prove the
+/// refuse boundary; a reserve pool stays within depth, where its math is exact
+/// at every size.
+fn sweep_fractions(concentrated: bool) -> &'static [(u64, u64)] {
+    match concentrated {
+        true => &[(1, 100), (1, 2), (9, 10), (99, 100), (101, 100), (3, 2)],
+        false => &[(1, 100), (1, 10), (1, 4), (1, 2)],
+    }
+}
+
+/// The depth used to size a pool's sweep: the window capacity (`max_amount_in`)
+/// for a concentrated pool, else the input reserve.
+fn sweep_depth(pool: &dyn Pool, from: AssetId, to: AssetId, concentrated: bool) -> U256 {
+    let depth = match concentrated {
+        true => pool
+            .as_limits()
+            .and_then(|l| l.max_amount_in(&from, &to))
+            .map(|a| a.raw),
+        false => pool
+            .as_introspect()
+            .and_then(|i| i.reserve(&from))
+            .map(|a| a.raw),
+    };
+    depth
+        .filter(|d| !d.is_zero())
+        .expect("pool must report a depth")
+}
+
+impl Report {
+    /// Assert one liquidity-relative sweep point: wei-exact against the chain,
+    /// except a concentrated pool may instead REFUSE (`TickWindowExceeded`) once
+    /// the swap crosses beyond its fetched window. Any other error, or a wrong
+    /// number, is a failure — never a silently-tolerated divergence.
+    fn sweep_point(
+        &mut self,
+        label: &str,
+        ours: Result<U256, amm_core::error::QuoteError>,
+        theirs: U256,
+        may_refuse: bool,
+    ) {
+        use amm_core::error::QuoteError;
+        match ours {
+            Ok(out) => self.wei(label, out, theirs),
+            Err(QuoteError::TickWindowExceeded) if may_refuse => self.pass(
+                &format!("{label} refused past window"),
+                true,
+                &format!("chain would give {theirs}"),
+            ),
+            Err(e) => self.pass(label, false, &format!("unexpected error {e:?}")),
+        }
+    }
+}
+
 // ─── token addresses ────────────────────────────────────────────────────────
 
 const USDC: Address = address!("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
@@ -418,6 +465,28 @@ async fn diff_uniswap_v2_usdc_weth() {
             theirs,
         );
     }
+    // Liquidity-relative sweep (USDC->WETH): constant-product is wei-exact at
+    // every size within depth — no tick window, so no refuse regime.
+    let (fa, ta) = (asset(ETH_CHAIN, USDC), asset(ETH_CHAIN, WETH));
+    let depth = sweep_depth(pool, fa, ta, false);
+    for &(num, den) in sweep_fractions(false) {
+        let amount = depth * U256::from(num) / U256::from(den);
+        let calldata = IUniV2Router::getAmountsOutCall {
+            amountIn: amount,
+            path: vec![USDC, WETH],
+        }
+        .abi_encode();
+        let theirs = *IUniV2Router::getAmountsOutCall::abi_decode_returns(
+            &fork.reference(router, calldata).await,
+        )
+        .unwrap()
+        .last()
+        .unwrap();
+        let ours = pool
+            .quote(&AssetAmount::new(fa, amount), &ta)
+            .map(|a| a.raw);
+        report.sweep_point(&format!("v2 sweep {num}/{den} depth"), ours, theirs, false);
+    }
     // exact-out, fee, reserve, spot-price — all wei-precise.
     verify_capabilities(
         &mut report,
@@ -450,13 +519,14 @@ async fn diff_uniswap_v3_usdc_weth() {
     let pool = pools[0].as_ref();
 
     let mut report = Report::default();
-    // Small in-window swaps must be WEI-EXACT vs QuoterV2; larger swaps stay
-    // within a bounded ppm (the finite tick-window fetch, not a precision error).
-    for (from, to, amount, wei_exact) in [
-        (USDC, WETH, U256::from(SMALL_USDC), true),
-        (WETH, USDC, U256::from(SMALL_WETH), true),
-        (USDC, WETH, U256::from(K_USDC), false),
-        (USDC, WETH, U256::from(BIG_USDC), false),
+    // Every in-window swap is WEI-EXACT vs QuoterV2 — there is no bounded-ppm
+    // regime: a swap large enough to cross beyond the fetched window is refused
+    // (asserted by the liquidity-relative sweep below), not approximated.
+    for (from, to, amount) in [
+        (USDC, WETH, U256::from(SMALL_USDC)),
+        (WETH, USDC, U256::from(SMALL_WETH)),
+        (USDC, WETH, U256::from(K_USDC)),
+        (USDC, WETH, U256::from(BIG_USDC)),
     ] {
         let ours = quote_out(pool, from, to, ETH_CHAIN, amount);
         let params = IUniV3Quoter::QuoteExactInputSingleParams {
@@ -472,10 +542,31 @@ async fn diff_uniswap_v3_usdc_weth() {
             .unwrap()
             .amountOut;
         let label = format!("v3 exact-in {from:#x}->{to:#x} {amount}");
-        match wei_exact {
-            true => report.wei(&label, ours, theirs),
-            false => report.ppm(&label, ours, theirs, 200),
-        }
+        report.wei(&label, ours, theirs);
+    }
+    // Liquidity-relative sweep (USDC->WETH) vs QuoterV2 across the window edge:
+    // in-window wei-exact, beyond-window refused — never a silent wrong number.
+    let (fa, ta) = (asset(ETH_CHAIN, USDC), asset(ETH_CHAIN, WETH));
+    let depth = sweep_depth(pool, fa, ta, true);
+    for &(num, den) in sweep_fractions(true) {
+        let amount = depth * U256::from(num) / U256::from(den);
+        let params = IUniV3Quoter::QuoteExactInputSingleParams {
+            tokenIn: USDC,
+            tokenOut: WETH,
+            amountIn: amount,
+            fee: U24::from(fee),
+            sqrtPriceLimitX96: U160::ZERO,
+        };
+        let calldata = IUniV3Quoter::quoteExactInputSingleCall { params }.abi_encode();
+        let theirs = IUniV3Quoter::quoteExactInputSingleCall::abi_decode_returns(
+            &fork.reference(quoter, calldata).await,
+        )
+        .unwrap()
+        .amountOut;
+        let ours = pool
+            .quote(&AssetAmount::new(fa, amount), &ta)
+            .map(|a| a.raw);
+        report.sweep_point(&format!("v3 sweep {num}/{den} depth"), ours, theirs, true);
     }
     verify_capabilities(
         &mut report,
@@ -530,13 +621,13 @@ async fn diff_uniswap_v4_eth_usdc() {
     let pool = pools[0].as_ref();
 
     let mut report = Report::default();
-    // (from, to, amount, zeroForOne, wei_exact). ETH is currency0, so ETH->USDC
-    // is zeroForOne = true. Small in-window swaps are WEI-EXACT vs the V4 Quoter.
-    for (from, to, amount, zero_for_one, wei_exact) in [
-        (Address::ZERO, USDC, U256::from(SMALL_WETH), true, true),
-        (Address::ZERO, USDC, U256::from(TENTH_E18), true, false),
-        (Address::ZERO, USDC, U256::from(E18), true, false),
-        (USDC, Address::ZERO, U256::from(K_USDC), false, false),
+    // (from, to, amount, zeroForOne). ETH is currency0, so ETH->USDC is
+    // zeroForOne = true. Every in-window swap is WEI-EXACT vs the V4 Quoter.
+    for (from, to, amount, zero_for_one) in [
+        (Address::ZERO, USDC, U256::from(SMALL_WETH), true),
+        (Address::ZERO, USDC, U256::from(TENTH_E18), true),
+        (Address::ZERO, USDC, U256::from(E18), true),
+        (USDC, Address::ZERO, U256::from(K_USDC), false),
     ] {
         let (from_asset, to_asset) = match from == Address::ZERO {
             true => (eth, usdc),
@@ -564,10 +655,35 @@ async fn diff_uniswap_v4_eth_usdc() {
             .unwrap()
             .amountOut;
         let label = format!("v4 exact-in {from:#x}->{to:#x} {amount}");
-        match wei_exact {
-            true => report.wei(&label, ours, theirs),
-            false => report.ppm(&label, ours, theirs, 200),
-        }
+        report.wei(&label, ours, theirs);
+    }
+    // Liquidity-relative sweep (ETH->USDC) across the window edge: in-window
+    // wei-exact, beyond-window refused.
+    let depth = sweep_depth(pool, eth, usdc, true);
+    for &(num, den) in sweep_fractions(true) {
+        let amount = depth * U256::from(num) / U256::from(den);
+        let params = IV4Quoter::QuoteExactSingleParams {
+            poolKey: IV4Quoter::PoolKey {
+                currency0: Address::ZERO,
+                currency1: USDC,
+                fee: U24::from(fee),
+                tickSpacing: I24::try_from(spacing).unwrap(),
+                hooks: Address::ZERO,
+            },
+            zeroForOne: true,
+            exactAmount: u128::try_from(amount).unwrap(),
+            hookData: alloy::primitives::Bytes::new(),
+        };
+        let calldata = IV4Quoter::quoteExactInputSingleCall { params }.abi_encode();
+        let theirs = IV4Quoter::quoteExactInputSingleCall::abi_decode_returns(
+            &fork.reference(quoter, calldata).await,
+        )
+        .unwrap()
+        .amountOut;
+        let ours = pool
+            .quote(&AssetAmount::new(eth, amount), &usdc)
+            .map(|a| a.raw);
+        report.sweep_point(&format!("v4 sweep {num}/{den} depth"), ours, theirs, true);
     }
     // ETH (currency0) -> USDC exact-out, plus fee/reserve/spot/limits.
     verify_capabilities(
@@ -686,6 +802,31 @@ async fn diff_aerodrome_v2() {
                 theirs,
             );
         }
+        // Liquidity-relative sweep (a->b): reserve pool (volatile or stable),
+        // wei-exact at every size within depth — no window, no refuse regime.
+        let (fa, ta) = (asset(BASE_CHAIN, a), asset(BASE_CHAIN, b));
+        let depth = sweep_depth(pool, fa, ta, false);
+        for &(num, den) in sweep_fractions(false) {
+            let amount = depth * U256::from(num) / U256::from(den);
+            let calldata = IAeroQuote::getAmountOutCall {
+                amountIn: amount,
+                tokenIn: a,
+            }
+            .abi_encode();
+            let theirs = IAeroQuote::getAmountOutCall::abi_decode_returns(
+                &fork.reference(pool_addr, calldata).await,
+            )
+            .unwrap();
+            let ours = pool
+                .quote(&AssetAmount::new(fa, amount), &ta)
+                .map(|x| x.raw);
+            report.sweep_point(
+                &format!("aero {label} sweep {num}/{den} depth"),
+                ours,
+                theirs,
+                false,
+            );
+        }
         verify_capabilities(
             &mut report,
             pool,
@@ -736,11 +877,13 @@ async fn diff_aerodrome_slipstream() {
     let pool = pools[0].as_ref();
 
     let mut report = Report::default();
-    for (from, to, amount, wei_exact) in [
-        (BASE_USDC, BASE_WETH, U256::from(SMALL_USDC), true),
-        (BASE_WETH, BASE_USDC, U256::from(SMALL_WETH), true),
-        (BASE_USDC, BASE_WETH, U256::from(K_USDC), false),
-        (BASE_WETH, BASE_USDC, U256::from(TENTH_E18), false),
+    // Every in-window swap is WEI-EXACT vs the Slipstream Quoter; beyond the
+    // fetched window the pool refuses rather than approximates.
+    for (from, to, amount) in [
+        (BASE_USDC, BASE_WETH, U256::from(SMALL_USDC)),
+        (BASE_WETH, BASE_USDC, U256::from(SMALL_WETH)),
+        (BASE_USDC, BASE_WETH, U256::from(K_USDC)),
+        (BASE_WETH, BASE_USDC, U256::from(TENTH_E18)),
     ] {
         let ours = quote_out(pool, from, to, BASE_CHAIN, amount);
         let params = ISlipstreamQuoter::QuoteExactInputSingleParams {
@@ -756,10 +899,36 @@ async fn diff_aerodrome_slipstream() {
             .unwrap()
             .amountOut;
         let label = format!("slipstream exact-in {from:#x}->{to:#x} {amount}");
-        match wei_exact {
-            true => report.wei(&label, ours, theirs),
-            false => report.ppm(&label, ours, theirs, 200),
-        }
+        report.wei(&label, ours, theirs);
+    }
+    // Liquidity-relative sweep (USDC->WETH) across the window edge: in-window
+    // wei-exact, beyond-window refused.
+    let (fa, ta) = (asset(BASE_CHAIN, BASE_USDC), asset(BASE_CHAIN, BASE_WETH));
+    let depth = sweep_depth(pool, fa, ta, true);
+    for &(num, den) in sweep_fractions(true) {
+        let amount = depth * U256::from(num) / U256::from(den);
+        let params = ISlipstreamQuoter::QuoteExactInputSingleParams {
+            tokenIn: BASE_USDC,
+            tokenOut: BASE_WETH,
+            amountIn: amount,
+            tickSpacing: I24::try_from(spacing).unwrap(),
+            sqrtPriceLimitX96: U160::ZERO,
+        };
+        let calldata = ISlipstreamQuoter::quoteExactInputSingleCall { params }.abi_encode();
+        let theirs = ISlipstreamQuoter::quoteExactInputSingleCall::abi_decode_returns(
+            &fork.reference(quoter, calldata).await,
+        )
+        .unwrap()
+        .amountOut;
+        let ours = pool
+            .quote(&AssetAmount::new(fa, amount), &ta)
+            .map(|a| a.raw);
+        report.sweep_point(
+            &format!("slipstream sweep {num}/{den} depth"),
+            ours,
+            theirs,
+            true,
+        );
     }
     verify_capabilities(
         &mut report,
@@ -861,6 +1030,43 @@ mod curve {
             false => ICurveGetDyUint::get_dyCall::abi_decode_returns(&ret).unwrap(),
         };
         report.wei(case.label, ours, theirs);
+
+        // Liquidity-relative sweep (coin i -> j) vs get_dy: reserve pool, wei-exact
+        // at every size within depth — no window, no refuse regime.
+        let (fa, ta) = (asset(ETH_CHAIN, ci), asset(ETH_CHAIN, cj));
+        let depth = sweep_depth(pools[0].as_ref(), fa, ta, false);
+        for &(num, den) in sweep_fractions(false) {
+            let dx = depth * U256::from(num) / U256::from(den);
+            let calldata = match case.int128_indices {
+                true => ICurveGetDyInt::get_dyCall {
+                    i: case.i as i128,
+                    j: case.j as i128,
+                    dx,
+                }
+                .abi_encode(),
+                false => ICurveGetDyUint::get_dyCall {
+                    i: U256::from(case.i),
+                    j: U256::from(case.j),
+                    dx,
+                }
+                .abi_encode(),
+            };
+            let ret = fork.reference(case.pool, calldata).await;
+            let theirs = match case.int128_indices {
+                true => ICurveGetDyInt::get_dyCall::abi_decode_returns(&ret).unwrap(),
+                false => ICurveGetDyUint::get_dyCall::abi_decode_returns(&ret).unwrap(),
+            };
+            let ours = pools[0]
+                .as_ref()
+                .quote(&AssetAmount::new(fa, dx), &ta)
+                .map(|x| x.raw);
+            report.sweep_point(
+                &format!("{} sweep {num}/{den}", case.label),
+                ours,
+                theirs,
+                false,
+            );
+        }
 
         // exact-out (minimal round-trip), fee, reserve, spot-price — wei-precise.
         let dec_j = case.coins[case.j].1;

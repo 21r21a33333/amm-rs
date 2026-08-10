@@ -59,6 +59,14 @@ impl UniswapV3Pool {
         }
     }
 
+    /// The pool's raw fee tier in pips (millionths): 500, 3000, or 10000.
+    ///
+    /// Unlike [`Introspect::fee_bps`] (which divides by 100 and is lossy), this is
+    /// the exact `uint24` the Uniswap V3 `SwapRouter02` requires in `PoolKey`.
+    pub fn fee_pips(&self) -> u32 {
+        self.fee_pips
+    }
+
     /// The market snapshot handed to the shared engine. V3's fee is the same in
     /// both directions.
     fn state(&self) -> SwapState<'_> {
@@ -173,9 +181,11 @@ impl Limits for UniswapV3Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::primitives::asset::ChainId;
     use crate::primitives::ratio::Ratio;
     use crate::protocols::concentrated::fixtures::{SQRT_1_1, dai, full_range_ticks, usdc, weth};
     use crate::protocols::concentrated::set_tick_bit;
+    use alloy_primitives::B256;
     use std::collections::HashMap;
 
     fn price(base: AssetId, quote: AssetId, n: u64, d: u64) -> Price {
@@ -234,6 +244,7 @@ mod tests {
                 ticks,
                 bitmap,
                 spacing: 60,
+                window: None,
             },
         )
     }
@@ -338,6 +349,7 @@ mod tests {
                 ticks: HashMap::new(),
                 bitmap: HashMap::new(),
                 spacing: 60,
+                window: None,
             },
         );
         assert_eq!(
@@ -375,6 +387,7 @@ mod tests {
                 ticks,
                 bitmap,
                 spacing: 60,
+                window: None,
             },
         );
         let huge = U256::from(1_000_000_000_000_000_000u64); // 1e18 ≫ band capacity (~2.7e15)
@@ -457,5 +470,22 @@ mod tests {
         assert!(maxin.raw > U256::ZERO);
         assert_eq!(maxin.asset, usdc());
         assert_eq!(pool.max_amount_in(&usdc(), &dai()), None);
+    }
+
+    #[test]
+    fn fee_pips_returns_raw_tier() {
+        // 0.30% tier = 3000 pips; fee_bps would collapse this to 30.
+        let a = AssetId::new(ChainId(1), B256::left_padding_from(&[1]));
+        let b = AssetId::new(ChainId(1), B256::left_padding_from(&[2]));
+        let pool = UniswapV3Pool::new(
+            PoolId::new("1:univ3:0x"),
+            [a, b],
+            U256::from(1u64) << 96, // sqrtPriceX96 = 1.0
+            0,
+            0,
+            3000,
+            TickData::from_ticks(60, vec![]),
+        );
+        assert_eq!(pool.fee_pips(), 3000);
     }
 }

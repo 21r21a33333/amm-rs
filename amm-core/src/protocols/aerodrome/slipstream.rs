@@ -68,6 +68,13 @@ impl AerodromeSlipstreamPool {
         }
     }
 
+    /// The pool's tick spacing (`int24`). Slipstream keys its pools by tick
+    /// spacing rather than fee tier, so the router's `SwapRouter` struct carries
+    /// this in the slot Uniswap V3 uses for `fee`.
+    pub fn tick_spacing(&self) -> i32 {
+        self.tick_data.spacing
+    }
+
     /// Resolve `zero_for_one` for a `from -> to` swap, or the not-in-pool error.
     fn direction(&self, from: &AssetId, to: &AssetId) -> Result<bool, QuoteError> {
         two_asset_direction(&self.assets, from, to).ok_or(QuoteError::AssetNotInPool {
@@ -168,7 +175,9 @@ impl Limits for AerodromeSlipstreamPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::primitives::asset::ChainId;
     use crate::protocols::concentrated::fixtures::{SQRT_1_1, full_range_ticks, usdc, weth};
+    use alloy_primitives::B256;
 
     fn full_range_pool() -> AerodromeSlipstreamPool {
         let liq: i128 = 1_000_000_000_000_000_000;
@@ -214,5 +223,21 @@ mod tests {
         let pool = full_range_pool();
         assert_eq!(pool.fee_bps(&usdc(), &weth()), Some(Bps(30))); // 3000 pips
         assert_eq!(pool.reserve(&usdc()), None); // concentrated: no single reserve
+    }
+
+    #[test]
+    fn tick_spacing_exposes_tickdata_spacing() {
+        let a = AssetId::new(ChainId(8453), B256::left_padding_from(&[1]));
+        let b = AssetId::new(ChainId(8453), B256::left_padding_from(&[2]));
+        let pool = AerodromeSlipstreamPool::new(
+            PoolId::new("8453:slipstream:0x"),
+            [a, b],
+            U256::from(1u64) << 96,
+            0,
+            0,
+            400,                               // fee_pips
+            TickData::from_ticks(100, vec![]), // spacing = 100
+        );
+        assert_eq!(pool.tick_spacing(), 100);
     }
 }

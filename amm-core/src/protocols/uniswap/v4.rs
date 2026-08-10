@@ -107,11 +107,18 @@ impl UniswapV4Pool {
     }
 
     /// V4's effective swap fee (pips): the protocol fee is taken first, then the
-    /// LP fee on the remainder — `protocol + lp·(1e6 − protocol)/1e6`, matching
-    /// v4-core. Both inputs are per-direction pip values.
+    /// LP fee on the remainder, matching v4-core's
+    /// `ProtocolFeeLibrary.calculateSwapFee`:
+    ///
+    /// `protocol + lp − ⌊protocol·lp / 1e6⌋`
+    ///
+    /// The cross-term must be *floored* (not the algebraically equal
+    /// `protocol + lp·(1e6 − protocol)/1e6`, which floors a different term and
+    /// yields a fee one pip lower). Both inputs are per-direction pip values;
+    /// `protocol == 0` collapses to the LP fee.
     pub fn combined_fee(lp_fee: u32, protocol_fee: u32) -> u32 {
         let (lp, pf) = (lp_fee as u64, protocol_fee as u64);
-        (pf + lp * (1_000_000 - pf) / 1_000_000) as u32
+        (pf + lp - pf * lp / 1_000_000) as u32
     }
 
     /// The 32-byte V4 pool id (hash of the pool key).
@@ -308,8 +315,13 @@ mod tests {
 
     #[test]
     fn combined_fee_compounds_lp_and_protocol() {
-        // lp 500 + protocol 125 → ~624 pips, per v4-core.
-        assert_eq!(UniswapV4Pool::combined_fee(500, 125), 624);
+        // lp 500 + protocol 125: 125 + 500 − ⌊125·500/1e6⌋ = 625, per v4-core
+        // `calculateSwapFee`. Flooring the other cross-term would give 624.
+        assert_eq!(UniswapV4Pool::combined_fee(500, 125), 625);
+        // A pair whose cross-term forces the rounding boundary (lp 500,
+        // protocol 253): 253 + 500 − ⌊253·500/1e6⌋ = 753, where the other-term
+        // form ⌊500·(1e6−253)/1e6⌋ + 253 = 752.
+        assert_eq!(UniswapV4Pool::combined_fee(500, 253), 753);
         // No protocol fee leaves the LP fee unchanged.
         assert_eq!(UniswapV4Pool::combined_fee(3000, 0), 3000);
     }

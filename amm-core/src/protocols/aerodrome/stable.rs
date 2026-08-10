@@ -154,21 +154,31 @@ impl AerodromeStablePool {
                     e18(),
                 )?;
                 // Gross the post-fee input back up (round up). The two ceilings
-                // bound the unit and fee conversion error, but not the Newton
-                // solver's own residual (`get_y` returns an approximate root), so
-                // add 1 wei to absorb it and keep the round-trip from under-delivering.
+                // bound the unit and fee conversion error, and the +1 absorbs the
+                // Newton solver's own residual (`get_y` returns an approximate
+                // root) — together a guaranteed upper bound, which is then
+                // tightened to the exact minimum against the forward `amount_out`.
+                // The forward quote is wei-exact against the chain, so the result
+                // is minimal and never under-delivers.
                 let fee_factor = BPS_ONE
                     .checked_sub(self.fee_bps)
                     .ok_or(QuoteError::Overflow)?;
                 match fee_factor == 0 {
                     true => Err(QuoteError::Overflow),
-                    false => ceil_div(
-                        net.checked_mul(U256::from(BPS_ONE))
-                            .ok_or(QuoteError::Overflow)?,
-                        U256::from(fee_factor),
-                    )?
-                    .checked_add(U256::from(1u64))
-                    .ok_or(QuoteError::Overflow),
+                    false => {
+                        let candidate = ceil_div(
+                            net.checked_mul(U256::from(BPS_ONE))
+                                .ok_or(QuoteError::Overflow)?,
+                            U256::from(fee_factor),
+                        )?
+                        .checked_add(U256::from(1u64))
+                        .ok_or(QuoteError::Overflow)?;
+                        Ok(crate::protocols::minimal_exact_out_input(
+                            candidate,
+                            amount_out,
+                            |dx| self.amount_out(dx, s).ok(),
+                        ))
+                    }
                 }
             }
         }
@@ -441,6 +451,20 @@ mod tests {
             "exact-out input {} delivered {} < target {want}",
             needed.raw,
             delivered.raw
+        );
+        // ...and be minimal: one wei less must under-fill. This usdc/dai pool is
+        // decimal-mismatched, where the unit conversions most stress minimality.
+        let under = pool
+            .quote(
+                &AssetAmount::new(usdc(), needed.raw - U256::from(1u64)),
+                &dai(),
+            )
+            .unwrap();
+        assert!(
+            under.raw < want,
+            "exact-out input {} is not minimal: one wei less still delivered {} >= target {want}",
+            needed.raw,
+            under.raw
         );
     }
 

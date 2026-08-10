@@ -35,6 +35,9 @@ required-features = ["uniswap-v2"]
 [dev-dependencies]
 proptest = "1"
 rstest = "0.26"
+# Construct `curve_math::Pool` fixtures directly in the property tests (the
+# public `CurvePool::new` takes one). Same git source as the optional dep above.
+curve-math = { git = "https://github.com/sunce86/curve-math", features = ["swap"] }
 
 [lints]
 workspace = true
