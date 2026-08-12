@@ -309,3 +309,116 @@ async fn wei_exact_v4_native_directions() {
         fork.revert(snap);
     }
 }
+
+// ── recipient isolation proof ─────────────────────────────────────────────────
+
+/// V4 distinct-recipient fork proof — exact-in ETH→USDC with `Recipient::To(other)`.
+///
+/// Asserts that when the resolved recipient is an address distinct from the
+/// transaction sender, the output lands in `other` and NOT in `sender`.
+/// This proves the V4 encoder's `TAKE(currency, recipient, OPEN_DELTA)` command
+/// uses the resolved recipient address, not `msg.sender`.
+///
+/// Structure mirrors [`wei_exact_v4_native_directions`]:
+/// 1. Snapshot + fund sender.
+/// 2. Build calldata with `opts` pointing to `other` (0xCD…CD), not `sender`.
+/// 3. Submit; assert `other`'s USDC balance rose by `quote.raw`.
+/// 4. Assert `sender`'s USDC balance did NOT rise.
+/// 5. Revert snapshot.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a forked RPC at $AMM_RPC_FORK_URL"]
+async fn v4_exact_in_delivers_to_distinct_recipient() {
+    let url = match std::env::var("AMM_RPC_FORK_URL") {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let alloy_provider = alloy::providers::ProviderBuilder::new()
+        .connect_http(url.parse().expect("invalid RPC url"));
+
+    let mut fork = support::fork_at(&url, fork_block(), ChainId(1), alloy_provider).await;
+
+    // ── shared constants ─────────────────────────────────────────────────────
+
+    let eth = AssetId::new(ChainId(1), B256::ZERO);
+    let usdc = asset(1, USDC_ADDR);
+    let weth = asset(1, WETH_ADDR);
+
+    // The address that signs and pays; must NOT receive the output.
+    let sender = Address::repeat_byte(0xBE);
+    // The declared output recipient; distinct from sender.
+    let other = Address::repeat_byte(0xCD);
+
+    let mut routers = Routers::default();
+    routers.universal = Some(UR);
+    routers.permit2 = Some(PERMIT2);
+    let cfg = ChainConfig::new(ChainId(1), weth).with_routers(routers);
+
+    // opts point the swap output to `other`, not `sender`.
+    let opts = ExecutionOptions::new(Slippage::from_bps(Bps(50)))
+        .with_recipient(Recipient::To(other))
+        .with_deadline(Deadline::AtTimestamp(u64::MAX / 2));
+
+    let pool = fetch_v4_pool(fork.provider().clone(), fork_block()).await;
+    let exe = as_executable(pool.as_ref()).expect("UniswapV4Pool must be Executable");
+
+    let snap = fork.snapshot();
+
+    let eth_in = U256::from(10_000_000_000_000_000u64); // 0.01 ETH
+    let quoted = pool
+        .quote(&AssetAmount::new(eth, eth_in), &usdc)
+        .expect("pool must quote ETH→USDC");
+
+    let route = Route::new_single_hop(eth, usdc, TradeType::ExactIn);
+    let prepared = exe
+        .build_swap(
+            &cfg,
+            CurrencyAmount {
+                currency: Currency::Native,
+                raw: eth_in,
+            },
+            Currency::Token(usdc),
+            &route,
+            &quoted,
+            &opts,
+        )
+        .expect("build_swap distinct-recipient (ETH→USDC) must succeed");
+
+    // V4 native-in carries no ERC-20 approval.
+    assert!(
+        prepared.approval.is_none(),
+        "native-in swap must carry no ERC-20 approval"
+    );
+
+    // Fund sender with eth_in plus a 1 ETH buffer; gas_price=0 so only tx.value
+    // is deducted.
+    let eth_buffer = U256::from(1_000_000_000_000_000_000u64); // 1 ETH
+    fork.fund_native(sender, eth_in + eth_buffer);
+
+    let sender_before = fork.erc20_balance(USDC_ADDR, sender);
+    let other_before = fork.erc20_balance(USDC_ADDR, other);
+
+    assert!(
+        fork.submit(sender, &prepared.tx),
+        "distinct-recipient (ETH→USDC) swap reverted"
+    );
+
+    let sender_after = fork.erc20_balance(USDC_ADDR, sender);
+    let other_after = fork.erc20_balance(USDC_ADDR, other);
+
+    // Output must reach the declared recipient, not the signer.
+    let other_delta = other_after - other_before;
+    assert_eq!(
+        other_delta, quoted.raw,
+        "distinct recipient: USDC delta {other_delta} must equal quoted {} to the wei",
+        quoted.raw
+    );
+
+    // Sender's USDC balance must be unchanged — no leakage to msg.sender.
+    assert_eq!(
+        sender_after, sender_before,
+        "sender USDC balance must not change when a distinct recipient is set"
+    );
+
+    fork.revert(snap);
+}
