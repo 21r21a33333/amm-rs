@@ -4,8 +4,8 @@
 //! The outer call is `execute(commands, inputs, deadline)` with one `V4_SWAP` entry.
 //! The `V4_SWAP` input is `abi.encode(bytes actions, bytes[] params)` where:
 //!
-//! - **exact-in** actions: `[0x06, 0x0c, 0x0f]` (`SWAP_EXACT_IN_SINGLE`, `SETTLE_ALL`, `TAKE_ALL`)
-//! - **exact-out** actions: `[0x08, 0x0c, 0x0f]` (`SWAP_EXACT_OUT_SINGLE`, `SETTLE_ALL`, `TAKE_ALL`)
+//! - **exact-in** actions: `[0x06, 0x0c, 0x0e]` (`SWAP_EXACT_IN_SINGLE`, `SETTLE_ALL`, `TAKE`)
+//! - **exact-out** actions: `[0x08, 0x0c, 0x0e]` (`SWAP_EXACT_OUT_SINGLE`, `SETTLE_ALL`, `TAKE`)
 //!
 //! Native ETH is supported on pools where `currency0 == address(0)` (V4 native-first-class).
 //! On a **native-in** swap the caller sends `tx.value = amountIn` and no Permit2 approval is
@@ -44,26 +44,22 @@ pub const ACTION_SWAP_EXACT_OUT_SINGLE: u8 = 0x08;
 /// V4 action byte: `SETTLE_ALL` (0x0c) — settle the input currency.
 pub const ACTION_SETTLE_ALL: u8 = 0x0c;
 
-/// V4 action byte: `TAKE_ALL` (0x0f) — take the output currency.
-pub const ACTION_TAKE_ALL: u8 = 0x0f;
+/// V4 action byte: `TAKE` (0x0e) — take `amount` of a currency to a recipient.
+pub const ACTION_TAKE: u8 = 0x0e;
+
+/// V4 amount sentinel: take the full positive delta of the currency.
+const OPEN_DELTA: U256 = U256::ZERO;
 
 /// Packed action sequence for an exact-in single-hop V4 swap.
 ///
-/// `[SWAP_EXACT_IN_SINGLE, SETTLE_ALL, TAKE_ALL]`
-pub const ACTIONS_EXACT_IN: [u8; 3] = [
-    ACTION_SWAP_EXACT_IN_SINGLE,
-    ACTION_SETTLE_ALL,
-    ACTION_TAKE_ALL,
-];
+/// `[SWAP_EXACT_IN_SINGLE, SETTLE_ALL, TAKE]`
+pub const ACTIONS_EXACT_IN: [u8; 3] = [ACTION_SWAP_EXACT_IN_SINGLE, ACTION_SETTLE_ALL, ACTION_TAKE];
 
 /// Packed action sequence for an exact-out single-hop V4 swap.
 ///
-/// `[SWAP_EXACT_OUT_SINGLE, SETTLE_ALL, TAKE_ALL]`
-pub const ACTIONS_EXACT_OUT: [u8; 3] = [
-    ACTION_SWAP_EXACT_OUT_SINGLE,
-    ACTION_SETTLE_ALL,
-    ACTION_TAKE_ALL,
-];
+/// `[SWAP_EXACT_OUT_SINGLE, SETTLE_ALL, TAKE]`
+pub const ACTIONS_EXACT_OUT: [u8; 3] =
+    [ACTION_SWAP_EXACT_OUT_SINGLE, ACTION_SETTLE_ALL, ACTION_TAKE];
 
 // ── Deployed ABI layout (DO NOT add `minHopPriceX36` — that is the v4-periphery
 //    `main` layout that reverts every swap on the deployed router) ────────────
@@ -138,13 +134,10 @@ impl Executable for UniswapV4Pool {
     ///
     /// # Note — recipient delivery
     ///
-    /// V4 output is delivered via `TAKE_ALL` to the Universal Router's `msgSender()`,
-    /// which is the EOA that submits `execute` directly.  Consequently,
-    /// `Recipient::To(other)` where `other != sender` is **not** honored by this
-    /// single-hop encoder — `opts.recipient` is resolved (so `Recipient::Sender`
-    /// returns [`BuildError::UnresolvedRecipient`]) but the resolved address is not
-    /// threaded into the `TAKE_ALL` params.  Cross-recipient delivery is part of the
-    /// deferred `msg.sender`/multicall audit.
+    /// V4 output is delivered via `TAKE(currency, recipient, OPEN_DELTA)` to the
+    /// resolved recipient address.  `OPEN_DELTA` (0) instructs the PoolManager to
+    /// transfer the full positive delta for the currency; the slippage floor is
+    /// enforced by `amountOutMinimum` in the swap action, not by the `TAKE` amount.
     fn build_swap(
         &self,
         ctx: &ChainConfig,
@@ -196,9 +189,14 @@ impl Executable for UniswapV4Pool {
         let p_settle: Bytes =
             <(Address, U256)>::abi_encode_params(&(common::evm_addr(&r.input), amount_in.raw))
                 .into();
-        // TAKE_ALL: take output currency at least minOut (U256).
-        let p_take: Bytes =
-            <(Address, U256)>::abi_encode_params(&(common::evm_addr(&r.output), min.raw)).into();
+        // TAKE: deliver the full output delta to the recipient. The slippage floor is
+        // enforced by the swap action's amountOutMinimum, so no min is needed here.
+        let p_take: Bytes = <(Address, Address, U256)>::abi_encode_params(&(
+            common::evm_addr(&r.output),
+            r.recipient,
+            OPEN_DELTA,
+        ))
+        .into();
         // swap params encoded as a bare struct (no function selector).
         let p_swap: Bytes = swap_params.abi_encode().into();
 
@@ -250,13 +248,10 @@ impl Executable for UniswapV4Pool {
     ///
     /// # Note — recipient delivery
     ///
-    /// V4 output is delivered via `TAKE_ALL` to the Universal Router's `msgSender()`,
-    /// which is the EOA that submits `execute` directly.  Consequently,
-    /// `Recipient::To(other)` where `other != sender` is **not** honored by this
-    /// single-hop encoder — `opts.recipient` is resolved (so `Recipient::Sender`
-    /// returns [`BuildError::UnresolvedRecipient`]) but the resolved address is not
-    /// threaded into the `TAKE_ALL` params.  Cross-recipient delivery is part of the
-    /// deferred `msg.sender`/multicall audit.
+    /// V4 output is delivered via `TAKE(currency, recipient, OPEN_DELTA)` to the
+    /// resolved recipient address.  `OPEN_DELTA` (0) instructs the PoolManager to
+    /// transfer the full positive delta for the currency; the slippage floor is
+    /// enforced by `amountInMaximum` in the swap action, not by the `TAKE` amount.
     fn build_swap_exact_out(
         &self,
         ctx: &ChainConfig,
@@ -305,10 +300,14 @@ impl Executable for UniswapV4Pool {
         // SETTLE_ALL: settle input currency up to max (U256).
         let p_settle: Bytes =
             <(Address, U256)>::abi_encode_params(&(common::evm_addr(&r.input), max.raw)).into();
-        // TAKE_ALL: take exact output amount (U256).
-        let p_take: Bytes =
-            <(Address, U256)>::abi_encode_params(&(common::evm_addr(&r.output), amount_out.raw))
-                .into();
+        // TAKE: deliver the full output delta to the recipient. The slippage floor is
+        // enforced by the swap action's amountInMaximum, so no min is needed here.
+        let p_take: Bytes = <(Address, Address, U256)>::abi_encode_params(&(
+            common::evm_addr(&r.output),
+            r.recipient,
+            OPEN_DELTA,
+        ))
+        .into();
         let p_swap: Bytes = swap_params.abi_encode().into();
 
         let v4_input = build_v4_swap_input(&ACTIONS_EXACT_OUT, vec![p_swap, p_settle, p_take]);
@@ -563,7 +562,7 @@ mod tests {
         assert_eq!(
             actions.as_ref(),
             &ACTIONS_EXACT_IN[..],
-            "actions must be [0x06,0x0c,0x0f]"
+            "actions must be [0x06,0x0c,0x0e]"
         );
         assert_eq!(params.len(), 3, "must have 3 params");
 
@@ -612,19 +611,20 @@ mod tests {
             "settle amount must be amountIn"
         );
 
-        // params[2]: TAKE_ALL (output, minOut as U256).
-        let (take_addr, take_amt) = <(Address, U256)>::abi_decode_params(&params[2])
-            .expect("params[2] must decode as (Address, U256)");
+        // params[2]: TAKE (output, recipient, OPEN_DELTA as U256).
+        let (take_addr, take_to, take_amt) =
+            <(Address, Address, U256)>::abi_decode_params(&params[2])
+                .expect("params[2] must decode as (Address, Address, U256)");
         assert_eq!(
             take_addr,
             crate::execution::protocols::common::evm_addr(&weth()),
-            "take address must be weth"
+            "take currency must be weth"
         );
         assert_eq!(
-            take_amt,
-            U256::from(990u64),
-            "take amount must be minOut=990"
+            take_to, recipient,
+            "take recipient must match opts recipient"
         );
+        assert_eq!(take_amt, U256::ZERO, "take amount must be OPEN_DELTA");
 
         // min_received == 990 of weth.
         assert_eq!(prepared.min_received.raw, U256::from(990u64));
@@ -732,7 +732,7 @@ mod tests {
         assert_eq!(
             actions.as_ref(),
             &ACTIONS_EXACT_OUT[..],
-            "actions must be [0x08,0x0c,0x0f]"
+            "actions must be [0x08,0x0c,0x0e]"
         );
         assert_eq!(params.len(), 3);
 
@@ -763,13 +763,18 @@ mod tests {
             "settle amount must be maxAmountIn=505"
         );
 
-        // params[2]: TAKE_ALL (output, exact output as U256).
-        let (take_addr, take_amt) = <(Address, U256)>::abi_decode_params(&params[2]).unwrap();
+        // params[2]: TAKE (output, recipient, OPEN_DELTA as U256).
+        let (take_addr, take_to, take_amt) =
+            <(Address, Address, U256)>::abi_decode_params(&params[2]).unwrap();
         assert_eq!(
             take_addr,
             crate::execution::protocols::common::evm_addr(&weth())
         );
-        assert_eq!(take_amt, out_raw, "take amount must be amountOut=400");
+        assert_eq!(
+            take_to, recipient,
+            "take recipient must match opts recipient"
+        );
+        assert_eq!(take_amt, U256::ZERO, "take amount must be OPEN_DELTA");
 
         // min_received == exact output in weth.
         assert_eq!(prepared.min_received.raw, out_raw);
@@ -877,14 +882,20 @@ mod tests {
             "SETTLE_ALL amount must be amountIn"
         );
 
-        // params[2]: TAKE_ALL currency == usdc.
-        let (take_addr, _) = <(Address, U256)>::abi_decode_params(&params[2])
-            .expect("params[2] must decode as (Address, U256)");
+        // params[2]: TAKE currency == usdc, recipient == opts recipient, amount == OPEN_DELTA.
+        let (take_addr, take_to, take_amt) =
+            <(Address, Address, U256)>::abi_decode_params(&params[2])
+                .expect("params[2] must decode as (Address, Address, U256)");
         assert_eq!(
             take_addr,
             crate::execution::protocols::common::evm_addr(&usdc()),
-            "TAKE_ALL currency must be usdc"
+            "TAKE currency must be usdc"
         );
+        assert_eq!(
+            take_to, recipient,
+            "TAKE recipient must match opts recipient"
+        );
+        assert_eq!(take_amt, U256::ZERO, "TAKE amount must be OPEN_DELTA");
     }
 
     // ── Native-out: USDC → ETH on a native V4 pool ──────────────────────────
@@ -950,19 +961,15 @@ mod tests {
             "SETTLE_ALL currency must be usdc"
         );
 
-        // TAKE_ALL currency == address(0).
-        let (take_addr, take_amt) = <(Address, U256)>::abi_decode_params(&params[2]).unwrap();
+        // TAKE currency == address(0), recipient == opts recipient, amount == OPEN_DELTA.
+        let (take_addr, take_to, take_amt) =
+            <(Address, Address, U256)>::abi_decode_params(&params[2]).unwrap();
+        assert_eq!(take_addr, Address::ZERO, "TAKE currency must be address(0)");
         assert_eq!(
-            take_addr,
-            Address::ZERO,
-            "TAKE_ALL currency must be address(0)"
+            take_to, recipient,
+            "TAKE recipient must match opts recipient"
         );
-        // min out = floor(1000 * 9950/10000) = 995
-        assert_eq!(
-            take_amt,
-            U256::from(995u64),
-            "TAKE_ALL amount must be minOut"
-        );
+        assert_eq!(take_amt, U256::ZERO, "TAKE amount must be OPEN_DELTA");
     }
 
     // ── Guard: both-native → NativeMismatch ─────────────────────────────────
@@ -1141,19 +1148,75 @@ mod tests {
         assert_eq!(err, BuildError::UnsupportedProtocol);
     }
 
+    // ── TAKE recipient delivery ──────────────────────────────────────────────
+
+    #[test]
+    fn take_delivers_to_the_resolved_recipient() {
+        // Build an ERC-20 exact-in swap on a V4 pool with a recipient that is NOT
+        // the sender; decode the V4_SWAP input and assert the final action is TAKE
+        // with (outputCurrency, recipient, OPEN_DELTA).
+        use super::{ACTION_TAKE, OPEN_DELTA};
+
+        let recipient = Address::repeat_byte(0xCD);
+        let o = opts(recipient, 1_700_000_000, 100);
+        let p = pool();
+        let c = ctx();
+
+        let amount_in = CurrencyAmount {
+            currency: Currency::Token(usdc()),
+            raw: U256::from(500u64),
+        };
+        let quoted_out = AssetAmount::new(weth(), U256::from(1000u64));
+        let route = Route::new_single_hop(usdc(), weth(), TradeType::ExactIn);
+
+        let prepared = p
+            .build_swap(
+                &c,
+                amount_in,
+                Currency::Token(weth()),
+                &route,
+                &quoted_out,
+                &o,
+            )
+            .expect("exact-in with explicit recipient must succeed");
+
+        let (_, inputs, _) = decode_outer(&prepared.tx.data);
+        let (actions, params) = decode_v4_input(&inputs[0]);
+
+        assert_eq!(
+            actions.last(),
+            Some(&ACTION_TAKE),
+            "final action must be TAKE (0x0e)"
+        );
+
+        let (currency, to, amount) =
+            <(Address, Address, U256)>::abi_decode_params(params.last().unwrap())
+                .expect("TAKE params must decode as (Address, Address, U256)");
+        assert_eq!(
+            currency,
+            crate::execution::protocols::common::evm_addr(&weth()),
+            "TAKE currency must be the output asset"
+        );
+        assert_eq!(
+            to, recipient,
+            "TAKE recipient must be the resolved recipient"
+        );
+        assert_eq!(amount, OPEN_DELTA, "TAKE amount must be OPEN_DELTA (0)");
+    }
+
     // ── Action constant values ───────────────────────────────────────────────
 
     #[test]
     fn action_constants_have_expected_values() {
         use super::{
             ACTION_SETTLE_ALL, ACTION_SWAP_EXACT_IN_SINGLE, ACTION_SWAP_EXACT_OUT_SINGLE,
-            ACTION_TAKE_ALL,
+            ACTION_TAKE,
         };
         assert_eq!(ACTION_SWAP_EXACT_IN_SINGLE, 0x06);
         assert_eq!(ACTION_SWAP_EXACT_OUT_SINGLE, 0x08);
         assert_eq!(ACTION_SETTLE_ALL, 0x0c);
-        assert_eq!(ACTION_TAKE_ALL, 0x0f);
-        assert_eq!(ACTIONS_EXACT_IN, [0x06u8, 0x0c, 0x0f]);
-        assert_eq!(ACTIONS_EXACT_OUT, [0x08u8, 0x0c, 0x0f]);
+        assert_eq!(ACTION_TAKE, 0x0e);
+        assert_eq!(ACTIONS_EXACT_IN, [0x06u8, 0x0c, 0x0e]);
+        assert_eq!(ACTIONS_EXACT_OUT, [0x08u8, 0x0c, 0x0e]);
     }
 }
