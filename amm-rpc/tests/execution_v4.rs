@@ -395,11 +395,9 @@ async fn fetch_v4_weth_pool(provider: impl Provider + Clone, block: u64) -> Box<
 ///
 /// Requires `flavor = "multi_thread"` — same reason as the other V4 fork tests.
 ///
-/// ## Controller action required
-///
-/// The pool fixture (`WETH_POOL_C0/C1/FEE/TICK_SPACING`) must be verified against
-/// a live Ethereum mainnet archive node at block 25_724_266 before running.  See
-/// the TODO note above `WETH_POOL_C0`.
+/// The pool fixture (`WETH_POOL_C0/C1/FEE/TICK_SPACING`) is a live USDC/WETH
+/// 0.05% WETH-currency pool, verified live and deep at the pinned block — see the
+/// fixture note above `WETH_POOL_C0`.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a forked RPC at $AMM_RPC_FORK_URL"]
 async fn wei_exact_v4_weth_pool_wrap_directions() {

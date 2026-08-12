@@ -172,10 +172,10 @@ fn build_v4_swap_input(actions: &[u8], params: Vec<Bytes>) -> Bytes {
 
 /// Determine whether the caller's native ETH must be wrapped to WETH before the swap.
 ///
-/// Returns `true` when the user is providing native ETH (or expecting native out,
-/// for the future native-out wrap case), the pool exposes WETH as a currency, and
-/// the pool does NOT have a first-class `address(0)` currency.  In that case the
-/// Universal Router `WRAP_ETH` command must precede `V4_SWAP`.
+/// Returns `true` when the caller provides native ETH (native-in) or expects
+/// native ETH out (native-out), the pool exposes WETH as a currency, and the pool
+/// does NOT have a first-class `address(0)` currency.  In that case the Universal
+/// Router wraps/unwraps ETH around the `V4_SWAP`.
 ///
 /// `weth` is `common::evm_addr(&ctx.weth)`; `c0`/`c1` are the pool's sorted
 /// currency addresses from `build_pool_key`.
@@ -188,9 +188,8 @@ fn is_wrap_case(
 ) -> bool {
     let pool_has_weth = c0 == weth || c1 == weth;
     let pool_has_native = c0 == Address::ZERO || c1 == Address::ZERO;
-    // Wrap is needed when the caller holds native ETH (or native is the output
-    // direction for future native-out), the pool exposes WETH, and there is no
-    // first-class address(0) currency on the pool.
+    // Wrap is needed when native ETH is on either side (in or out), the pool
+    // exposes WETH, and there is no first-class address(0) currency on the pool.
     (amount_in_currency.is_native() || to.is_native()) && pool_has_weth && !pool_has_native
 }
 
