@@ -16,12 +16,21 @@ the same object-safe `Pool` trait, so a router holds Uniswap, Curve, and
 Aerodrome pools in one `Vec<Box<dyn Pool>>` and adds a new AMM by implementing
 the trait in its own crate — no closed enum to fork.
 
-> ⚠️ **Not audited.** `amm-rs` computes swap quotes and builds swap calldata; it
-> does not submit transactions or hold funds — you sign and send. Quotes are
-> best-effort reproductions of on-chain contract math and can diverge from live
-> results (MEV, state changes between block and execution, unsupported edge
-> cases). **Verify against the chain before acting on any quote.** No warranty;
-> use at your own risk.
+> ✅ **Verified to the wei, on-chain.** Every quoter reproduces the deployed
+> contract's own math, and every calldata builder is proven on a mainnet/Base
+> fork to settle to the **exact wei** against the real on-chain balance delta —
+> for the execution layer, with delivery to the resolved recipient and **no funds
+> left in the router**. Four independent test layers back this: golden vectors,
+> property-based invariants, live differential (our quote vs the contract's own
+> quoter at the same block), and execution fork proofs. All six protocol families
+> pass across both directions and exact-in/exact-out.
+>
+> ⚠️ **Scope & safety.** `amm-rs` computes quotes and builds calldata — it never
+> holds funds or submits transactions; you sign and send. It has **not had an
+> independent security audit**, and a quote can still diverge from live execution
+> (MEV, state drift between block and send, unsupported edge cases). **Verify
+> against the chain and review the calldata before you sign.** No warranty; use at
+> your own risk.
 
 ## Installation
 
@@ -125,7 +134,14 @@ the tick data supplied; when fetched via `amm-rpc` they use a bounded tick windo
 (depth configurable per source), and a swap large enough to cross beyond it is
 **refused** rather than extrapolated — so a returned quote is never an
 over-estimate. Every calldata builder is proven to settle on-chain to the wei on
-mainnet/Base forks. See [docs/protocols.md](docs/protocols.md).
+mainnet/Base forks.
+
+The calldata layer also handles the execution details that break naive builders:
+output is delivered to your chosen **recipient** (not silently to the sender),
+**native ETH** is swapped directly on the pools that support it (Curve `use_eth`,
+Uniswap V4 `address(0)`) and **wrapped/unwrapped** around WETH-currency V4 pools
+with no ETH or WETH stranded, and each protocol's Permit2 / ERC-20 approval is
+returned alongside the transaction. See [docs/protocols.md](docs/protocols.md).
 
 ## Core concepts
 
@@ -176,8 +192,11 @@ Four layers:
   liquidity fraction, for every exchange. Gated on an RPC endpoint.
 - **Execution fork proofs** ([`amm-rpc/tests/execution_*.rs`](amm-rpc/tests))
   — build the calldata, run it against a mainnet/Base fork, and assert the
-  settled on-chain balance delta equals the quote to the wei. Gated on an RPC
-  endpoint.
+  settled on-chain balance delta equals the quote to the wei, delivered to a
+  distinct recipient, with no ETH/WETH left in the router. Covers every family
+  in both directions and exact-in/exact-out, including native-ETH and the V4
+  WETH-wrap paths. Gated on an RPC endpoint (`$AMM_RPC_FORK_URL` /
+  `$AMM_RPC_BASE_FORK_URL`).
 
 ## Examples
 
