@@ -5,11 +5,11 @@
 //! Uniswap's Universal Router (selector `0x3593564c`).
 //!
 //! The constants below are the full canonical Universal Router command set.
-//! `WRAP_ETH`, `UNWRAP_WETH`, `SWEEP`, and `PERMIT2_PERMIT` are forward-looking:
-//! they are not emitted by the current single-hop encoders (only `V4_SWAP` is used
-//! today — V4 native paths use `TAKE_ALL` on first-class `address(0)` rather than
-//! wrap/unwrap/sweep), but will be used by future multi-command routes (in-stream
-//! Permit2 permits, and WETH-pool wrap/unwrap/sweep cases).
+//! `WRAP_ETH` and `UNWRAP_WETH` are emitted by the V4 encoder for WETH-currency
+//! pools swapped with native ETH (wrap the input / unwrap the output). `SWEEP`
+//! and `PERMIT2_PERMIT` are forward-looking — not emitted today, reserved for
+//! future multi-command routes (in-stream Permit2 permits, post-unwrap dust
+//! sweeps).
 
 use alloy::primitives::{Bytes, U256};
 use alloy::{sol, sol_types::SolCall};
@@ -19,14 +19,14 @@ pub const V4_SWAP: u8 = 0x10;
 
 /// Universal Router command byte: wrap native ETH into WETH.
 ///
-/// Forward-looking — not emitted by the current single-hop encoders; reserved for
-/// future multi-command routes that target WETH pools.
+/// Emitted by the V4 encoder for a WETH-currency pool swapped with native ETH
+/// input — the router wraps the caller's ETH before the swap settles WETH.
 pub const WRAP_ETH: u8 = 0x0b;
 
 /// Universal Router command byte: unwrap WETH back to native ETH.
 ///
-/// Forward-looking — not emitted by the current single-hop encoders; reserved for
-/// future multi-command routes that target WETH pools.
+/// Emitted by the V4 encoder for a WETH-currency pool with native-ETH output
+/// (unwrap the taken WETH) and to return any exact-out wrap remainder as ETH.
 pub const UNWRAP_WETH: u8 = 0x0c;
 
 /// Universal Router command byte: process a Permit2 `permit` approval.
