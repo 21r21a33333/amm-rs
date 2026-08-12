@@ -92,6 +92,8 @@ const USDC_SLOT: u64 = 9;
 const USDT_SLOT: u64 = 2;
 /// WETH `balanceOf` storage slot.
 const WETH_SLOT: u64 = 3;
+/// WBTC `balanceOf` storage slot.
+const WBTC_SLOT: u64 = 0;
 
 /// Pinned mainnet block. Override with `AMM_FORK_BLOCK` to run against a
 /// recent block on a non-archive RPC.
@@ -660,6 +662,198 @@ async fn wei_exact_stable_ng_usdc_to_crvusd() {
         assert!(
             delta <= quoted.raw && quoted.raw - delta <= U256::from(1u64),
             "USDC→crvUSD: on-chain crvUSD delta {delta} must be within 1 wei of (and <=) quoted {}",
+            quoted.raw
+        );
+
+        fork.revert(snap);
+    }
+}
+
+// ── proof: CryptoU256UseEth — tricrypto2 native ETH in + out ─────────────────
+
+/// Wei-exact tricrypto2 execution proof — native ETH as the input and output
+/// currency, exercising the `use_eth` payable path of the `CryptoU256UseEth`
+/// encoder for both directions.
+///
+/// Two directions, each snapshot/reverted independently:
+///
+/// **ETH-in (ETH → WBTC):** `Currency::Native` as input carries `tx.value = dx`
+/// and no ERC-20 approval.  The pool receives ETH directly (use_eth=true) and
+/// delivers WBTC.
+///
+/// **ETH-out (WBTC → ETH):** Token input (WBTC) with `Currency::Native` as
+/// output.  `tx.value = 0`, normal ERC-20 approval for the pool.  The pool
+/// unwraps WETH and sends native ETH to the sender.  `gas_price=0` (harness)
+/// means the ETH delta is the pure swap output with no gas deduction.
+///
+/// Both directions are asserted wei-exact: tricrypto2's deployed CryptoSwap
+/// solver matches the curve-math quote to the wei (observed shortfall 0 at
+/// block 20_000_000).
+///
+/// Requires `flavor = "multi_thread"` for `foundry_fork_db::SharedBackend`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a forked RPC at $AMM_RPC_FORK_URL"]
+async fn wei_exact_curve_tricrypto2_native_eth() {
+    let url = match std::env::var("AMM_RPC_FORK_URL") {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let alloy_provider = alloy::providers::ProviderBuilder::new()
+        .connect_http(url.parse().expect("invalid RPC url"));
+
+    let mut fork = support::fork_at(&url, fork_block(), ChainId(1), alloy_provider.clone()).await;
+
+    assert_eq!(
+        fork.block_number(),
+        fork_block(),
+        "fork must be pinned to fork_block()"
+    );
+
+    // ── shared constants ─────────────────────────────────────────────────────
+
+    let wbtc = asset(1, WBTC_ADDR);
+    let weth_asset = asset(1, WETH_ADDR);
+
+    let sender = Address::repeat_byte(0xE1);
+
+    let cfg = ChainConfig::new(ChainId(1), weth_asset);
+    let opts = exec_opts(sender);
+
+    // Fetch tricrypto2 once; both directions read from the same pinned state.
+    let pool = fetch_tricrypto2(fork.provider()).await;
+    let exe =
+        as_executable(pool.as_ref()).expect("CurvePool (CryptoU256UseEth) must be Executable");
+
+    // ── Direction 1: native-in (ETH → WBTC, i=2, j=1) ───────────────────────
+    //
+    // Currency::Native as input → use_eth=true, tx.value = dx, no approval.
+    // The pool receives ETH and delivers WBTC to the sender.
+    {
+        let snap = fork.snapshot();
+
+        // 0.5 ETH (18 dec) — a modest in-window size for tricrypto2.
+        let eth_in = U256::from(500_000_000_000_000_000u64); // 0.5 ETH
+        let quoted = pool
+            .quote(&AssetAmount::new(weth_asset, eth_in), &wbtc)
+            .expect("pool must quote ETH→WBTC (via WETH slot)");
+
+        let route = Route::new_single_hop(weth_asset, wbtc, TradeType::ExactIn);
+        let prepared = exe
+            .build_swap(
+                &cfg,
+                CurrencyAmount {
+                    currency: Currency::Native,
+                    raw: eth_in,
+                },
+                Currency::Token(wbtc),
+                &route,
+                &quoted,
+                &opts,
+            )
+            .expect("build_swap ETH-in (CryptoU256UseEth) must succeed");
+
+        // Native-in: no ERC-20 approval (pool receives ETH via msg.value).
+        assert!(
+            prepared.approval.is_none(),
+            "ETH-in swap must carry no ERC-20 approval"
+        );
+
+        // tx.value must equal the input amount for native-in.
+        assert_eq!(prepared.tx.value, eth_in, "ETH-in: tx.value must equal dx");
+
+        // Fund sender with eth_in + 1 ETH buffer. gas_price=0 but tx.value
+        // is deducted from the sender's balance by the EVM.
+        let eth_buffer = U256::from(1_000_000_000_000_000_000u64); // 1 ETH
+        fork.fund_native(sender, eth_in + eth_buffer);
+
+        let wbtc_before = fork.erc20_balance(WBTC_ADDR, sender);
+        assert!(
+            fork.submit(sender, &prepared.tx),
+            "ETH-in (ETH→WBTC) exchange on tricrypto2 reverted"
+        );
+        let wbtc_after = fork.erc20_balance(WBTC_ADDR, sender);
+        let delta = wbtc_after - wbtc_before;
+
+        // tricrypto2's deployed CryptoSwap solver matches the curve-math quote
+        // to the wei (observed shortfall 0), so assert wei-exact.
+        assert_eq!(
+            delta, quoted.raw,
+            "ETH-in: on-chain WBTC delta {delta} must equal the quoted output {}",
+            quoted.raw
+        );
+
+        fork.revert(snap);
+    }
+
+    // ── Direction 2: native-out (WBTC → ETH, i=1, j=2) ─────────────────────
+    //
+    // Token input (WBTC) with Currency::Native as output. use_eth=true so the
+    // pool unwraps WETH and delivers native ETH to the sender. tx.value=0.
+    // gas_price=0 (harness enforce) → the ETH delta is pure swap output.
+    {
+        let snap = fork.snapshot();
+
+        // 0.01 WBTC (8 dec) — a modest amount well within the pool's reserves.
+        let wbtc_in = U256::from(1_000_000u64); // 0.01 WBTC
+        let quoted = pool
+            .quote(&AssetAmount::new(wbtc, wbtc_in), &weth_asset)
+            .expect("pool must quote WBTC→ETH (via WETH slot)");
+
+        let route = Route::new_single_hop(wbtc, weth_asset, TradeType::ExactIn);
+        let prepared = exe
+            .build_swap(
+                &cfg,
+                CurrencyAmount {
+                    currency: Currency::Token(wbtc),
+                    raw: wbtc_in,
+                },
+                Currency::Native,
+                &route,
+                &quoted,
+                &opts,
+            )
+            .expect("build_swap ETH-out (CryptoU256UseEth) must succeed");
+
+        // Token input → tx.value must be 0.
+        assert_eq!(
+            prepared.tx.value,
+            U256::ZERO,
+            "ETH-out: tx.value must be 0 (pool pulls WBTC via transferFrom)"
+        );
+
+        // Fund WBTC (2× the swap amount) via slot 0. Fail-fast readback verifies
+        // the slot number is correct for WBTC on mainnet.
+        fork.fund_erc20(sender, WBTC_ADDR, WBTC_SLOT, wbtc_in * U256::from(2u64));
+        let readback = fork.erc20_balance(WBTC_ADDR, sender);
+        assert!(
+            readback >= wbtc_in,
+            "WBTC slot 0 injection failed: readback {readback} < {wbtc_in}; wrong slot?"
+        );
+
+        // Apply the pool approval: the pool (tricrypto2) pulls WBTC via transferFrom.
+        if let Some(req) = &prepared.approval {
+            let token_addr = Address::from_word(req.token.token);
+            fork.approve(sender, token_addr, req.spender, req.min_allowance);
+        }
+
+        // Give sender a small native ETH seed so the EVM's balance check on
+        // msg.sender passes (tx.value is 0, but revm asserts sender.balance >= value).
+        fork.fund_native(sender, U256::from(1_000_000_000_000_000_000u64)); // 1 ETH
+
+        let eth_before = fork.native_balance(sender);
+        assert!(
+            fork.submit(sender, &prepared.tx),
+            "ETH-out (WBTC→ETH) exchange on tricrypto2 reverted"
+        );
+        let eth_after = fork.native_balance(sender);
+
+        // gas_price=0 → ETH delta equals the raw swap output with no gas deduction.
+        // Wei-exact: tricrypto2's on-chain solver matches the curve-math quote.
+        let delta = eth_after - eth_before;
+        assert_eq!(
+            delta, quoted.raw,
+            "ETH-out: on-chain ETH delta {delta} must equal the quoted output {}",
             quoted.raw
         );
 
