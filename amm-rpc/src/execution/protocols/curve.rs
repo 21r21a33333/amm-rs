@@ -24,6 +24,18 @@
 //! - **native ETH / `use_eth = true`** (the payable crypto-pool path) — the
 //!   encoder trades wrapped WETH as an ERC-20 (`use_eth = false`); the top-level
 //!   native guard rejects `Currency::Native` on either side.
+//!
+//! **Recipient delivery contract:**
+//! - `CryptoU256Receiver` (`exchange(…, address receiver)`) delivers the output
+//!   to `r.recipient`; this is the only Curve ABI with a recipient argument.
+//! - `StableI128`, `StableI128Ng`, and `CryptoU256UseEth` have no `receiver`
+//!   parameter and always pay `msg.sender`. `Recipient::Sender` is collapsed to
+//!   `Recipient::To(sender)` by `options::resolve` at the router edge before any
+//!   encoder runs, so the builder always receives a concrete address; on these
+//!   receiver-less ABIs that address can only be honored when it equals the
+//!   transaction sender — which the builder cannot verify. Callers must avoid
+//!   routing to a receiver-less pool when the intended recipient differs from the
+//!   transaction sender.
 
 #[cfg(feature = "curve")]
 use alloy::primitives::U256;
@@ -939,6 +951,47 @@ mod tests {
         assert_eq!(approval.spender, CRYPTO_RECV_POOL_ADDR);
         assert_eq!(approval.token, weth());
         assert_eq!(approval.min_allowance, amount_in_raw);
+    }
+
+    // ── CryptoU256Receiver passes the resolved recipient (0xCD…) ─────────────
+
+    /// `CryptoU256Receiver` must forward `r.recipient` as the `receiver` field.
+    ///
+    /// Decodes the produced `exchange(uint256,uint256,uint256,uint256,address)`
+    /// calldata and asserts the decoded `receiver` equals the configured
+    /// `Recipient::To(0xCD…)`.
+    #[test]
+    fn twocrypto_ng_passes_the_receiver() {
+        let pool = crypto_receiver_pool();
+        let c = ctx();
+        let recipient = Address::repeat_byte(0xCD);
+        let opts = opts_resolved(recipient, 9_999_999, 50);
+
+        let amount_in_raw = U256::from(100_000_000_000_000_000u64); // 0.1 WETH
+        let quoted_out = AssetAmount::new(tc_ng_token(), U256::from(1_000_000_000_000_000_000u64));
+        let route = Route::new_single_hop(weth(), tc_ng_token(), TradeType::ExactIn);
+
+        let prepared = pool
+            .build_swap(
+                &c,
+                CurrencyAmount {
+                    currency: Currency::Token(weth()),
+                    raw: amount_in_raw,
+                },
+                Currency::Token(tc_ng_token()),
+                &route,
+                &quoted_out,
+                &opts,
+            )
+            .expect("CryptoU256Receiver build_swap must succeed");
+
+        let decoded = ICurveCryptoReceiver::exchangeCall::abi_decode(&prepared.tx.data)
+            .expect("calldata must decode as exchange(uint256,uint256,uint256,uint256,address)");
+
+        assert_eq!(
+            decoded.receiver, recipient,
+            "receiver field must equal the resolved recipient (0xCD…)"
+        );
     }
 
     // ── as_executable dispatch ────────────────────────────────────────────────
