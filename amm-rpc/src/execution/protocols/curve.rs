@@ -16,14 +16,20 @@
 //! **Variant coverage (E4.5 — no silent caps).** The Phase-0 `interface_of` map
 //! routes all twelve `curve_adapter::CurveVariant`s onto exactly these four
 //! `CurveInterface` families, all of which are now implemented — so every Curve
-//! variant can encode a direct coin-to-coin `exchange`. Two capabilities are
-//! deliberately **deferred** and return [`BuildError::UnsupportedProtocol`]:
+//! variant can encode a direct coin-to-coin `exchange`. One capability is
+//! deliberately **deferred** and returns [`BuildError::UnsupportedProtocol`]:
 //! - **`exchange_underlying`** (meta / lending pools trading a base-pool
 //!   underlying coin) — a different method with its own index space; plain
 //!   `exchange` covers the coin-level swaps that carry the volume.
-//! - **native ETH / `use_eth = true`** (the payable crypto-pool path) — the
-//!   encoder trades wrapped WETH as an ERC-20 (`use_eth = false`); the top-level
-//!   native guard rejects `Currency::Native` on either side.
+//!
+//! **Native ETH (`use_eth`) support.** `CryptoU256UseEth` pools (tricrypto2-style)
+//! accept native ETH on either side via the payable `use_eth` flag. When
+//! `Currency::Native` appears on either side, `common::resolve_swap` maps it to
+//! `ctx.weth` and sets `r.native_in` / `r.native_out`; the encoder then sets
+//! `use_eth = true`, sends value = `amount_in.raw` for native-in, and skips the
+//! ERC-20 approval for native-in (no token to approve — ETH is sent as tx.value).
+//! All other interfaces (`StableI128`, `StableI128Ng`, `CryptoU256Receiver`, `None`)
+//! still reject `Currency::Native` with [`BuildError::UnsupportedProtocol`].
 //!
 //! **Recipient delivery contract:**
 //! - `CryptoU256Receiver` (`exchange(…, address receiver)`) delivers the output
@@ -75,11 +81,11 @@ sol! {
 
     /// Curve CryptoSwap `exchange` — tricrypto / two-crypto V1 ABI.
     ///
-    /// Selector `0x394747c5`. The `use_eth` flag controls whether to
-    /// unwrap ETH on the way in/out; we always pass `false` (trade WETH
-    /// as an ERC-20). Native paths are deferred; the native guard in
-    /// `build_swap` already rejects `Currency::Native` before we reach here.
-    /// Indices are `uint256` (not `int128`).
+    /// Selector `0x394747c5`. The `use_eth` flag controls whether to unwrap
+    /// ETH on the way in/out. When `Currency::Native` is present, the encoder
+    /// sets `use_eth = true`; for pure ERC-20 swaps it is `false`. For native-in
+    /// the call is payable and tx.value carries the ETH amount; for native-out
+    /// or pure ERC-20 the call is not payable. Indices are `uint256` (not `int128`).
     interface ICurveCryptoUseEth {
         function exchange(uint256 i, uint256 j, uint256 dx, uint256 min_dy, bool use_eth) external payable;
     }
@@ -115,8 +121,9 @@ impl Executable for CurvePool {
     /// # Errors
     ///
     /// - [`BuildError::UnsupportedProtocol`] — `opts.price_limit` is `Some`
-    ///   (Curve has no price bound), either currency is native (native/use_eth
-    ///   paths are deferred), the pool has no registered interface, or the
+    ///   (Curve has no price bound), `Currency::Native` appears on either side
+    ///   for any interface other than `CryptoU256UseEth` (which supports native
+    ///   ETH via `use_eth`), the pool has no registered interface, or the
     ///   interface is not yet implemented.
     /// - [`BuildError::AssetNotInPool`] — coins not found in this pool.
     /// - [`BuildError::Overflow`] — coin index exceeds `i128::MAX` (defensive;
@@ -137,12 +144,19 @@ impl Executable for CurvePool {
             return Err(BuildError::UnsupportedProtocol);
         }
 
-        // Native ETH paths (use_eth) are deferred to a later task.
-        if amount_in.currency.is_native() || to.is_native() {
+        // Only CryptoU256UseEth supports native ETH via the payable `use_eth`
+        // flag. Every other interface — StableI128, StableI128Ng,
+        // CryptoU256Receiver, and the no-metadata None case — does not accept
+        // native currency; reject early so callers get a clear error rather than
+        // a silent coin-lookup failure.
+        let is_use_eth_iface = self.interface() == Some(CurveInterface::CryptoU256UseEth);
+        if (amount_in.currency.is_native() || to.is_native()) && !is_use_eth_iface {
             return Err(BuildError::UnsupportedProtocol);
         }
 
         // resolve_swap validates trade type, membership, recipient, deadline.
+        // For native-in/out it maps Currency::Native → ctx.weth and sets
+        // r.native_in / r.native_out. coin_indices then finds the WETH slot.
         // Curve's classic `exchange` ignores recipient and deadline at the ABI
         // level, but we still enforce they are resolved (prevents callers from
         // omitting resolution accidentally).
@@ -189,14 +203,16 @@ impl Executable for CurvePool {
                 call.abi_encode()
             }
             Some(CurveInterface::CryptoU256UseEth) => {
-                // Indices are `uint256` in this ABI family. `use_eth = false`:
-                // trade WETH as an ERC-20; native unwrapping is deferred.
+                // use_eth=true enables the pool's native-ETH path on either
+                // side: native-in → the call is payable and the pool wraps the
+                // received ETH; native-out → the pool unwraps WETH before
+                // delivering. For pure ERC-20 swaps, use_eth stays false.
                 let call = ICurveCryptoUseEth::exchangeCall {
                     i: U256::from(i),
                     j: U256::from(j),
                     dx: amount_in.raw,
                     min_dy: min.raw,
-                    use_eth: false,
+                    use_eth: r.native_in || r.native_out,
                 };
                 call.abi_encode()
             }
@@ -218,16 +234,27 @@ impl Executable for CurvePool {
             _ => return Err(BuildError::UnsupportedProtocol),
         };
 
-        // Shared epilogue: tx.to = pool, value = 0, approve the pool (Curve
-        // pulls the input token via `transferFrom`, not a router).
+        // Shared epilogue: tx.to = pool. `value` and `approval` are two facets
+        // of the same input-side decision, so they resolve together:
+        // - native ETH in → the payable call carries `dx` in tx.value, nothing
+        //   to approve;
+        // - token in (including native-out, whose input is an ERC-20) → zero
+        //   value, and the pool pulls `dx` via transferFrom under an approval.
+        let (value, approval) = match r.native_in {
+            true => (amount_in.raw, None),
+            false => (
+                U256::ZERO,
+                Some(common::erc20_approval(pool_addr, r.input, amount_in.raw)),
+            ),
+        };
         Ok(common::prepared(
             ctx,
             pool_addr,
             data.into(),
-            U256::ZERO,
+            value,
             min,
             None,
-            Some(common::erc20_approval(pool_addr, r.input, amount_in.raw)),
+            approval,
         ))
     }
 
@@ -992,6 +1019,173 @@ mod tests {
             decoded.receiver, recipient,
             "receiver field must equal the resolved recipient (0xCD…)"
         );
+    }
+
+    // ── CryptoU256UseEth: native-in sets value, use_eth, skips approval ─────
+
+    /// ETH-in on a `CryptoU256UseEth` pool must set `use_eth=true`, carry
+    /// `amount_in.raw` as `tx.value`, and omit the ERC-20 approval (ETH is
+    /// sent as value, not pulled via transferFrom).
+    ///
+    /// Pool coins: USDT(0), WBTC(1), WETH(2). Input: ETH (→ WETH index 2).
+    /// Output: WBTC (index 1). `ctx.weth == weth()` so resolve_swap maps
+    /// Currency::Native → weth(), coin_indices finds index 2.
+    #[test]
+    fn eth_in_sets_value_and_use_eth_and_skips_approval() {
+        let pool = crypto_3pool();
+        let c = ctx(); // ctx.weth == weth() == pool coin index 2
+        let recipient = Address::repeat_byte(0xAA);
+        let opts = opts_resolved(recipient, 9_999_999, 50);
+
+        let dx = U256::from(1_000_000_000_000_000_000u64); // 1 ETH
+        let quoted_out = AssetAmount::new(wbtc(), U256::from(5_000_000u64)); // synthetic
+        // Route uses weth() as the canonical from-asset (what resolve_swap sees
+        // after mapping Native→weth()); the route from/to assets must be members.
+        let route = Route::new_single_hop(weth(), wbtc(), TradeType::ExactIn);
+
+        let prepared = pool
+            .build_swap(
+                &c,
+                CurrencyAmount {
+                    currency: Currency::Native,
+                    raw: dx,
+                },
+                Currency::Token(wbtc()),
+                &route,
+                &quoted_out,
+                &opts,
+            )
+            .expect("ETH-in CryptoU256UseEth must succeed");
+
+        // tx.value must carry the ETH amount.
+        assert_eq!(
+            prepared.tx.value, dx,
+            "tx.value must equal amount_in.raw for native-in"
+        );
+
+        // Calldata: use_eth=true, i=2 (WETH), j=1 (WBTC).
+        let decoded = ICurveCryptoUseEth::exchangeCall::abi_decode(&prepared.tx.data)
+            .expect("calldata must decode as CryptoUseEth exchange");
+        assert!(decoded.use_eth, "use_eth must be true for native-in");
+        assert_eq!(decoded.i, U256::from(2u64), "i must be 2 (WETH/ETH index)");
+        assert_eq!(decoded.j, U256::from(1u64), "j must be 1 (WBTC index)");
+        assert_eq!(decoded.dx, dx, "dx must equal amount_in.raw");
+
+        // No ERC-20 approval — ETH is sent as value, not pulled via transferFrom.
+        assert!(
+            prepared.approval.is_none(),
+            "approval must be None for native-in"
+        );
+    }
+
+    // ── CryptoU256UseEth: native-out sets use_eth, keeps value=0 + approval ──
+
+    /// ETH-out on a `CryptoU256UseEth` pool must set `use_eth=true`, keep
+    /// `tx.value=0` (input is an ERC-20 token), and include an ERC-20 approval
+    /// for the input token.
+    ///
+    /// Input: WBTC (index 1, ERC-20). Output: ETH (→ WETH index 2 after
+    /// resolve). Pool must unwrap the WETH output before delivery; caller sends
+    /// no ETH (value=0) but must approve the pool to pull WBTC.
+    #[test]
+    fn eth_out_uses_zero_value_and_approves_input() {
+        let pool = crypto_3pool();
+        let c = ctx();
+        let recipient = Address::repeat_byte(0xBB);
+        let opts = opts_resolved(recipient, 9_999_999, 50);
+
+        let dx = U256::from(5_000_000u64); // 0.05 WBTC (8 dec)
+        let quoted_out = AssetAmount::new(weth(), U256::from(1_000_000_000_000_000_000u64));
+        let route = Route::new_single_hop(wbtc(), weth(), TradeType::ExactIn);
+
+        let prepared = pool
+            .build_swap(
+                &c,
+                CurrencyAmount {
+                    currency: Currency::Token(wbtc()),
+                    raw: dx,
+                },
+                Currency::Native,
+                &route,
+                &quoted_out,
+                &opts,
+            )
+            .expect("ETH-out CryptoU256UseEth must succeed");
+
+        // Not payable — input is ERC-20, ETH goes out, not in.
+        assert_eq!(
+            prepared.tx.value,
+            U256::ZERO,
+            "tx.value must be 0 for native-out"
+        );
+
+        // Calldata: use_eth=true, i=1 (WBTC), j=2 (WETH).
+        let decoded = ICurveCryptoUseEth::exchangeCall::abi_decode(&prepared.tx.data)
+            .expect("calldata must decode as CryptoUseEth exchange");
+        assert!(decoded.use_eth, "use_eth must be true for native-out");
+        assert_eq!(decoded.i, U256::from(1u64), "i must be 1 (WBTC index)");
+        assert_eq!(decoded.j, U256::from(2u64), "j must be 2 (WETH/ETH index)");
+        assert_eq!(decoded.dx, dx, "dx must equal amount_in.raw");
+
+        // ERC-20 approval for the input token (WBTC) — pool pulls via transferFrom.
+        let approval = prepared
+            .approval
+            .expect("approval must be Some for ERC-20 input");
+        assert_eq!(
+            approval.spender, CRYPTO_POOL_ADDR,
+            "spender must be the pool"
+        );
+        assert_eq!(
+            approval.token,
+            wbtc(),
+            "approval must target the input token"
+        );
+        assert_eq!(approval.min_allowance, dx, "min_allowance must equal dx");
+    }
+
+    // ── Non-use-eth interfaces reject native currency ─────────────────────────
+
+    /// `StableI128` does not accept native ETH on either side. Passing
+    /// `Currency::Native` as input must return `UnsupportedProtocol` immediately
+    /// (before any coin-lookup), regardless of whether the pool's coins include
+    /// the WETH asset.
+    #[test]
+    fn non_use_eth_interface_rejects_native() {
+        let pool = stable_3pool(); // StableI128, coins: DAI/USDC/USDT
+        let c = ctx();
+        let opts = opts_resolved(Address::repeat_byte(0x55), 9_999_999, 50);
+
+        // Native input → StableI128 must reject.
+        let err_in = pool
+            .build_swap(
+                &c,
+                CurrencyAmount {
+                    currency: Currency::Native,
+                    raw: U256::from(1_000u64),
+                },
+                Currency::Token(usdc()),
+                &Route::new_single_hop(weth(), usdc(), TradeType::ExactIn),
+                &AssetAmount::new(usdc(), U256::from(1_000u64)),
+                &opts,
+            )
+            .expect_err("StableI128 + native-in must return UnsupportedProtocol");
+        assert_eq!(err_in, BuildError::UnsupportedProtocol);
+
+        // Native output → StableI128 must reject.
+        let err_out = pool
+            .build_swap(
+                &c,
+                CurrencyAmount {
+                    currency: Currency::Token(dai()),
+                    raw: U256::from(1_000u64),
+                },
+                Currency::Native,
+                &Route::new_single_hop(dai(), weth(), TradeType::ExactIn),
+                &AssetAmount::new(weth(), U256::from(1_000u64)),
+                &opts,
+            )
+            .expect_err("StableI128 + native-out must return UnsupportedProtocol");
+        assert_eq!(err_out, BuildError::UnsupportedProtocol);
     }
 
     // ── as_executable dispatch ────────────────────────────────────────────────
