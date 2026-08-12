@@ -1,23 +1,50 @@
 //! Uniswap V4 swap encoder: exact-in and exact-out → [`PreparedSwap`].
 //!
 //! Encodes single-hop V4 swaps via the Universal Router `V4_SWAP` (0x10) command.
-//! The outer call is `execute(commands, inputs, deadline)` with one `V4_SWAP` entry.
+//! The outer call is `execute(commands, inputs, deadline)` with one or more entries.
 //! The `V4_SWAP` input is `abi.encode(bytes actions, bytes[] params)` where:
 //!
-//! - **exact-in** actions: `[0x06, 0x0c, 0x0f]` (`SWAP_EXACT_IN_SINGLE`, `SETTLE_ALL`, `TAKE_ALL`)
-//! - **exact-out** actions: `[0x08, 0x0c, 0x0f]` (`SWAP_EXACT_OUT_SINGLE`, `SETTLE_ALL`, `TAKE_ALL`)
+//! - **exact-in** actions: `[0x06, 0x0c, 0x0e]` (`SWAP_EXACT_IN_SINGLE`, `SETTLE_ALL`, `TAKE`)
+//! - **exact-out** actions: `[0x08, 0x0c, 0x0e]` (`SWAP_EXACT_OUT_SINGLE`, `SETTLE_ALL`, `TAKE`)
+//!
+//! ## WETH-wrap case (native-in, WETH-currency pool)
+//!
+//! When the pool exposes WETH as a currency (not `address(0)`) but the caller
+//! holds native ETH, the router wraps ETH to WETH before the swap:
+//!
+//! - **exact-in** commands: `[WRAP_ETH, V4_SWAP]`
+//!   - actions inside V4_SWAP: `[SWAP_EXACT_IN_SINGLE, SETTLE, TAKE]`
+//!   - `SETTLE` (0x0b) settles from the router's post-wrap WETH balance (`payerIsUser = false`)
+//! - **exact-out** commands: `[WRAP_ETH, V4_SWAP, UNWRAP_WETH]`
+//!   - same SETTLE pattern; `UNWRAP_WETH` returns leftover WETH to recipient as ETH
+//!
+//! ## WETH-unwrap case (native-out, WETH-currency pool)
+//!
+//! When the pool exposes WETH and the caller wants native ETH out (token → ETH),
+//! the router receives WETH from the pool and unwraps it to ETH:
+//!
+//! - **exact-in** commands: `[V4_SWAP, UNWRAP_WETH]`
+//!   - actions inside V4_SWAP: `[SWAP_EXACT_IN_SINGLE, SETTLE_ALL, TAKE]`
+//!   - `TAKE` delivers WETH to the router (`ADDRESS_THIS`); `UNWRAP_WETH` pays
+//!     the recipient with the slippage floor as minimum ETH out
+//! - **exact-out** commands: `[V4_SWAP, UNWRAP_WETH]`
+//!   - `SETTLE_ALL` pulls the token input from the user via Permit2;
+//!     `UNWRAP_WETH` uses the exact output amount as the minimum
+//!
+//! ## First-class native (address(0) pool)
 //!
 //! Native ETH is supported on pools where `currency0 == address(0)` (V4 native-first-class).
 //! On a **native-in** swap the caller sends `tx.value = amountIn` and no Permit2 approval is
 //! needed; on a **native-out** swap `tx.value = 0` and the token input is approved via Permit2.
-//! `price_limit` is deferred to a later task.
+//! A `price_limit` is unsupported: V4's Router swap actions carry no
+//! `sqrtPriceLimitX96` — slippage is bounded by `amountOutMinimum`/`amountInMaximum`.
 //! Approval spender is **Permit2**, not the router — V4 pulls via Permit2.
 
 use alloy::primitives::aliases::{I24, U24};
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::sol;
 use alloy::sol_types::SolValue;
-use amm_core::primitives::asset::AssetAmount;
+use amm_core::primitives::asset::{AssetAmount, AssetId};
 use amm_core::protocols::uniswap::v4::UniswapV4Pool;
 use amm_core::traits::pool::Pool;
 
@@ -28,7 +55,7 @@ use crate::execution::{
     options::ExecutionOptions,
     prepared::{PreparedSwap, Route},
     protocols::common,
-    route_planner::{RoutePlanner, V4_SWAP},
+    route_planner::{RoutePlanner, UNWRAP_WETH, V4_SWAP, WRAP_ETH},
     types::{Currency, CurrencyAmount, TradeType, UnsignedTx},
 };
 
@@ -40,29 +67,93 @@ pub const ACTION_SWAP_EXACT_IN_SINGLE: u8 = 0x06;
 /// V4 action byte: `SWAP_EXACT_OUT_SINGLE` (0x08).
 pub const ACTION_SWAP_EXACT_OUT_SINGLE: u8 = 0x08;
 
-/// V4 action byte: `SETTLE_ALL` (0x0c) — settle the input currency.
+/// V4 action byte: `SETTLE` (0x0b) — settle the exact swap debt from the router's
+/// own balance when `payerIsUser = false`. Used in the WETH-wrap path after the
+/// router has received WETH from `WRAP_ETH`.
+pub const ACTION_SETTLE: u8 = 0x0b;
+
+/// V4 action byte: `SETTLE_ALL` (0x0c) — settle input currency up to `amount`,
+/// paying from the user via Permit2 or direct transfer.
 pub const ACTION_SETTLE_ALL: u8 = 0x0c;
 
-/// V4 action byte: `TAKE_ALL` (0x0f) — take the output currency.
-pub const ACTION_TAKE_ALL: u8 = 0x0f;
+/// V4 action byte: `TAKE` (0x0e) — take `amount` of a currency to a recipient.
+pub const ACTION_TAKE: u8 = 0x0e;
 
-/// Packed action sequence for an exact-in single-hop V4 swap.
-///
-/// `[SWAP_EXACT_IN_SINGLE, SETTLE_ALL, TAKE_ALL]`
-pub const ACTIONS_EXACT_IN: [u8; 3] = [
-    ACTION_SWAP_EXACT_IN_SINGLE,
-    ACTION_SETTLE_ALL,
-    ACTION_TAKE_ALL,
-];
+/// V4 amount sentinel: take/settle the full open delta for the currency.
+const OPEN_DELTA: U256 = U256::ZERO;
 
-/// Packed action sequence for an exact-out single-hop V4 swap.
+/// Universal Router recipient sentinel: the router's own address.
+/// Used as the destination for `WRAP_ETH` so the wrapped WETH stays in the
+/// router and can be spent by the subsequent `SETTLE` V4 action.
+const ADDRESS_THIS: Address = Address::with_last_byte(2);
+
+/// Packed action sequence for an exact-in single-hop V4 swap (standard path).
 ///
-/// `[SWAP_EXACT_OUT_SINGLE, SETTLE_ALL, TAKE_ALL]`
-pub const ACTIONS_EXACT_OUT: [u8; 3] = [
-    ACTION_SWAP_EXACT_OUT_SINGLE,
-    ACTION_SETTLE_ALL,
-    ACTION_TAKE_ALL,
-];
+/// `[SWAP_EXACT_IN_SINGLE, SETTLE_ALL, TAKE]`
+pub const ACTIONS_EXACT_IN: [u8; 3] = [ACTION_SWAP_EXACT_IN_SINGLE, ACTION_SETTLE_ALL, ACTION_TAKE];
+
+/// Packed action sequence for an exact-out single-hop V4 swap (standard path).
+///
+/// `[SWAP_EXACT_OUT_SINGLE, SETTLE_ALL, TAKE]`
+pub const ACTIONS_EXACT_OUT: [u8; 3] =
+    [ACTION_SWAP_EXACT_OUT_SINGLE, ACTION_SETTLE_ALL, ACTION_TAKE];
+
+/// Packed action sequence for an exact-in wrap swap: SETTLE from the router's
+/// WETH balance, not from the user.
+///
+/// `[SWAP_EXACT_IN_SINGLE, SETTLE, TAKE]`
+const ACTIONS_WRAP_EXACT_IN: [u8; 3] = [ACTION_SWAP_EXACT_IN_SINGLE, ACTION_SETTLE, ACTION_TAKE];
+
+/// Packed action sequence for an exact-out wrap swap: SETTLE from the router's
+/// WETH balance.
+///
+/// `[SWAP_EXACT_OUT_SINGLE, SETTLE, TAKE]`
+const ACTIONS_WRAP_EXACT_OUT: [u8; 3] = [ACTION_SWAP_EXACT_OUT_SINGLE, ACTION_SETTLE, ACTION_TAKE];
+
+// ── param encoders ────────────────────────────────────────────────────────────
+// Named ABI-encoders for the V4 action and Universal Router command params reused
+// across the exact-in and exact-out builders; the name states each param's role,
+// keeping the call sites declarative.
+
+/// `TAKE` param `(currency, recipient, OPEN_DELTA)`: move `currency`'s full
+/// positive delta to `recipient`. The swap action enforces the slippage floor.
+fn take_param(currency: Address, recipient: Address) -> Bytes {
+    <(Address, Address, U256)>::abi_encode_params(&(currency, recipient, OPEN_DELTA)).into()
+}
+
+/// `SETTLE_ALL` param `(currency, amount)`: settle `currency` up to `amount`, paid
+/// by the user (Permit2 for an ERC-20, or tx.value for address(0) ETH).
+fn settle_all_param(currency: Address, amount: U256) -> Bytes {
+    <(Address, U256)>::abi_encode_params(&(currency, amount)).into()
+}
+
+/// `SETTLE` param `(currency, OPEN_DELTA, payerIsUser=false)`: settle `currency`'s
+/// full debt from the router's balance — pays wrapped WETH after `WRAP_ETH`.
+fn settle_from_router_param(currency: Address) -> Bytes {
+    <(Address, U256, bool)>::abi_encode_params(&(currency, OPEN_DELTA, false)).into()
+}
+
+/// `WRAP_ETH` command input `(ADDRESS_THIS, amount)`: wrap `amount` native ETH into
+/// WETH held by the router.
+fn wrap_eth_input(amount: U256) -> Bytes {
+    <(Address, U256)>::abi_encode_params(&(ADDRESS_THIS, amount)).into()
+}
+
+/// `UNWRAP_WETH` command input `(recipient, min_out)`: unwrap the router's WETH to
+/// `recipient`, reverting below `min_out`.
+fn unwrap_weth_input(recipient: Address, min_out: U256) -> Bytes {
+    <(Address, U256)>::abi_encode_params(&(recipient, min_out)).into()
+}
+
+/// The asset `Currency::Native` resolves to for this swap: WETH in the wrap case
+/// (so pool-membership matches the pool's WETH currency), else first-class
+/// address(0) native ETH.
+fn native_asset_for(ctx: &ChainConfig, needs_wrap: bool) -> AssetId {
+    match needs_wrap {
+        true => ctx.weth,
+        false => AssetId::new(ctx.chain, B256::ZERO),
+    }
+}
 
 // ── Deployed ABI layout (DO NOT add `minHopPriceX36` — that is the v4-periphery
 //    `main` layout that reverts every swap on the deployed router) ────────────
@@ -124,25 +215,62 @@ fn build_v4_swap_input(actions: &[u8], params: Vec<Bytes>) -> Bytes {
     <(Bytes, Vec<Bytes>)>::abi_encode_params(&(actions_bytes, params)).into()
 }
 
+/// Determine whether the caller's native ETH must be wrapped to WETH before the swap.
+///
+/// Returns `true` when the caller provides native ETH (native-in) or expects
+/// native ETH out (native-out), the pool exposes WETH as a currency, and the pool
+/// does NOT have a first-class `address(0)` currency.  In that case the Universal
+/// Router wraps/unwraps ETH around the `V4_SWAP`.
+///
+/// `weth` is `common::evm_addr(&ctx.weth)`; `c0`/`c1` are the pool's sorted
+/// currency addresses from `build_pool_key`.
+fn is_wrap_case(
+    amount_in_currency: Currency,
+    to: Currency,
+    weth: Address,
+    c0: Address,
+    c1: Address,
+) -> bool {
+    let pool_has_weth = c0 == weth || c1 == weth;
+    let pool_has_native = c0 == Address::ZERO || c1 == Address::ZERO;
+    // Wrap is needed when native ETH is on either side (in or out), the pool
+    // exposes WETH, and there is no first-class address(0) currency on the pool.
+    (amount_in_currency.is_native() || to.is_native()) && pool_has_weth && !pool_has_native
+}
+
 impl Sealed for UniswapV4Pool {}
 
 impl Executable for UniswapV4Pool {
-    /// Build an exact-in V4 swap, supporting both ERC-20 and native-ETH inputs/outputs.
+    /// Build an exact-in V4 swap, supporting ERC-20, native-ETH (address(0) pool),
+    /// ETH-to-token via WETH wrap, and token-to-native ETH via WETH unwrap.
     ///
-    /// Native ETH is handled when the pool has `currency0 == address(0)`.  On a
-    /// native-in swap `tx.value = amountIn` and no Permit2 approval is required;
-    /// on a native-out swap `tx.value = 0` and Permit2 approves the token input.
-    /// A `price_limit` returns [`BuildError::UnsupportedProtocol`] (deferred).
+    /// ## Address(0)-native path
     ///
-    /// # Note — recipient delivery
+    /// When the pool has `currency0 == address(0)`, native ETH is first-class.
+    /// `tx.value = amountIn`; no Permit2 approval; commands = `[V4_SWAP]` with
+    /// `SETTLE_ALL`.
     ///
-    /// V4 output is delivered via `TAKE_ALL` to the Universal Router's `msgSender()`,
-    /// which is the EOA that submits `execute` directly.  Consequently,
-    /// `Recipient::To(other)` where `other != sender` is **not** honored by this
-    /// single-hop encoder — `opts.recipient` is resolved (so `Recipient::Sender`
-    /// returns [`BuildError::UnresolvedRecipient`]) but the resolved address is not
-    /// threaded into the `TAKE_ALL` params.  Cross-recipient delivery is part of the
-    /// deferred `msg.sender`/multicall audit.
+    /// ## WETH-wrap path (native-in, WETH pool)
+    ///
+    /// When the pool's currencies include WETH (not address(0)) and the caller
+    /// holds native ETH: commands = `[WRAP_ETH, V4_SWAP]`. `WRAP_ETH` deposits
+    /// `amountIn` WETH to the router; the V4 `SETTLE` action (payerIsUser=false)
+    /// pays the swap from that balance. `tx.value = amountIn`; `approval = None`.
+    ///
+    /// ## WETH-unwrap path (native-out, WETH pool)
+    ///
+    /// When the output is native ETH and the pool exposes WETH: commands =
+    /// `[V4_SWAP, UNWRAP_WETH]`. The V4 `TAKE` action delivers WETH to the
+    /// router (`ADDRESS_THIS`); `UNWRAP_WETH` converts it to ETH and pays the
+    /// recipient, enforcing the slippage floor as the minimum ETH out.
+    /// `tx.value = 0`; Permit2 approval required on the token input.
+    ///
+    /// ## ERC-20 path
+    ///
+    /// Token input: commands = `[V4_SWAP]`, `SETTLE_ALL`, Permit2 approval required.
+    ///
+    /// A `price_limit` returns [`BuildError::UnsupportedProtocol`]: the V4 Router
+    /// swap actions carry no `sqrtPriceLimitX96` field (unlike V3).
     fn build_swap(
         &self,
         ctx: &ChainConfig,
@@ -152,9 +280,13 @@ impl Executable for UniswapV4Pool {
         quoted_out: &AssetAmount,
         opts: &ExecutionOptions,
     ) -> Result<PreparedSwap, BuildError> {
-        // V4 resolves Native → address(0) (first-class currency), not WETH.
-        let native_asset =
-            amm_core::primitives::asset::AssetId::new(ctx.chain, alloy::primitives::B256::ZERO);
+        // Must call build_pool_key before resolve_swap_with so we can compute
+        // needs_wrap from the pool's actual currency addresses.
+        let (pool_key, c0, _c1) = build_pool_key(self)?;
+        let weth = common::evm_addr(&ctx.weth);
+
+        let needs_wrap = is_wrap_case(amount_in.currency, to, weth, c0, _c1);
+
         let r = common::resolve_swap_with(
             ctx,
             self,
@@ -163,16 +295,17 @@ impl Executable for UniswapV4Pool {
             route,
             opts,
             TradeType::ExactIn,
-            native_asset,
+            native_asset_for(ctx, needs_wrap),
         )?;
 
-        // price_limit is deferred: V4 single-hop CAN accept a limit, but that
-        // integration is out of scope for this task.
+        // V4's Router ExactInputSingle action has no sqrtPriceLimitX96 field
+        // (unlike V3): a per-swap price limit would require calling
+        // PoolManager.swap directly, which the Universal Router does not do.
+        // Slippage is bounded by amountOutMinimum below.
         if opts.price_limit.is_some() {
             return Err(BuildError::UnsupportedProtocol);
         }
 
-        let (pool_key, c0, _c1) = build_pool_key(self)?;
         let zero_for_one = common::evm_addr(&r.input) == c0;
 
         // Swap struct amounts are uint128; convert from U256.
@@ -187,39 +320,68 @@ impl Executable for UniswapV4Pool {
             amountOutMinimum: min_u128,
             hookData: Bytes::new(),
         };
-
-        // SETTLE_ALL: settle input currency up to amountIn (U256).
-        let p_settle: Bytes =
-            <(Address, U256)>::abi_encode_params(&(common::evm_addr(&r.input), amount_in.raw))
-                .into();
-        // TAKE_ALL: take output currency at least minOut (U256).
-        let p_take: Bytes =
-            <(Address, U256)>::abi_encode_params(&(common::evm_addr(&r.output), min.raw)).into();
-        // swap params encoded as a bare struct (no function selector).
         let p_swap: Bytes = swap_params.abi_encode().into();
 
-        let v4_input = build_v4_swap_input(&ACTIONS_EXACT_IN, vec![p_swap, p_settle, p_take]);
+        let p_take = take_param(common::evm_addr(&r.output), r.recipient);
 
-        let mut planner = RoutePlanner::new();
-        planner.add(V4_SWAP, v4_input);
         let deadline_secs = u64::try_from(r.deadline).map_err(|_| BuildError::Overflow)?;
-        let data = planner.encode(deadline_secs);
 
-        // native-in: caller sends ETH via tx.value; no Permit2 approval needed.
-        // native-out: token input uses Permit2; tx.value stays zero.
-        let value = if r.native_in {
-            amount_in.raw
-        } else {
-            U256::ZERO
-        };
-        let approval = if r.native_in {
-            None
-        } else {
-            Some(common::erc20_approval(
-                ctx.permit2()?,
-                r.input,
-                amount_in.raw,
-            ))
+        let (data, value, approval) = match (needs_wrap, r.native_in) {
+            // WETH-wrap, native-in: wrap the caller's ETH, then SETTLE the WETH from
+            // the router's balance (payerIsUser=false) rather than from the user.
+            (true, true) => {
+                let v4_input = build_v4_swap_input(
+                    &ACTIONS_WRAP_EXACT_IN,
+                    vec![p_swap, settle_from_router_param(weth), p_take],
+                );
+                let mut planner = RoutePlanner::new();
+                planner
+                    .add(WRAP_ETH, wrap_eth_input(amount_in.raw))
+                    .add(V4_SWAP, v4_input);
+                (planner.encode(deadline_secs), amount_in.raw, None)
+            }
+            // WETH-wrap, native-out: settle the ERC-20 input from the user, TAKE the
+            // WETH output to the router, then UNWRAP it to ETH for the recipient (the
+            // unwrap min carries the slippage floor).
+            (true, false) => {
+                let p_settle = settle_all_param(common::evm_addr(&r.input), amount_in.raw);
+                let p_take_router = take_param(common::evm_addr(&r.output), ADDRESS_THIS);
+                let v4_input =
+                    build_v4_swap_input(&ACTIONS_EXACT_IN, vec![p_swap, p_settle, p_take_router]);
+                let mut planner = RoutePlanner::new();
+                planner
+                    .add(V4_SWAP, v4_input)
+                    .add(UNWRAP_WETH, unwrap_weth_input(r.recipient, min.raw));
+                let approval = Some(common::erc20_approval(
+                    ctx.permit2()?,
+                    r.input,
+                    amount_in.raw,
+                ));
+                (planner.encode(deadline_secs), U256::ZERO, approval)
+            }
+            // Standard path: SETTLE_ALL from the user — ERC-20 via Permit2, or
+            // address(0) native ETH via tx.value.
+            _ => {
+                let p_settle = settle_all_param(common::evm_addr(&r.input), amount_in.raw);
+                let v4_input =
+                    build_v4_swap_input(&ACTIONS_EXACT_IN, vec![p_swap, p_settle, p_take]);
+                let mut planner = RoutePlanner::new();
+                planner.add(V4_SWAP, v4_input);
+                // Both hinge on native-in: ETH pays via tx.value with nothing to
+                // approve; an ERC-20 pays zero value under a Permit2 approval.
+                let (value, approval) = match r.native_in {
+                    true => (amount_in.raw, None),
+                    false => (
+                        U256::ZERO,
+                        Some(common::erc20_approval(
+                            ctx.permit2()?,
+                            r.input,
+                            amount_in.raw,
+                        )),
+                    ),
+                };
+                (planner.encode(deadline_secs), value, approval)
+            }
         };
 
         Ok(PreparedSwap {
@@ -236,22 +398,37 @@ impl Executable for UniswapV4Pool {
         })
     }
 
-    /// Build an exact-out V4 swap, supporting both ERC-20 and native-ETH inputs/outputs.
+    /// Build an exact-out V4 swap, supporting ERC-20, native-ETH (address(0) pool),
+    /// ETH-to-token via WETH wrap, and token-to-native ETH via WETH unwrap.
     ///
-    /// Native ETH is handled when the pool has `currency0 == address(0)`.  On a
-    /// native-in swap `tx.value = maxAmountIn` and no Permit2 approval is required;
-    /// on a native-out swap `tx.value = 0` and Permit2 approves the token input.
-    /// A `price_limit` returns [`BuildError::UnsupportedProtocol`] (deferred).
+    /// ## Address(0)-native path
     ///
-    /// # Note — recipient delivery
+    /// When the pool has `currency0 == address(0)`, native ETH is first-class.
+    /// `tx.value = maxAmountIn`; no Permit2 approval; commands = `[V4_SWAP]` with
+    /// `SETTLE_ALL`.
     ///
-    /// V4 output is delivered via `TAKE_ALL` to the Universal Router's `msgSender()`,
-    /// which is the EOA that submits `execute` directly.  Consequently,
-    /// `Recipient::To(other)` where `other != sender` is **not** honored by this
-    /// single-hop encoder — `opts.recipient` is resolved (so `Recipient::Sender`
-    /// returns [`BuildError::UnresolvedRecipient`]) but the resolved address is not
-    /// threaded into the `TAKE_ALL` params.  Cross-recipient delivery is part of the
-    /// deferred `msg.sender`/multicall audit.
+    /// ## WETH-wrap path (native-in, WETH pool)
+    ///
+    /// When the pool's currencies include WETH (not address(0)) and the caller
+    /// holds native ETH: commands = `[WRAP_ETH, V4_SWAP, UNWRAP_WETH]`. `WRAP_ETH`
+    /// deposits `maxAmountIn` WETH to the router; the V4 `SETTLE` action pays the
+    /// actual swap amount; `UNWRAP_WETH` returns leftover WETH to the recipient as
+    /// ETH. `tx.value = maxAmountIn`; `approval = None`.
+    ///
+    /// ## WETH-unwrap path (native-out, WETH pool)
+    ///
+    /// When the output is native ETH and the pool exposes WETH: commands =
+    /// `[V4_SWAP, UNWRAP_WETH]`. The V4 `TAKE` action delivers WETH to the
+    /// router (`ADDRESS_THIS`); `UNWRAP_WETH` converts it to ETH and pays the
+    /// recipient, enforcing `amount_out` as the minimum (exact-out guarantees the
+    /// pool delivers exactly that). `tx.value = 0`; Permit2 approval on the token
+    /// input.
+    ///
+    /// ## ERC-20 path
+    ///
+    /// Token input: commands = `[V4_SWAP]`, `SETTLE_ALL`, Permit2 approval required.
+    ///
+    /// A `price_limit` returns [`BuildError::UnsupportedProtocol`].
     fn build_swap_exact_out(
         &self,
         ctx: &ChainConfig,
@@ -261,9 +438,13 @@ impl Executable for UniswapV4Pool {
         quoted_in: &AssetAmount,
         opts: &ExecutionOptions,
     ) -> Result<PreparedSwap, BuildError> {
-        // V4 resolves Native → address(0) (first-class currency), not WETH.
-        let native_asset =
-            amm_core::primitives::asset::AssetId::new(ctx.chain, alloy::primitives::B256::ZERO);
+        // build_pool_key must precede resolve_swap_with so needs_wrap is computed
+        // from the pool's actual currency addresses.
+        let (pool_key, c0, _c1) = build_pool_key(self)?;
+        let weth = common::evm_addr(&ctx.weth);
+
+        let needs_wrap = is_wrap_case(from, amount_out.currency, weth, c0, _c1);
+
         let r = common::resolve_swap_with(
             ctx,
             self,
@@ -272,15 +453,15 @@ impl Executable for UniswapV4Pool {
             route,
             opts,
             TradeType::ExactOut,
-            native_asset,
+            native_asset_for(ctx, needs_wrap),
         )?;
 
-        // price_limit deferred.
+        // No sqrtPriceLimitX96 on V4's Router actions (see build_swap);
+        // amountInMaximum bounds the exact-out swap instead.
         if opts.price_limit.is_some() {
             return Err(BuildError::UnsupportedProtocol);
         }
 
-        let (pool_key, c0, _c1) = build_pool_key(self)?;
         let zero_for_one = common::evm_addr(&r.input) == c0;
 
         // Swap struct amounts are uint128.
@@ -295,30 +476,59 @@ impl Executable for UniswapV4Pool {
             amountInMaximum: max_u128,
             hookData: Bytes::new(),
         };
-
-        // SETTLE_ALL: settle input currency up to max (U256).
-        let p_settle: Bytes =
-            <(Address, U256)>::abi_encode_params(&(common::evm_addr(&r.input), max.raw)).into();
-        // TAKE_ALL: take exact output amount (U256).
-        let p_take: Bytes =
-            <(Address, U256)>::abi_encode_params(&(common::evm_addr(&r.output), amount_out.raw))
-                .into();
         let p_swap: Bytes = swap_params.abi_encode().into();
 
-        let v4_input = build_v4_swap_input(&ACTIONS_EXACT_OUT, vec![p_swap, p_settle, p_take]);
+        let p_take = take_param(common::evm_addr(&r.output), r.recipient);
 
-        let mut planner = RoutePlanner::new();
-        planner.add(V4_SWAP, v4_input);
         let deadline_secs = u64::try_from(r.deadline).map_err(|_| BuildError::Overflow)?;
-        let data = planner.encode(deadline_secs);
 
-        // native-in: caller sends ETH via tx.value (maxAmountIn); no Permit2 approval needed.
-        // native-out: token input uses Permit2; tx.value stays zero.
-        let value = if r.native_in { max.raw } else { U256::ZERO };
-        let approval = if r.native_in {
-            None
-        } else {
-            Some(common::erc20_approval(ctx.permit2()?, r.input, max.raw))
+        let (data, value, approval) = match (needs_wrap, r.native_in) {
+            // WETH-wrap, native-in: wrap `max` ETH, SETTLE only what the swap needs
+            // from the router, then UNWRAP (min 0) refunds the leftover as ETH.
+            (true, true) => {
+                let v4_input = build_v4_swap_input(
+                    &ACTIONS_WRAP_EXACT_OUT,
+                    vec![p_swap, settle_from_router_param(weth), p_take],
+                );
+                let mut planner = RoutePlanner::new();
+                planner
+                    .add(WRAP_ETH, wrap_eth_input(max.raw))
+                    .add(V4_SWAP, v4_input)
+                    .add(UNWRAP_WETH, unwrap_weth_input(r.recipient, U256::ZERO));
+                (planner.encode(deadline_secs), max.raw, None)
+            }
+            // WETH-wrap, native-out: settle the ERC-20 input, TAKE the exact WETH
+            // output to the router, then UNWRAP it to ETH for the recipient (the
+            // unwrap min is the exact output).
+            (true, false) => {
+                let p_settle = settle_all_param(common::evm_addr(&r.input), max.raw);
+                let p_take_router = take_param(common::evm_addr(&r.output), ADDRESS_THIS);
+                let v4_input =
+                    build_v4_swap_input(&ACTIONS_EXACT_OUT, vec![p_swap, p_settle, p_take_router]);
+                let mut planner = RoutePlanner::new();
+                planner
+                    .add(V4_SWAP, v4_input)
+                    .add(UNWRAP_WETH, unwrap_weth_input(r.recipient, amount_out.raw));
+                let approval = Some(common::erc20_approval(ctx.permit2()?, r.input, max.raw));
+                (planner.encode(deadline_secs), U256::ZERO, approval)
+            }
+            // Standard path: SETTLE_ALL from the user — ERC-20 via Permit2, or
+            // address(0) native ETH via tx.value.
+            _ => {
+                let p_settle = settle_all_param(common::evm_addr(&r.input), max.raw);
+                let v4_input =
+                    build_v4_swap_input(&ACTIONS_EXACT_OUT, vec![p_swap, p_settle, p_take]);
+                let mut planner = RoutePlanner::new();
+                planner.add(V4_SWAP, v4_input);
+                let (value, approval) = match r.native_in {
+                    true => (max.raw, None),
+                    false => (
+                        U256::ZERO,
+                        Some(common::erc20_approval(ctx.permit2()?, r.input, max.raw)),
+                    ),
+                };
+                (planner.encode(deadline_secs), value, approval)
+            }
         };
 
         Ok(PreparedSwap {
@@ -384,6 +594,11 @@ mod tests {
     /// WETH — token1 (used in ERC-20 pool; NOT address(0)).
     fn weth() -> AssetId {
         asset(0x02)
+    }
+
+    /// A third ERC-20 token with no WETH or native relation.
+    fn token_x() -> AssetId {
+        asset(0x10)
     }
 
     fn universal_router() -> Address {
@@ -466,6 +681,28 @@ mod tests {
             Hooks::None,
             500,
             10,
+            Address::ZERO,
+        )
+    }
+
+    /// A full-range WETH/TOKEN_X V4 pool with WETH as currency0.
+    /// currency0 = WETH (0x02), currency1 = TOKEN_X (0x10).
+    /// No address(0) — wrap case applies when caller provides native ETH.
+    fn weth_pool() -> UniswapV4Pool {
+        let liq: i128 = 1_000_000_000_000_000_000;
+        UniswapV4Pool::new(
+            PoolId::new("1:univ4:0xwethpool"),
+            B256::repeat_byte(0xEE),
+            [weth(), token_x()],
+            U256::from(SQRT_1_1),
+            liq as u128,
+            0,
+            3000,
+            3000,
+            full_range_ticks(liq),
+            Hooks::None,
+            3000,
+            60,
             Address::ZERO,
         )
     }
@@ -557,7 +794,7 @@ mod tests {
         assert_eq!(
             actions.as_ref(),
             &ACTIONS_EXACT_IN[..],
-            "actions must be [0x06,0x0c,0x0f]"
+            "actions must be [0x06,0x0c,0x0e]"
         );
         assert_eq!(params.len(), 3, "must have 3 params");
 
@@ -606,19 +843,20 @@ mod tests {
             "settle amount must be amountIn"
         );
 
-        // params[2]: TAKE_ALL (output, minOut as U256).
-        let (take_addr, take_amt) = <(Address, U256)>::abi_decode_params(&params[2])
-            .expect("params[2] must decode as (Address, U256)");
+        // params[2]: TAKE (output, recipient, OPEN_DELTA as U256).
+        let (take_addr, take_to, take_amt) =
+            <(Address, Address, U256)>::abi_decode_params(&params[2])
+                .expect("params[2] must decode as (Address, Address, U256)");
         assert_eq!(
             take_addr,
             crate::execution::protocols::common::evm_addr(&weth()),
-            "take address must be weth"
+            "take currency must be weth"
         );
         assert_eq!(
-            take_amt,
-            U256::from(990u64),
-            "take amount must be minOut=990"
+            take_to, recipient,
+            "take recipient must match opts recipient"
         );
+        assert_eq!(take_amt, U256::ZERO, "take amount must be OPEN_DELTA");
 
         // min_received == 990 of weth.
         assert_eq!(prepared.min_received.raw, U256::from(990u64));
@@ -726,7 +964,7 @@ mod tests {
         assert_eq!(
             actions.as_ref(),
             &ACTIONS_EXACT_OUT[..],
-            "actions must be [0x08,0x0c,0x0f]"
+            "actions must be [0x08,0x0c,0x0e]"
         );
         assert_eq!(params.len(), 3);
 
@@ -757,13 +995,18 @@ mod tests {
             "settle amount must be maxAmountIn=505"
         );
 
-        // params[2]: TAKE_ALL (output, exact output as U256).
-        let (take_addr, take_amt) = <(Address, U256)>::abi_decode_params(&params[2]).unwrap();
+        // params[2]: TAKE (output, recipient, OPEN_DELTA as U256).
+        let (take_addr, take_to, take_amt) =
+            <(Address, Address, U256)>::abi_decode_params(&params[2]).unwrap();
         assert_eq!(
             take_addr,
             crate::execution::protocols::common::evm_addr(&weth())
         );
-        assert_eq!(take_amt, out_raw, "take amount must be amountOut=400");
+        assert_eq!(
+            take_to, recipient,
+            "take recipient must match opts recipient"
+        );
+        assert_eq!(take_amt, U256::ZERO, "take amount must be OPEN_DELTA");
 
         // min_received == exact output in weth.
         assert_eq!(prepared.min_received.raw, out_raw);
@@ -871,14 +1114,20 @@ mod tests {
             "SETTLE_ALL amount must be amountIn"
         );
 
-        // params[2]: TAKE_ALL currency == usdc.
-        let (take_addr, _) = <(Address, U256)>::abi_decode_params(&params[2])
-            .expect("params[2] must decode as (Address, U256)");
+        // params[2]: TAKE currency == usdc, recipient == opts recipient, amount == OPEN_DELTA.
+        let (take_addr, take_to, take_amt) =
+            <(Address, Address, U256)>::abi_decode_params(&params[2])
+                .expect("params[2] must decode as (Address, Address, U256)");
         assert_eq!(
             take_addr,
             crate::execution::protocols::common::evm_addr(&usdc()),
-            "TAKE_ALL currency must be usdc"
+            "TAKE currency must be usdc"
         );
+        assert_eq!(
+            take_to, recipient,
+            "TAKE recipient must match opts recipient"
+        );
+        assert_eq!(take_amt, U256::ZERO, "TAKE amount must be OPEN_DELTA");
     }
 
     // ── Native-out: USDC → ETH on a native V4 pool ──────────────────────────
@@ -944,19 +1193,15 @@ mod tests {
             "SETTLE_ALL currency must be usdc"
         );
 
-        // TAKE_ALL currency == address(0).
-        let (take_addr, take_amt) = <(Address, U256)>::abi_decode_params(&params[2]).unwrap();
+        // TAKE currency == address(0), recipient == opts recipient, amount == OPEN_DELTA.
+        let (take_addr, take_to, take_amt) =
+            <(Address, Address, U256)>::abi_decode_params(&params[2]).unwrap();
+        assert_eq!(take_addr, Address::ZERO, "TAKE currency must be address(0)");
         assert_eq!(
-            take_addr,
-            Address::ZERO,
-            "TAKE_ALL currency must be address(0)"
+            take_to, recipient,
+            "TAKE recipient must match opts recipient"
         );
-        // min out = floor(1000 * 9950/10000) = 995
-        assert_eq!(
-            take_amt,
-            U256::from(995u64),
-            "TAKE_ALL amount must be minOut"
-        );
+        assert_eq!(take_amt, U256::ZERO, "TAKE amount must be OPEN_DELTA");
     }
 
     // ── Guard: both-native → NativeMismatch ─────────────────────────────────
@@ -984,12 +1229,28 @@ mod tests {
         );
     }
 
-    // ── Guard: native input on non-native V4 pool → AssetNotInPool ──────────
+    // ── Guard: native input on a non-WETH, non-native V4 pool → AssetNotInPool
 
     #[test]
-    fn native_currency_on_non_native_v4_pool_returns_asset_not_in_pool() {
-        // pool() is USDC/WETH (no address(0) currency) — wrap case is deferred.
-        let p = pool();
+    fn native_currency_on_non_native_non_weth_pool_returns_asset_not_in_pool() {
+        // A pool with currencies that are neither address(0) nor WETH:
+        // native input cannot be wrapped to match either currency.
+        let liq: i128 = 1_000_000_000_000_000_000;
+        let p = UniswapV4Pool::new(
+            PoolId::new("1:univ4:0xother"),
+            B256::repeat_byte(0xFF),
+            [usdc(), token_x()],
+            U256::from(SQRT_1_1),
+            liq as u128,
+            0,
+            3000,
+            3000,
+            full_range_ticks(liq),
+            Hooks::None,
+            3000,
+            60,
+            Address::ZERO,
+        );
         let c = ctx();
         let opts = opts(Address::repeat_byte(0x55), 9_999_999, 50);
 
@@ -998,7 +1259,9 @@ mod tests {
             raw: U256::from(100u64),
         };
         let quoted_out = AssetAmount::new(usdc(), U256::from(100u64));
-        let route = Route::new_single_hop(usdc(), weth(), TradeType::ExactIn);
+        // needs_wrap=false (no weth in pool, no address(0)) → native_asset=address(0)
+        // → resolve maps Native→address(0) → not in pool → AssetNotInPool
+        let route = Route::new_single_hop(usdc(), token_x(), TradeType::ExactIn);
 
         let err = p
             .build_swap(
@@ -1009,7 +1272,7 @@ mod tests {
                 &quoted_out,
                 &opts,
             )
-            .expect_err("native on non-native pool must fail");
+            .expect_err("native on non-native/non-weth pool must fail");
         assert!(
             matches!(err, BuildError::AssetNotInPool { .. }),
             "expected AssetNotInPool, got {err:?}"
@@ -1135,19 +1398,596 @@ mod tests {
         assert_eq!(err, BuildError::UnsupportedProtocol);
     }
 
+    // ── TAKE recipient delivery ──────────────────────────────────────────────
+
+    #[test]
+    fn take_delivers_to_the_resolved_recipient() {
+        // Build an ERC-20 exact-in swap on a V4 pool with a recipient that is NOT
+        // the sender; decode the V4_SWAP input and assert the final action is TAKE
+        // with (outputCurrency, recipient, OPEN_DELTA).
+        use super::{ACTION_TAKE, OPEN_DELTA};
+
+        let recipient = Address::repeat_byte(0xCD);
+        let o = opts(recipient, 1_700_000_000, 100);
+        let p = pool();
+        let c = ctx();
+
+        let amount_in = CurrencyAmount {
+            currency: Currency::Token(usdc()),
+            raw: U256::from(500u64),
+        };
+        let quoted_out = AssetAmount::new(weth(), U256::from(1000u64));
+        let route = Route::new_single_hop(usdc(), weth(), TradeType::ExactIn);
+
+        let prepared = p
+            .build_swap(
+                &c,
+                amount_in,
+                Currency::Token(weth()),
+                &route,
+                &quoted_out,
+                &o,
+            )
+            .expect("exact-in with explicit recipient must succeed");
+
+        let (_, inputs, _) = decode_outer(&prepared.tx.data);
+        let (actions, params) = decode_v4_input(&inputs[0]);
+
+        assert_eq!(
+            actions.last(),
+            Some(&ACTION_TAKE),
+            "final action must be TAKE (0x0e)"
+        );
+
+        let (currency, to, amount) =
+            <(Address, Address, U256)>::abi_decode_params(params.last().unwrap())
+                .expect("TAKE params must decode as (Address, Address, U256)");
+        assert_eq!(
+            currency,
+            crate::execution::protocols::common::evm_addr(&weth()),
+            "TAKE currency must be the output asset"
+        );
+        assert_eq!(
+            to, recipient,
+            "TAKE recipient must be the resolved recipient"
+        );
+        assert_eq!(amount, OPEN_DELTA, "TAKE amount must be OPEN_DELTA (0)");
+    }
+
     // ── Action constant values ───────────────────────────────────────────────
 
     #[test]
     fn action_constants_have_expected_values() {
         use super::{
-            ACTION_SETTLE_ALL, ACTION_SWAP_EXACT_IN_SINGLE, ACTION_SWAP_EXACT_OUT_SINGLE,
-            ACTION_TAKE_ALL,
+            ACTION_SETTLE, ACTION_SETTLE_ALL, ACTION_SWAP_EXACT_IN_SINGLE,
+            ACTION_SWAP_EXACT_OUT_SINGLE, ACTION_TAKE,
         };
         assert_eq!(ACTION_SWAP_EXACT_IN_SINGLE, 0x06);
         assert_eq!(ACTION_SWAP_EXACT_OUT_SINGLE, 0x08);
+        assert_eq!(ACTION_SETTLE, 0x0b);
         assert_eq!(ACTION_SETTLE_ALL, 0x0c);
-        assert_eq!(ACTION_TAKE_ALL, 0x0f);
-        assert_eq!(ACTIONS_EXACT_IN, [0x06u8, 0x0c, 0x0f]);
-        assert_eq!(ACTIONS_EXACT_OUT, [0x08u8, 0x0c, 0x0f]);
+        assert_eq!(ACTION_TAKE, 0x0e);
+        assert_eq!(ACTIONS_EXACT_IN, [0x06u8, 0x0c, 0x0e]);
+        assert_eq!(ACTIONS_EXACT_OUT, [0x08u8, 0x0c, 0x0e]);
+    }
+
+    // ── WETH-wrap exact-in: ETH → TOKEN_X on a WETH-currency pool ───────────
+
+    /// ETH→token exact-in on a WETH-currency pool: the encoder must prepend
+    /// `WRAP_ETH` and use `SETTLE` (payerIsUser=false) instead of `SETTLE_ALL`.
+    #[test]
+    fn native_in_wrap_exact_in_prepends_wrap_and_settles_from_router() {
+        use super::{ACTION_SETTLE, ACTIONS_WRAP_EXACT_IN, ADDRESS_THIS};
+        use crate::execution::route_planner::{V4_SWAP, WRAP_ETH};
+
+        let p = weth_pool();
+        let c = ctx();
+        let recipient = Address::repeat_byte(0x77);
+        let amount_raw = U256::from(1_000u64);
+        // 50 bps slippage.
+        let opts = opts(recipient, 9_999_999, 50);
+
+        let amount_in = CurrencyAmount {
+            currency: Currency::Native,
+            raw: amount_raw,
+        };
+        let quoted_out = AssetAmount::new(token_x(), U256::from(2_000u64));
+        // Route: weth → token_x (after wrap, input resolves to weth).
+        let route = Route::new_single_hop(weth(), token_x(), TradeType::ExactIn);
+
+        let prepared = p
+            .build_swap(
+                &c,
+                amount_in,
+                Currency::Token(token_x()),
+                &route,
+                &quoted_out,
+                &opts,
+            )
+            .expect("WETH-wrap exact-in must succeed");
+
+        // tx.value == amountIn; no Permit2 approval.
+        assert_eq!(
+            prepared.tx.value, amount_raw,
+            "tx.value must equal amountIn for wrap path"
+        );
+        assert!(
+            prepared.approval.is_none(),
+            "approval must be None for wrap path (ETH sent as value)"
+        );
+
+        // Outer: commands == [WRAP_ETH, V4_SWAP].
+        let (commands, inputs, _) = decode_outer(&prepared.tx.data);
+        assert_eq!(
+            commands.as_ref(),
+            &[WRAP_ETH, V4_SWAP],
+            "commands must be [WRAP_ETH=0x0b, V4_SWAP=0x10]"
+        );
+        assert_eq!(inputs.len(), 2, "must have two inputs: WRAP_ETH + V4_SWAP");
+
+        // WRAP_ETH input: (ADDRESS_THIS, amountIn).
+        let (wrap_recipient, wrap_amount) = <(Address, U256)>::abi_decode_params(&inputs[0])
+            .expect("WRAP_ETH input must decode as (Address, U256)");
+        assert_eq!(
+            wrap_recipient, ADDRESS_THIS,
+            "WRAP_ETH recipient must be ADDRESS_THIS (address(2))"
+        );
+        assert_eq!(
+            wrap_amount, amount_raw,
+            "WRAP_ETH amount must equal amountIn"
+        );
+
+        // V4_SWAP input: actions == [SWAP_EXACT_IN_SINGLE, SETTLE, TAKE].
+        let (actions, params) = decode_v4_input(&inputs[1]);
+        assert_eq!(
+            actions.as_ref(),
+            &ACTIONS_WRAP_EXACT_IN[..],
+            "V4 actions must be [0x06, SETTLE=0x0b, 0x0e]"
+        );
+        assert_eq!(params.len(), 3);
+
+        // params[0]: ExactInputSingleParams — pool key, zeroForOne, amounts.
+        let swap = ExactInputSingleParams::abi_decode(&params[0])
+            .expect("params[0] must decode as ExactInputSingleParams");
+        // weth_pool has currency0=WETH, currency1=TOKEN_X; input=weth → zeroForOne=true.
+        assert!(
+            swap.zeroForOne,
+            "zeroForOne must be true (weth=c0, input=weth after wrap)"
+        );
+        assert_eq!(swap.amountIn, 1_000u128, "amountIn must be 1000");
+
+        // params[1]: SETTLE — (weth, OPEN_DELTA, payerIsUser=false).
+        let (settle_currency, settle_amount, payer_is_user) =
+            <(Address, U256, bool)>::abi_decode_params(&params[1])
+                .expect("SETTLE param must decode as (Address, U256, bool)");
+        let weth_addr = crate::execution::protocols::common::evm_addr(&weth());
+        assert_eq!(settle_currency, weth_addr, "SETTLE currency must be WETH");
+        assert_eq!(
+            settle_amount,
+            U256::ZERO,
+            "SETTLE amount must be OPEN_DELTA (0)"
+        );
+        assert!(
+            !payer_is_user,
+            "payerIsUser must be false (router pays from its WETH balance)"
+        );
+
+        // params[2]: TAKE — output goes to recipient.
+        let (take_addr, take_to, take_amt) =
+            <(Address, Address, U256)>::abi_decode_params(&params[2])
+                .expect("TAKE param must decode as (Address, Address, U256)");
+        assert_eq!(
+            take_addr,
+            crate::execution::protocols::common::evm_addr(&token_x()),
+            "TAKE currency must be token_x (output)"
+        );
+        assert_eq!(
+            take_to, recipient,
+            "TAKE recipient must match opts recipient"
+        );
+        assert_eq!(take_amt, U256::ZERO, "TAKE amount must be OPEN_DELTA");
+
+        // Verify ACTION_SETTLE byte value.
+        assert_eq!(
+            actions[1], ACTION_SETTLE,
+            "second action byte must be SETTLE=0x0b"
+        );
+    }
+
+    // ── WETH-wrap exact-out: ETH → TOKEN_X on a WETH-currency pool ──────────
+
+    /// ETH→token exact-out: commands must be `[WRAP_ETH, V4_SWAP, UNWRAP_WETH]`;
+    /// `UNWRAP_WETH` returns any leftover WETH to the recipient as ETH.
+    #[test]
+    fn native_in_wrap_exact_out_appends_leftover_unwrap() {
+        use super::{ACTIONS_WRAP_EXACT_OUT, ADDRESS_THIS};
+        use crate::execution::route_planner::{UNWRAP_WETH, V4_SWAP, WRAP_ETH};
+
+        let p = weth_pool();
+        let c = ctx();
+        let recipient = Address::repeat_byte(0x88);
+        let out_raw = U256::from(500u64);
+        // 100 bps slippage: quoted_in 1000 → max = ceil(1000 * 10100/10000) = 1010
+        let opts = opts(recipient, 9_999_999, 100);
+
+        let amount_out = CurrencyAmount {
+            currency: Currency::Token(token_x()),
+            raw: out_raw,
+        };
+        let quoted_in = AssetAmount::new(weth(), U256::from(1_000u64));
+        // Route: weth → token_x (after wrap, input=weth).
+        let route = Route::new_single_hop(weth(), token_x(), TradeType::ExactOut);
+
+        let prepared = p
+            .build_swap_exact_out(&c, amount_out, Currency::Native, &route, &quoted_in, &opts)
+            .expect("WETH-wrap exact-out must succeed");
+
+        // max = ceil(1000 * 10100/10000) = 1010
+        let expected_max = U256::from(1_010u64);
+
+        // tx.value == max; no Permit2 approval.
+        assert_eq!(
+            prepared.tx.value, expected_max,
+            "tx.value must equal max for wrap exact-out"
+        );
+        assert!(
+            prepared.approval.is_none(),
+            "approval must be None for wrap exact-out"
+        );
+
+        // Outer: commands == [WRAP_ETH, V4_SWAP, UNWRAP_WETH].
+        let (commands, inputs, _) = decode_outer(&prepared.tx.data);
+        assert_eq!(
+            commands.as_ref(),
+            &[WRAP_ETH, V4_SWAP, UNWRAP_WETH],
+            "commands must be [WRAP_ETH=0x0b, V4_SWAP=0x10, UNWRAP_WETH=0x0c]"
+        );
+        assert_eq!(inputs.len(), 3, "must have 3 inputs");
+
+        // WRAP_ETH input: (ADDRESS_THIS, max).
+        let (wrap_recipient, wrap_amount) = <(Address, U256)>::abi_decode_params(&inputs[0])
+            .expect("WRAP_ETH input must decode as (Address, U256)");
+        assert_eq!(
+            wrap_recipient, ADDRESS_THIS,
+            "WRAP_ETH recipient must be ADDRESS_THIS"
+        );
+        assert_eq!(
+            wrap_amount, expected_max,
+            "WRAP_ETH amount must be max (1010)"
+        );
+
+        // V4_SWAP actions == [SWAP_EXACT_OUT_SINGLE, SETTLE, TAKE].
+        let (actions, params) = decode_v4_input(&inputs[1]);
+        assert_eq!(
+            actions.as_ref(),
+            &ACTIONS_WRAP_EXACT_OUT[..],
+            "V4 actions must be [0x08, SETTLE=0x0b, 0x0e]"
+        );
+        assert_eq!(params.len(), 3);
+
+        // params[1]: SETTLE — (weth, OPEN_DELTA, payerIsUser=false).
+        let (settle_currency, settle_amount, payer_is_user) =
+            <(Address, U256, bool)>::abi_decode_params(&params[1])
+                .expect("SETTLE param must decode as (Address, U256, bool)");
+        let weth_addr = crate::execution::protocols::common::evm_addr(&weth());
+        assert_eq!(settle_currency, weth_addr, "SETTLE currency must be WETH");
+        assert_eq!(
+            settle_amount,
+            U256::ZERO,
+            "SETTLE amount must be OPEN_DELTA"
+        );
+        assert!(!payer_is_user, "payerIsUser must be false");
+
+        // UNWRAP_WETH input: (recipient, 0) — unwrap all remaining WETH to recipient as ETH.
+        let (unwrap_recipient, unwrap_min) = <(Address, U256)>::abi_decode_params(&inputs[2])
+            .expect("UNWRAP_WETH input must decode as (Address, U256)");
+        assert_eq!(
+            unwrap_recipient, recipient,
+            "UNWRAP_WETH recipient must match opts recipient"
+        );
+        assert_eq!(
+            unwrap_min,
+            U256::ZERO,
+            "UNWRAP_WETH min must be 0 (unwrap everything)"
+        );
+    }
+
+    // ── WETH-wrap native-out exact-in: TOKEN_X → ETH on WETH-currency pool ───
+
+    /// Token→ETH exact-in on a WETH-currency pool: the encoder must use `SETTLE_ALL`
+    /// for the token input from the user, `TAKE` to the router (ADDRESS_THIS) for the
+    /// WETH output, and then append `UNWRAP_WETH` to convert the WETH to ETH and deliver
+    /// it to the recipient.
+    #[test]
+    fn native_out_unwrap_exact_in_takes_to_router_then_unwraps() {
+        use super::{ACTIONS_EXACT_IN, ADDRESS_THIS, OPEN_DELTA};
+        use crate::execution::route_planner::{UNWRAP_WETH, V4_SWAP};
+
+        let p = weth_pool(); // currency0=WETH, currency1=TOKEN_X
+        let c = ctx();
+        let recipient = Address::repeat_byte(0x99);
+        let amount_raw = U256::from(800u64);
+        // 50 bps slippage: quoted_out 2000 → min = floor(2000 * 9950/10000) = 1990
+        let opts = opts(recipient, 9_999_999, 50);
+
+        let amount_in = CurrencyAmount {
+            currency: Currency::Token(token_x()),
+            raw: amount_raw,
+        };
+        let quoted_out = AssetAmount::new(weth(), U256::from(2_000u64));
+        // Route: token_x → weth (after resolve, output=weth; native_out=true).
+        let route = Route::new_single_hop(token_x(), weth(), TradeType::ExactIn);
+
+        let prepared = p
+            .build_swap(
+                &c,
+                amount_in,
+                // to == Native triggers needs_wrap on a WETH-currency pool
+                Currency::Native,
+                &route,
+                &quoted_out,
+                &opts,
+            )
+            .expect("native-out wrap exact-in must succeed");
+
+        // tx.value == 0 (token input, no ETH sent); Permit2 approval on token_x.
+        assert_eq!(
+            prepared.tx.value,
+            U256::ZERO,
+            "tx.value must be 0 for native-out wrap (token input)"
+        );
+        let approval = prepared
+            .approval
+            .expect("approval must be Some for token input");
+        assert_eq!(
+            approval.spender,
+            permit2(),
+            "approval.spender must be Permit2"
+        );
+        assert_eq!(approval.token, token_x(), "approval.token must be token_x");
+        assert_eq!(
+            approval.min_allowance, amount_raw,
+            "approval.min_allowance must be amountIn"
+        );
+
+        // Outer: commands == [V4_SWAP, UNWRAP_WETH].
+        let (commands, inputs, _) = decode_outer(&prepared.tx.data);
+        assert_eq!(
+            commands.as_ref(),
+            &[V4_SWAP, UNWRAP_WETH],
+            "commands must be [V4_SWAP=0x10, UNWRAP_WETH=0x0c]"
+        );
+        assert_eq!(
+            inputs.len(),
+            2,
+            "must have two inputs: V4_SWAP + UNWRAP_WETH"
+        );
+
+        // V4_SWAP input: actions == [SWAP_EXACT_IN_SINGLE, SETTLE_ALL, TAKE].
+        let (actions, params) = decode_v4_input(&inputs[0]);
+        assert_eq!(
+            actions.as_ref(),
+            &ACTIONS_EXACT_IN[..],
+            "V4 actions must be [SWAP_EXACT_IN_SINGLE=0x06, SETTLE_ALL=0x0c, TAKE=0x0e]"
+        );
+        assert_eq!(params.len(), 3);
+
+        // params[0]: ExactInputSingleParams — token_x is input (c1), so zeroForOne=false.
+        let swap = ExactInputSingleParams::abi_decode(&params[0])
+            .expect("params[0] must decode as ExactInputSingleParams");
+        assert!(
+            !swap.zeroForOne,
+            "zeroForOne must be false (token_x=c1 is the input)"
+        );
+        assert_eq!(swap.amountIn, 800u128, "amountIn must be 800");
+        // min = floor(2000 * 9950/10000) = 1990
+        assert_eq!(
+            swap.amountOutMinimum, 1_990u128,
+            "amountOutMinimum must be 1990 at 50bps"
+        );
+
+        // params[1]: SETTLE_ALL — (token_x, amountIn).
+        let (settle_addr, settle_amt) = <(Address, U256)>::abi_decode_params(&params[1])
+            .expect("params[1] must decode as (Address, U256)");
+        assert_eq!(
+            settle_addr,
+            crate::execution::protocols::common::evm_addr(&token_x()),
+            "SETTLE_ALL currency must be token_x (input)"
+        );
+        assert_eq!(settle_amt, amount_raw, "SETTLE_ALL amount must be amountIn");
+
+        // params[2]: TAKE — (weth, ADDRESS_THIS, OPEN_DELTA).
+        // WETH output goes to the router (not the recipient) so UNWRAP_WETH can
+        // convert it to ETH.
+        let (take_addr, take_to, take_amt) =
+            <(Address, Address, U256)>::abi_decode_params(&params[2])
+                .expect("params[2] must decode as (Address, Address, U256)");
+        let weth_addr = crate::execution::protocols::common::evm_addr(&weth());
+        assert_eq!(
+            take_addr, weth_addr,
+            "TAKE currency must be WETH (the swap output)"
+        );
+        assert_eq!(
+            take_to, ADDRESS_THIS,
+            "TAKE recipient must be ADDRESS_THIS so router holds WETH"
+        );
+        assert_eq!(take_amt, OPEN_DELTA, "TAKE amount must be OPEN_DELTA (0)");
+
+        // UNWRAP_WETH input: (recipient, min) where min == slippage floor (1990).
+        let (unwrap_recipient, unwrap_min) = <(Address, U256)>::abi_decode_params(&inputs[1])
+            .expect("UNWRAP_WETH input must decode as (Address, U256)");
+        assert_eq!(
+            unwrap_recipient, recipient,
+            "UNWRAP_WETH recipient must be opts recipient"
+        );
+        assert_eq!(
+            unwrap_min,
+            U256::from(1_990u64),
+            "UNWRAP_WETH min must be slippage floor (1990)"
+        );
+    }
+
+    // ── WETH-wrap native-out exact-out: TOKEN_X → ETH on WETH-currency pool ──
+
+    /// Token→ETH exact-out on a WETH-currency pool: commands == `[V4_SWAP, UNWRAP_WETH]`;
+    /// `UNWRAP_WETH` uses `amount_out` (not 0) as the min, enforcing the exact output.
+    #[test]
+    fn native_out_unwrap_exact_out_unwraps_exact_output() {
+        use super::{ACTIONS_EXACT_OUT, ADDRESS_THIS, OPEN_DELTA};
+        use crate::execution::route_planner::{UNWRAP_WETH, V4_SWAP};
+
+        let p = weth_pool(); // currency0=WETH, currency1=TOKEN_X
+        let c = ctx();
+        let recipient = Address::repeat_byte(0xAA);
+        let out_raw = U256::from(500u64);
+        // 100 bps slippage: quoted_in 1000 → max = ceil(1000 * 10100/10000) = 1010
+        let opts = opts(recipient, 9_999_999, 100);
+
+        let amount_out = CurrencyAmount {
+            currency: Currency::Native,
+            raw: out_raw,
+        };
+        let quoted_in = AssetAmount::new(token_x(), U256::from(1_000u64));
+        // Route: token_x → weth (after resolve, output=weth; native_out=true).
+        let route = Route::new_single_hop(token_x(), weth(), TradeType::ExactOut);
+
+        let prepared = p
+            .build_swap_exact_out(
+                &c,
+                amount_out,
+                // from == Token(token_x) — ERC-20 input
+                Currency::Token(token_x()),
+                &route,
+                &quoted_in,
+                &opts,
+            )
+            .expect("native-out wrap exact-out must succeed");
+
+        let expected_max = U256::from(1_010u64);
+
+        // tx.value == 0; Permit2 approval on token_x for maxAmountIn.
+        assert_eq!(
+            prepared.tx.value,
+            U256::ZERO,
+            "tx.value must be 0 for native-out wrap exact-out"
+        );
+        let approval = prepared
+            .approval
+            .expect("approval must be Some for token input");
+        assert_eq!(approval.spender, permit2(), "spender must be Permit2");
+        assert_eq!(approval.token, token_x(), "approval.token must be token_x");
+        assert_eq!(
+            approval.min_allowance, expected_max,
+            "approval.min_allowance must be maxAmountIn (1010)"
+        );
+
+        // Outer: commands == [V4_SWAP, UNWRAP_WETH].
+        let (commands, inputs, _) = decode_outer(&prepared.tx.data);
+        assert_eq!(
+            commands.as_ref(),
+            &[V4_SWAP, UNWRAP_WETH],
+            "commands must be [V4_SWAP=0x10, UNWRAP_WETH=0x0c]"
+        );
+        assert_eq!(inputs.len(), 2);
+
+        // V4_SWAP actions == [SWAP_EXACT_OUT_SINGLE, SETTLE_ALL, TAKE].
+        let (actions, params) = decode_v4_input(&inputs[0]);
+        assert_eq!(
+            actions.as_ref(),
+            &ACTIONS_EXACT_OUT[..],
+            "V4 actions must be [SWAP_EXACT_OUT_SINGLE=0x08, SETTLE_ALL=0x0c, TAKE=0x0e]"
+        );
+        assert_eq!(params.len(), 3);
+
+        // params[0]: ExactOutputSingleParams.
+        let swap = ExactOutputSingleParams::abi_decode(&params[0])
+            .expect("params[0] must decode as ExactOutputSingleParams");
+        // token_x=c1, weth=c0; input=token_x → zeroForOne=false (one→zero).
+        assert!(
+            !swap.zeroForOne,
+            "zeroForOne must be false (token_x=c1 is the input)"
+        );
+        assert_eq!(swap.amountOut, 500u128, "amountOut must be 500");
+        assert_eq!(
+            swap.amountInMaximum, 1_010u128,
+            "amountInMaximum must be 1010 at 100bps"
+        );
+
+        // params[2]: TAKE — (weth, ADDRESS_THIS, OPEN_DELTA).
+        let (take_addr, take_to, take_amt) =
+            <(Address, Address, U256)>::abi_decode_params(&params[2])
+                .expect("params[2] must decode as (Address, Address, U256)");
+        let weth_addr = crate::execution::protocols::common::evm_addr(&weth());
+        assert_eq!(take_addr, weth_addr, "TAKE currency must be WETH");
+        assert_eq!(
+            take_to, ADDRESS_THIS,
+            "TAKE recipient must be ADDRESS_THIS so router holds WETH"
+        );
+        assert_eq!(take_amt, OPEN_DELTA, "TAKE amount must be OPEN_DELTA (0)");
+
+        // UNWRAP_WETH input: (recipient, amount_out) — enforce exact output as min.
+        let (unwrap_recipient, unwrap_min) = <(Address, U256)>::abi_decode_params(&inputs[1])
+            .expect("UNWRAP_WETH input must decode as (Address, U256)");
+        assert_eq!(
+            unwrap_recipient, recipient,
+            "UNWRAP_WETH recipient must be opts recipient"
+        );
+        assert_eq!(
+            unwrap_min, out_raw,
+            "UNWRAP_WETH min must be the exact output amount (500)"
+        );
+    }
+
+    // ── address(0)-native pool is unchanged by wrap detection ────────────────
+
+    /// An address(0)-native V4 pool with `Currency::Native` still produces a single
+    /// `[V4_SWAP]` command with `SETTLE_ALL` — the wrap path must NOT activate.
+    #[test]
+    fn address0_native_pool_unchanged() {
+        use crate::execution::route_planner::V4_SWAP;
+
+        let p = native_pool();
+        let c = ctx();
+        let recipient = Address::repeat_byte(0x55);
+        let opts = opts(recipient, 9_999_999, 50);
+
+        let amount_in = CurrencyAmount {
+            currency: Currency::Native,
+            raw: U256::from(300u64),
+        };
+        let quoted_out = AssetAmount::new(usdc(), U256::from(600u64));
+        let route = Route::new_single_hop(eth(), usdc(), TradeType::ExactIn);
+
+        let prepared = p
+            .build_swap(
+                &c,
+                amount_in,
+                Currency::Token(usdc()),
+                &route,
+                &quoted_out,
+                &opts,
+            )
+            .expect("native pool with Currency::Native must succeed unchanged");
+
+        // Single [V4_SWAP] command — no WRAP_ETH prepended.
+        let (commands, inputs, _) = decode_outer(&prepared.tx.data);
+        assert_eq!(
+            commands.as_ref(),
+            &[V4_SWAP],
+            "native pool must still use single V4_SWAP command"
+        );
+        assert_eq!(inputs.len(), 1);
+
+        // Actions inside V4_SWAP must be the standard SETTLE_ALL sequence.
+        let (actions, _params) = decode_v4_input(&inputs[0]);
+        assert_eq!(
+            actions.as_ref(),
+            &ACTIONS_EXACT_IN[..],
+            "actions must be [SWAP_EXACT_IN_SINGLE, SETTLE_ALL, TAKE] — no wrap"
+        );
+
+        // tx.value == amountIn; no approval.
+        assert_eq!(prepared.tx.value, U256::from(300u64));
+        assert!(prepared.approval.is_none());
     }
 }

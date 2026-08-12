@@ -309,3 +309,498 @@ async fn wei_exact_v4_native_directions() {
         fork.revert(snap);
     }
 }
+
+// ── WETH-currency V4 pool wrap/unwrap proof ───────────────────────────────────
+
+/// WETH ERC-20 address on Ethereum mainnet.  Used as currency1 in the
+/// WETH-currency pool below (USDC < WETH numerically so USDC=c0, WETH=c1).
+/// This constant is also the wrapped-native in `ChainConfig::weth`.
+const WETH_ERC20_ADDR: Address = WETH_ADDR;
+
+// A live USDC/WETH 0.05% V4 pool where WETH is the ERC-20 currency (currency1),
+// not address(0) — the case this wrap path exists to serve. Address-sorted:
+//   USDC = 0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48 (currency0)
+//   WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 (currency1)
+// fee = 500, tickSpacing = 10, hooks = address(0).
+//
+// poolId = keccak256(abi.encode(currency0, currency1, fee, tickSpacing, hooks))
+//        = 0x4f88f7c99022eace4740c6898f59ce6a2e798a1e64ce54589720b7153eb224a7.
+// Initialized at block 21_695_956; StateView.getLiquidity at the pinned block
+// 25_724_266 is 14_722_032_017_955_615 (~1.47e16) — deep and live.
+
+/// USDC currency0 for the WETH-currency pool (numerically smaller than WETH).
+const WETH_POOL_C0: Address = USDC_ADDR;
+/// WETH currency1 for the WETH-currency pool.
+const WETH_POOL_C1: Address = WETH_ERC20_ADDR;
+/// Fee for the WETH-currency V4 pool (0.05% = 500 pips).
+const WETH_POOL_FEE: u32 = 500u32;
+/// Tick spacing for the WETH-currency V4 pool.
+const WETH_POOL_TICK_SPACING: i32 = 10i32;
+
+/// Fetch the USDC/WETH ERC-20 UniV4 0.05% pool from `provider`, pinned to `block`.
+///
+/// Unlike the address(0) pool used by `fetch_v4_pool`, this pool carries WETH as
+/// an explicit ERC-20 currency (currency1).  Swapping native ETH against it
+/// requires `WRAP_ETH` before the V4_SWAP and `UNWRAP_WETH` after (when the
+/// output is ETH) — the path this fork test exercises.
+async fn fetch_v4_weth_pool(provider: impl Provider + Clone, block: u64) -> Box<dyn Pool> {
+    let usdc = asset(1, WETH_POOL_C0);
+    let weth = asset(1, WETH_POOL_C1);
+    let config = V4PoolConfig::new(
+        WETH_POOL_C0,
+        WETH_POOL_C1,
+        usdc,
+        weth,
+        WETH_POOL_FEE,
+        WETH_POOL_TICK_SPACING,
+        Address::ZERO,
+        Hooks::None,
+    );
+    let source = UniswapV4Source::new(provider, MANAGER, vec![config.clone()]);
+    let key = PoolKey {
+        exchange: ExchangeId::new("uniswap-v4"),
+        chain: ChainId(1),
+        address: config.pool_id.to_string(),
+        assets: vec![usdc, weth],
+        fee_bps: None,
+    };
+    let mut pools = source
+        .refresh(&[key], BlockId::number(block))
+        .await
+        .expect("UniswapV4Source::refresh for WETH-currency pool");
+    assert_eq!(pools.len(), 1, "expected exactly one pool from refresh");
+    pools.remove(0)
+}
+
+/// Wei-exact V4 execution proof — WETH-currency pool wrap/unwrap, three directions.
+///
+/// The pool carries WETH as an explicit ERC-20 currency (not `address(0)`).  The
+/// Universal Router wraps / unwraps ETH around each swap so the caller can send and
+/// receive native ETH despite the pool speaking WETH.  After every swap the test
+/// checks that the router holds zero WETH and zero native ETH — no residue.
+///
+/// Directions covered (snapshot/revert between each):
+///
+/// 1. **native-in exact-in (ETH → USDC):** `tx.value = eth_in`, no Permit2
+///    approval; router gets WETH via WRAP_ETH, settles from its own WETH balance.
+///    Assert USDC delta == `quote.raw`; router WETH and native ETH == 0.
+///
+/// 2. **native-out exact-in (USDC → ETH):** fund + Permit2-approve USDC; submit
+///    with `tx.value = 0`; assert ETH delta == `quote.raw` (gas_price=0 so no gas
+///    deduction); router WETH and native ETH == 0.
+///
+/// 3. **native-in exact-out (ETH → exact USDC):** `tx.value = max_in` (with
+///    slippage headroom); submit; assert USDC delta == `amount_out`; assert router
+///    WETH and native ETH == 0 (UNWRAP_WETH returns unused wrap).
+///
+/// Requires `flavor = "multi_thread"` — same reason as the other V4 fork tests.
+///
+/// The pool fixture (`WETH_POOL_C0/C1/FEE/TICK_SPACING`) is a live USDC/WETH
+/// 0.05% WETH-currency pool, verified live and deep at the pinned block — see the
+/// fixture note above `WETH_POOL_C0`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a forked RPC at $AMM_RPC_FORK_URL"]
+async fn wei_exact_v4_weth_pool_wrap_directions() {
+    let url = match std::env::var("AMM_RPC_FORK_URL") {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let alloy_provider = alloy::providers::ProviderBuilder::new()
+        .connect_http(url.parse().expect("invalid RPC url"));
+
+    let mut fork = support::fork_at(&url, fork_block(), ChainId(1), alloy_provider).await;
+
+    assert_eq!(
+        fork.block_number(),
+        fork_block(),
+        "fork must be pinned to fork_block()"
+    );
+
+    // ── shared constants ─────────────────────────────────────────────────────
+
+    let usdc = asset(1, USDC_ADDR);
+    let weth_asset = asset(1, WETH_ADDR);
+
+    let sender = Address::repeat_byte(0xBE);
+
+    // ChainConfig: WETH as wrapped native; Universal Router + Permit2.
+    let mut routers = Routers::default();
+    routers.universal = Some(UR);
+    routers.permit2 = Some(PERMIT2);
+    let cfg = ChainConfig::new(ChainId(1), weth_asset).with_routers(routers);
+
+    let opts = exec_opts(sender);
+
+    // Fetch the WETH-currency pool via the fork's own provider.
+    let pool = fetch_v4_weth_pool(fork.provider().clone(), fork_block()).await;
+    let exe = as_executable(pool.as_ref()).expect("UniswapV4Pool must be Executable");
+
+    // ── Direction 1: native-in exact-in (ETH → USDC via WETH pool) ──────────
+    //
+    // The encoder emits [WRAP_ETH, V4_SWAP]: ETH is wrapped to WETH in the
+    // router, SETTLE (payerIsUser=false) settles the swap debt from that WETH.
+    // No Permit2 approval; tx.value = eth_in.  After the swap the router must
+    // hold zero WETH and zero native ETH (the wrap+settle consumed exactly eth_in).
+    {
+        let snap = fork.snapshot();
+
+        let eth_in = U256::from(10_000_000_000_000_000u64); // 0.01 ETH
+
+        // Quote ETH-in (WETH asset) → USDC.  The pool's currency1 is WETH.
+        let quoted = pool
+            .quote(&AssetAmount::new(weth_asset, eth_in), &usdc)
+            .expect("pool must quote WETH→USDC (native-in wrap direction)");
+
+        // Route: weth_asset → usdc, so the encoder sees a WETH-pool swap with
+        // native ETH as the caller's currency.
+        let route = Route::new_single_hop(weth_asset, usdc, TradeType::ExactIn);
+        let prepared = exe
+            .build_swap(
+                &cfg,
+                CurrencyAmount {
+                    currency: Currency::Native,
+                    raw: eth_in,
+                },
+                Currency::Token(usdc),
+                &route,
+                &quoted,
+                &opts,
+            )
+            .expect("build_swap native-in wrap (ETH→USDC via WETH pool) must succeed");
+
+        // WRAP_ETH path: ETH is sent as tx.value; no ERC-20 approval needed.
+        assert!(
+            prepared.approval.is_none(),
+            "native-in wrap: must carry no ERC-20 approval (ETH sent as tx.value)"
+        );
+        assert_eq!(
+            prepared.tx.value, eth_in,
+            "native-in wrap: tx.value must equal eth_in"
+        );
+
+        // Fund sender with eth_in + 1 ETH gas buffer.  gas_price=0 so only
+        // tx.value is deducted from the sender's balance.
+        let eth_buffer = U256::from(1_000_000_000_000_000_000u64); // 1 ETH
+        fork.fund_native(sender, eth_in + eth_buffer);
+
+        let before_usdc = fork.erc20_balance(USDC_ADDR, sender);
+        assert!(
+            fork.submit(sender, &prepared.tx),
+            "native-in wrap (ETH→USDC) swap reverted"
+        );
+        let after_usdc = fork.erc20_balance(USDC_ADDR, sender);
+
+        let delta = after_usdc - before_usdc;
+        assert_eq!(
+            delta, quoted.raw,
+            "native-in wrap: USDC delta {delta} must equal quoted {} to the wei",
+            quoted.raw
+        );
+
+        // No-residue guarantee: the router must hold zero WETH and zero native ETH
+        // after the swap.  WRAP_ETH + SETTLE consumed exactly eth_in WETH; the
+        // pool settled that debt, leaving nothing stranded.
+        assert_eq!(
+            fork.erc20_balance(WETH_ERC20_ADDR, UR),
+            U256::ZERO,
+            "native-in wrap: router must hold zero WETH after swap"
+        );
+        assert_eq!(
+            fork.native_balance(UR),
+            U256::ZERO,
+            "native-in wrap: router must hold zero native ETH after swap"
+        );
+
+        fork.revert(snap);
+    }
+
+    // ── Direction 2: native-out exact-in (USDC → ETH via WETH pool) ─────────
+    //
+    // The encoder emits [V4_SWAP, UNWRAP_WETH]: USDC is settled from the user
+    // via Permit2; the pool outputs WETH to the router (TAKE to ADDRESS_THIS);
+    // UNWRAP_WETH converts it to native ETH and pays the recipient.
+    // tx.value = 0; gas_price = 0 so ETH delta = pure swap output.
+    {
+        let snap = fork.snapshot();
+
+        let usdc_in = U256::from(100_000_000u64); // 100 USDC (6 decimals)
+
+        // Quote USDC-in → WETH (the pool's output currency).  The encoder's
+        // UNWRAP_WETH step converts that WETH to native ETH for the recipient.
+        let quoted = pool
+            .quote(&AssetAmount::new(usdc, usdc_in), &weth_asset)
+            .expect("pool must quote USDC→WETH (native-out unwrap direction)");
+
+        let route = Route::new_single_hop(usdc, weth_asset, TradeType::ExactIn);
+        let prepared = exe
+            .build_swap(
+                &cfg,
+                CurrencyAmount {
+                    currency: Currency::Token(usdc),
+                    raw: usdc_in,
+                },
+                Currency::Native,
+                &route,
+                &quoted,
+                &opts,
+            )
+            .expect("build_swap native-out unwrap (USDC→ETH via WETH pool) must succeed");
+
+        // tx.value must be 0; Permit2 approval required for the USDC input.
+        assert_eq!(
+            prepared.tx.value,
+            U256::ZERO,
+            "native-out unwrap: tx.value must be 0"
+        );
+
+        // Fund USDC via storage-slot injection (slot 9); also sets 100 ETH.
+        fork.fund_erc20(sender, USDC_ADDR, USDC_SLOT, usdc_in * U256::from(2u64));
+
+        // Fail-fast: confirm the slot write landed before proceeding.
+        let usdc_funded = fork.erc20_balance(USDC_ADDR, sender);
+        assert!(
+            usdc_funded >= usdc_in,
+            "USDC slot 9 injection failed: got {usdc_funded}, need {usdc_in}"
+        );
+
+        // Apply the Permit2 two-step approval from `prepared.approval`.
+        if let Some(req) = &prepared.approval {
+            let token_addr = Address::from_word(req.token.token);
+            fork.permit2_approve(
+                sender,
+                token_addr,
+                req.spender,
+                UR,
+                req.min_allowance,
+                1_000_000_000_000u64,
+            );
+        }
+
+        // Small native ETH buffer so the EVM's balance-check on the sender
+        // passes (tx.value is 0, but some EVM setups still require sender > 0).
+        fork.fund_native(sender, U256::from(1_000_000_000_000_000_000u64)); // 1 ETH
+
+        let before_eth = fork.native_balance(sender);
+        assert!(
+            fork.submit(sender, &prepared.tx),
+            "native-out unwrap (USDC→ETH) swap reverted"
+        );
+        let after_eth = fork.native_balance(sender);
+
+        // gas_price=0: ETH delta is the pure swap output, wei-exact.
+        let delta = after_eth - before_eth;
+        assert_eq!(
+            delta, quoted.raw,
+            "native-out unwrap: ETH delta {delta} must equal quoted {} to the wei",
+            quoted.raw
+        );
+
+        // No-residue guarantee: UNWRAP_WETH must have converted all WETH;
+        // the router holds zero WETH and zero native ETH.
+        assert_eq!(
+            fork.erc20_balance(WETH_ERC20_ADDR, UR),
+            U256::ZERO,
+            "native-out unwrap: router must hold zero WETH after swap"
+        );
+        assert_eq!(
+            fork.native_balance(UR),
+            U256::ZERO,
+            "native-out unwrap: router must hold zero native ETH after swap"
+        );
+
+        fork.revert(snap);
+    }
+
+    // ── Direction 3: native-in exact-out (ETH → exact USDC via WETH pool) ───
+    //
+    // The encoder emits [WRAP_ETH, V4_SWAP, UNWRAP_WETH]: WRAP_ETH wraps the
+    // slippage-padded max; SETTLE drains only the actual swap cost; UNWRAP_WETH
+    // returns leftover WETH to the recipient as ETH.  After the swap the router
+    // must hold zero WETH and zero native ETH — UNWRAP_WETH handled the surplus.
+    {
+        let snap = fork.snapshot();
+
+        let usdc_out = U256::from(10_000_000u64); // 10 USDC (6 decimals)
+
+        // Quote exact-out: how many WETH units (= ETH) are needed for 10 USDC.
+        let quoted_in = pool
+            .as_exact_out()
+            .expect("pool must support exact-out quoting")
+            .quote_exact_out(&AssetAmount::new(usdc, usdc_out), &weth_asset)
+            .expect("pool must quote exact-out USDC←WETH (native-in wrap direction)");
+
+        let route = Route::new_single_hop(weth_asset, usdc, TradeType::ExactOut);
+        let prepared = exe
+            .build_swap_exact_out(
+                &cfg,
+                CurrencyAmount {
+                    currency: Currency::Token(usdc),
+                    raw: usdc_out,
+                },
+                Currency::Native,
+                &route,
+                &quoted_in,
+                &opts,
+            )
+            .expect("build_swap_exact_out native-in wrap (ETH→exact USDC) must succeed");
+
+        // WRAP_ETH path: no ERC-20 approval; tx.value = max_in (with slippage).
+        assert!(
+            prepared.approval.is_none(),
+            "native-in exact-out wrap: must carry no ERC-20 approval"
+        );
+        // tx.value must be positive (max ETH the router will wrap).
+        assert!(
+            prepared.tx.value > U256::ZERO,
+            "native-in exact-out wrap: tx.value must be > 0"
+        );
+
+        // Fund sender with tx.value (the max wrap amount) + 1 ETH buffer.
+        let eth_buffer = U256::from(1_000_000_000_000_000_000u64); // 1 ETH
+        fork.fund_native(sender, prepared.tx.value + eth_buffer);
+
+        let before_usdc = fork.erc20_balance(USDC_ADDR, sender);
+        assert!(
+            fork.submit(sender, &prepared.tx),
+            "native-in exact-out wrap (ETH→USDC) swap reverted"
+        );
+        let after_usdc = fork.erc20_balance(USDC_ADDR, sender);
+
+        // Exact-out: the USDC delta must be exactly the requested output.
+        let delta = after_usdc - before_usdc;
+        assert_eq!(
+            delta, usdc_out,
+            "native-in exact-out wrap: USDC delta {delta} must equal requested {usdc_out} to the wei"
+        );
+
+        // No-residue guarantee: UNWRAP_WETH returns unused WETH as native ETH
+        // to the recipient, so the router holds zero WETH.  The router also
+        // must hold zero native ETH — it does not accumulate the unwrapped ETH.
+        assert_eq!(
+            fork.erc20_balance(WETH_ERC20_ADDR, UR),
+            U256::ZERO,
+            "native-in exact-out wrap: router must hold zero WETH after swap"
+        );
+        assert_eq!(
+            fork.native_balance(UR),
+            U256::ZERO,
+            "native-in exact-out wrap: router must hold zero native ETH after swap"
+        );
+
+        fork.revert(snap);
+    }
+}
+
+// ── recipient isolation proof ─────────────────────────────────────────────────
+
+/// V4 distinct-recipient fork proof — exact-in ETH→USDC with `Recipient::To(other)`.
+///
+/// Asserts that when the resolved recipient is an address distinct from the
+/// transaction sender, the output lands in `other` and NOT in `sender`.
+/// This proves the V4 encoder's `TAKE(currency, recipient, OPEN_DELTA)` command
+/// uses the resolved recipient address, not `msg.sender`.
+///
+/// Structure mirrors [`wei_exact_v4_native_directions`]:
+/// 1. Snapshot + fund sender.
+/// 2. Build calldata with `opts` pointing to `other` (0xCD…CD), not `sender`.
+/// 3. Submit; assert `other`'s USDC balance rose by `quote.raw`.
+/// 4. Assert `sender`'s USDC balance did NOT rise.
+/// 5. Revert snapshot.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a forked RPC at $AMM_RPC_FORK_URL"]
+async fn v4_exact_in_delivers_to_distinct_recipient() {
+    let url = match std::env::var("AMM_RPC_FORK_URL") {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let alloy_provider = alloy::providers::ProviderBuilder::new()
+        .connect_http(url.parse().expect("invalid RPC url"));
+
+    let mut fork = support::fork_at(&url, fork_block(), ChainId(1), alloy_provider).await;
+
+    // ── shared constants ─────────────────────────────────────────────────────
+
+    let eth = AssetId::new(ChainId(1), B256::ZERO);
+    let usdc = asset(1, USDC_ADDR);
+    let weth = asset(1, WETH_ADDR);
+
+    // The address that signs and pays; must NOT receive the output.
+    let sender = Address::repeat_byte(0xBE);
+    // The declared output recipient; distinct from sender.
+    let other = Address::repeat_byte(0xCD);
+
+    let mut routers = Routers::default();
+    routers.universal = Some(UR);
+    routers.permit2 = Some(PERMIT2);
+    let cfg = ChainConfig::new(ChainId(1), weth).with_routers(routers);
+
+    // opts point the swap output to `other`, not `sender`.
+    let opts = ExecutionOptions::new(Slippage::from_bps(Bps(50)))
+        .with_recipient(Recipient::To(other))
+        .with_deadline(Deadline::AtTimestamp(u64::MAX / 2));
+
+    let pool = fetch_v4_pool(fork.provider().clone(), fork_block()).await;
+    let exe = as_executable(pool.as_ref()).expect("UniswapV4Pool must be Executable");
+
+    let snap = fork.snapshot();
+
+    let eth_in = U256::from(10_000_000_000_000_000u64); // 0.01 ETH
+    let quoted = pool
+        .quote(&AssetAmount::new(eth, eth_in), &usdc)
+        .expect("pool must quote ETH→USDC");
+
+    let route = Route::new_single_hop(eth, usdc, TradeType::ExactIn);
+    let prepared = exe
+        .build_swap(
+            &cfg,
+            CurrencyAmount {
+                currency: Currency::Native,
+                raw: eth_in,
+            },
+            Currency::Token(usdc),
+            &route,
+            &quoted,
+            &opts,
+        )
+        .expect("build_swap distinct-recipient (ETH→USDC) must succeed");
+
+    // V4 native-in carries no ERC-20 approval.
+    assert!(
+        prepared.approval.is_none(),
+        "native-in swap must carry no ERC-20 approval"
+    );
+
+    // Fund sender with eth_in plus a 1 ETH buffer; gas_price=0 so only tx.value
+    // is deducted.
+    let eth_buffer = U256::from(1_000_000_000_000_000_000u64); // 1 ETH
+    fork.fund_native(sender, eth_in + eth_buffer);
+
+    let sender_before = fork.erc20_balance(USDC_ADDR, sender);
+    let other_before = fork.erc20_balance(USDC_ADDR, other);
+
+    assert!(
+        fork.submit(sender, &prepared.tx),
+        "distinct-recipient (ETH→USDC) swap reverted"
+    );
+
+    let sender_after = fork.erc20_balance(USDC_ADDR, sender);
+    let other_after = fork.erc20_balance(USDC_ADDR, other);
+
+    // Output must reach the declared recipient, not the signer.
+    let other_delta = other_after - other_before;
+    assert_eq!(
+        other_delta, quoted.raw,
+        "distinct recipient: USDC delta {other_delta} must equal quoted {} to the wei",
+        quoted.raw
+    );
+
+    // Sender's USDC balance must be unchanged — no leakage to msg.sender.
+    assert_eq!(
+        sender_after, sender_before,
+        "sender USDC balance must not change when a distinct recipient is set"
+    );
+
+    fork.revert(snap);
+}
