@@ -1,5 +1,4 @@
-//! Quote-to-build bridge types: [`Route`], [`PreparedSwap`], and
-//! [`ApprovalRequirement`].
+//! Build-layer output types: [`PreparedSwap`] and [`ApprovalRequirement`].
 //!
 //! These types carry the output of the build layer back to callers, expressing
 //! exactly what the signer and submitter need — the transaction envelope, the
@@ -10,45 +9,7 @@ use alloy::primitives::{Address, U256};
 use amm_core::primitives::asset::{AssetAmount, AssetId};
 use amm_core::primitives::ratio::Bps;
 
-use crate::execution::types::{TradeType, UnsignedTx};
-
-/// A route through one or more liquidity pools, expressed as an ordered list of
-/// asset hops and their corresponding fee tiers.
-///
-/// `hops` always has one more entry than `fee_tiers`: for a single-hop swap
-/// `A → B`, `hops = [A, B]` and `fee_tiers` carries the pool fee (or is empty
-/// when the fee is embedded in the pool identifier and need not be passed
-/// separately).
-///
-/// This is a v1 single-hop shape; the `hops`/`fee_tiers` pair generalises
-/// naturally to multi-hop paths without breaking the type.
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Route {
-    /// Ordered token sequence: `[in, hop₁, …, out]`. Always at least two
-    /// entries.
-    pub hops: Vec<AssetId>,
-    /// Per-pool fee tiers (hundredths of a basis point, Uniswap convention).
-    /// Empty when fees are carried implicitly by the pool key.
-    pub fee_tiers: Vec<u32>,
-    /// Whether the exact constraint is on the input or output side.
-    pub trade_type: TradeType,
-}
-
-impl Route {
-    /// Construct a single-hop route `input → output` with no explicit fee tier.
-    ///
-    /// `hops` is set to `[input, output]`; `fee_tiers` is empty. The caller may
-    /// push a fee tier into `fee_tiers` after construction when the router
-    /// requires it.
-    pub fn new_single_hop(input: AssetId, output: AssetId, trade_type: TradeType) -> Route {
-        Route {
-            hops: vec![input, output],
-            fee_tiers: vec![],
-            trade_type,
-        }
-    }
-}
+use crate::execution::types::UnsignedTx;
 
 /// The ERC-20 allowance a swap requires before the transaction can be sent.
 ///
@@ -101,41 +62,4 @@ pub struct PreparedSwap {
     /// Estimated price impact in basis points. `None` when the pool state
     /// needed for the estimate is unavailable.
     pub price_impact: Option<Bps>,
-}
-
-#[cfg(test)]
-mod tests {
-    use alloy::primitives::B256;
-    use amm_core::primitives::asset::ChainId;
-
-    use super::*;
-
-    fn asset(chain: u64, byte: u8) -> AssetId {
-        AssetId::new(ChainId(chain), B256::left_padding_from(&[byte]))
-    }
-
-    #[test]
-    fn new_single_hop_exact_in_yields_two_hops_no_fee_tiers() {
-        let a = asset(1, 0xAA);
-        let b = asset(1, 0xBB);
-        let route = Route::new_single_hop(a, b, TradeType::ExactIn);
-
-        assert_eq!(route.hops, vec![a, b], "hops should be [input, output]");
-        assert!(
-            route.fee_tiers.is_empty(),
-            "fee_tiers should be empty for new_single_hop"
-        );
-        assert_eq!(route.trade_type, TradeType::ExactIn);
-    }
-
-    #[test]
-    fn new_single_hop_exact_out_preserves_trade_type() {
-        let a = asset(1, 0x01);
-        let b = asset(1, 0x02);
-        let route = Route::new_single_hop(a, b, TradeType::ExactOut);
-
-        assert_eq!(route.hops, vec![a, b]);
-        assert!(route.fee_tiers.is_empty());
-        assert_eq!(route.trade_type, TradeType::ExactOut);
-    }
 }

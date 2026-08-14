@@ -46,10 +46,8 @@ use amm_core::primitives::pool::PoolKey;
 use amm_core::primitives::ratio::Bps;
 use amm_core::slippage::Slippage;
 use amm_core::traits::pool::Pool;
-use amm_rpc::execution::prepared::Route;
 use amm_rpc::execution::{
-    ChainConfig, Currency, CurrencyAmount, Deadline, ExecutionOptions, Recipient, TradeType,
-    as_executable,
+    ChainConfig, Currency, CurrencyAmount, Deadline, ExecutionOptions, Recipient, as_executable,
 };
 use amm_rpc::source::StateSource;
 
@@ -339,7 +337,6 @@ async fn wei_exact_curve_3pool_stable_i128() {
             .quote(&AssetAmount::new(dai, amt), &usdc)
             .expect("pool must quote DAI→USDC");
 
-        let route = Route::new_single_hop(dai, usdc, TradeType::ExactIn);
         let prepared = exe
             .build_swap(
                 &cfg,
@@ -348,7 +345,6 @@ async fn wei_exact_curve_3pool_stable_i128() {
                     raw: amt,
                 },
                 Currency::Token(usdc),
-                &route,
                 &quoted,
                 &opts,
             )
@@ -402,7 +398,6 @@ async fn wei_exact_curve_3pool_stable_i128() {
             .quote(&AssetAmount::new(usdc, amt), &usdt)
             .expect("pool must quote USDC→USDT");
 
-        let route = Route::new_single_hop(usdc, usdt, TradeType::ExactIn);
         let prepared = exe
             .build_swap(
                 &cfg,
@@ -411,7 +406,6 @@ async fn wei_exact_curve_3pool_stable_i128() {
                     raw: amt,
                 },
                 Currency::Token(usdt),
-                &route,
                 &quoted,
                 &opts,
             )
@@ -510,7 +504,6 @@ async fn wei_exact_tricrypto2_crypto_u256_use_eth() {
             .quote(&AssetAmount::new(usdt, amt), &weth_asset)
             .expect("pool must quote USDT→WETH");
 
-        let route = Route::new_single_hop(usdt, weth_asset, TradeType::ExactIn);
         let prepared = exe
             .build_swap(
                 &cfg,
@@ -519,7 +512,6 @@ async fn wei_exact_tricrypto2_crypto_u256_use_eth() {
                     raw: amt,
                 },
                 Currency::Token(weth_asset),
-                &route,
                 &quoted,
                 &opts,
             )
@@ -619,7 +611,6 @@ async fn wei_exact_stable_ng_usdc_to_crvusd() {
             .quote(&AssetAmount::new(usdc, amt), &crvusd)
             .expect("pool must quote USDC→crvUSD");
 
-        let route = Route::new_single_hop(usdc, crvusd, TradeType::ExactIn);
         let prepared = exe
             .build_swap(
                 &cfg,
@@ -628,7 +619,6 @@ async fn wei_exact_stable_ng_usdc_to_crvusd() {
                     raw: amt,
                 },
                 Currency::Token(crvusd),
-                &route,
                 &quoted,
                 &opts,
             )
@@ -738,7 +728,6 @@ async fn wei_exact_curve_tricrypto2_native_eth() {
             .quote(&AssetAmount::new(weth_asset, eth_in), &wbtc)
             .expect("pool must quote ETH→WBTC (via WETH slot)");
 
-        let route = Route::new_single_hop(weth_asset, wbtc, TradeType::ExactIn);
         let prepared = exe
             .build_swap(
                 &cfg,
@@ -747,7 +736,6 @@ async fn wei_exact_curve_tricrypto2_native_eth() {
                     raw: eth_in,
                 },
                 Currency::Token(wbtc),
-                &route,
                 &quoted,
                 &opts,
             )
@@ -800,7 +788,6 @@ async fn wei_exact_curve_tricrypto2_native_eth() {
             .quote(&AssetAmount::new(wbtc, wbtc_in), &weth_asset)
             .expect("pool must quote WBTC→ETH (via WETH slot)");
 
-        let route = Route::new_single_hop(wbtc, weth_asset, TradeType::ExactIn);
         let prepared = exe
             .build_swap(
                 &cfg,
@@ -809,7 +796,6 @@ async fn wei_exact_curve_tricrypto2_native_eth() {
                     raw: wbtc_in,
                 },
                 Currency::Native,
-                &route,
                 &quoted,
                 &opts,
             )
@@ -913,7 +899,6 @@ async fn wei_exact_twocrypto_ng_weth_to_tc_ng_token() {
             .quote(&AssetAmount::new(weth_asset, amt), &tc_ng_token)
             .expect("pool must quote WETH→TC_NG_TOKEN");
 
-        let route = Route::new_single_hop(weth_asset, tc_ng_token, TradeType::ExactIn);
         let prepared = exe
             .build_swap(
                 &cfg,
@@ -922,7 +907,6 @@ async fn wei_exact_twocrypto_ng_weth_to_tc_ng_token() {
                     raw: amt,
                 },
                 Currency::Token(tc_ng_token),
-                &route,
                 &quoted,
                 &opts,
             )

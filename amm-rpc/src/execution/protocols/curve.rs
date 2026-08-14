@@ -60,9 +60,9 @@ use crate::execution::{
     error::BuildError,
     executable::{Executable, Sealed},
     options::ExecutionOptions,
-    prepared::{PreparedSwap, Route},
+    prepared::PreparedSwap,
     protocols::common,
-    types::{Currency, CurrencyAmount, TradeType},
+    types::{Currency, CurrencyAmount},
 };
 
 // ── ABI ──────────────────────────────────────────────────────────────────────
@@ -135,7 +135,6 @@ impl Executable for CurvePool {
         ctx: &ChainConfig,
         amount_in: CurrencyAmount,
         to: Currency,
-        route: &Route,
         quoted_out: &AssetAmount,
         opts: &ExecutionOptions,
     ) -> Result<PreparedSwap, BuildError> {
@@ -154,21 +153,13 @@ impl Executable for CurvePool {
             return Err(BuildError::UnsupportedProtocol);
         }
 
-        // resolve_swap validates trade type, membership, recipient, deadline.
+        // resolve_swap validates membership, recipient, deadline.
         // For native-in/out it maps Currency::Native → ctx.weth and sets
         // r.native_in / r.native_out. coin_indices then finds the WETH slot.
         // Curve's classic `exchange` ignores recipient and deadline at the ABI
         // level, but we still enforce they are resolved (prevents callers from
         // omitting resolution accidentally).
-        let r = common::resolve_swap(
-            ctx,
-            self,
-            amount_in.currency,
-            to,
-            route,
-            opts,
-            TradeType::ExactIn,
-        )?;
+        let r = common::resolve_swap(ctx, self, amount_in.currency, to, opts)?;
 
         // Shared prologue: extract pool address, coin indices, and min-out.
         // Only the calldata bytes differ between ABI families.
@@ -265,7 +256,6 @@ impl Executable for CurvePool {
         _ctx: &ChainConfig,
         _amount_out: CurrencyAmount,
         _from: Currency,
-        _route: &Route,
         _quoted_in: &AssetAmount,
         _opts: &ExecutionOptions,
     ) -> Result<PreparedSwap, BuildError> {
@@ -294,8 +284,7 @@ mod tests {
         error::BuildError,
         executable::{Executable, as_executable},
         options::{Deadline, ExecutionOptions, Recipient},
-        prepared::Route,
-        types::{Currency, CurrencyAmount, TradeType},
+        types::{Currency, CurrencyAmount},
     };
 
     // ── constants ─────────────────────────────────────────────────────────────
@@ -450,8 +439,6 @@ mod tests {
 
         let amount_in_raw = U256::from(1_000_000_000_000_000_000u64); // 1 DAI (18 dec)
         let quoted_out = AssetAmount::new(usdc(), U256::from(1_000_000_000_000_000_000u64));
-        let route = Route::new_single_hop(dai(), usdc(), TradeType::ExactIn);
-
         let prepared = pool
             .build_swap(
                 &c,
@@ -460,7 +447,6 @@ mod tests {
                     raw: amount_in_raw,
                 },
                 Currency::Token(usdc()),
-                &route,
                 &quoted_out,
                 &opts,
             )
@@ -538,8 +524,6 @@ mod tests {
         // Quoted output: 0.5 WETH (18 dec, synthetic — only slippage math matters
         // for encoder unit test; actual quote is tested by fork proof)
         let quoted_out = AssetAmount::new(weth(), U256::from(500_000_000_000_000_000u64));
-        let route = Route::new_single_hop(usdt(), weth(), TradeType::ExactIn);
-
         let prepared = pool
             .build_swap(
                 &c,
@@ -548,7 +532,6 @@ mod tests {
                     raw: amount_in_raw,
                 },
                 Currency::Token(weth()),
-                &route,
                 &quoted_out,
                 &opts,
             )
@@ -628,7 +611,6 @@ mod tests {
                     raw: U256::from(500_000_000u64),
                 },
                 Currency::Token(wbtc()),
-                &Route::new_single_hop(usdt(), wbtc(), TradeType::ExactIn),
                 &AssetAmount::new(wbtc(), U256::from(1_000_000u64)),
                 &opts,
             )
@@ -670,7 +652,6 @@ mod tests {
                     raw: U256::from(100u64),
                 },
                 Currency::Token(usdc()),
-                &Route::new_single_hop(dai(), usdc(), TradeType::ExactIn),
                 &AssetAmount::new(usdc(), U256::from(100u64)),
                 &opts,
             )
@@ -694,7 +675,6 @@ mod tests {
                     raw: U256::from(100u64),
                 },
                 Currency::Token(usdc()),
-                &Route::new_single_hop(weth(), usdc(), TradeType::ExactIn),
                 &AssetAmount::new(usdc(), U256::from(100u64)),
                 &opts,
             )
@@ -718,7 +698,6 @@ mod tests {
                     raw: U256::from(100u64),
                 },
                 Currency::Native,
-                &Route::new_single_hop(dai(), weth(), TradeType::ExactIn),
                 &AssetAmount::new(weth(), U256::from(100u64)),
                 &opts,
             )
@@ -742,7 +721,6 @@ mod tests {
                     raw: U256::from(100u64),
                 },
                 Currency::Token(dai()),
-                &Route::new_single_hop(dai(), usdc(), TradeType::ExactOut),
                 &AssetAmount::new(dai(), U256::from(100u64)),
                 &opts,
             )
@@ -779,7 +757,6 @@ mod tests {
                     raw: U256::from(100u64),
                 },
                 Currency::Token(usdc()),
-                &Route::new_single_hop(dai(), usdc(), TradeType::ExactIn),
                 &AssetAmount::new(usdc(), U256::from(100u64)),
                 &opts,
             )
@@ -857,8 +834,6 @@ mod tests {
 
         let amount_in_raw = U256::from(1_000_000u64); // 1 USDC-NG (6 dec)
         let quoted_out = AssetAmount::new(crvusd(), U256::from(1_000_000_000_000_000_000u64));
-        let route = Route::new_single_hop(usdc_ng(), crvusd(), TradeType::ExactIn);
-
         let prepared = pool
             .build_swap(
                 &c,
@@ -867,7 +842,6 @@ mod tests {
                     raw: amount_in_raw,
                 },
                 Currency::Token(crvusd()),
-                &route,
                 &quoted_out,
                 &opts,
             )
@@ -917,8 +891,6 @@ mod tests {
 
         let amount_in_raw = U256::from(100_000_000_000_000_000u64); // 0.1 WETH
         let quoted_out = AssetAmount::new(tc_ng_token(), U256::from(1_000_000_000_000_000_000u64));
-        let route = Route::new_single_hop(weth(), tc_ng_token(), TradeType::ExactIn);
-
         let prepared = pool
             .build_swap(
                 &c,
@@ -927,7 +899,6 @@ mod tests {
                     raw: amount_in_raw,
                 },
                 Currency::Token(tc_ng_token()),
-                &route,
                 &quoted_out,
                 &opts,
             )
@@ -996,8 +967,6 @@ mod tests {
 
         let amount_in_raw = U256::from(100_000_000_000_000_000u64); // 0.1 WETH
         let quoted_out = AssetAmount::new(tc_ng_token(), U256::from(1_000_000_000_000_000_000u64));
-        let route = Route::new_single_hop(weth(), tc_ng_token(), TradeType::ExactIn);
-
         let prepared = pool
             .build_swap(
                 &c,
@@ -1006,7 +975,6 @@ mod tests {
                     raw: amount_in_raw,
                 },
                 Currency::Token(tc_ng_token()),
-                &route,
                 &quoted_out,
                 &opts,
             )
@@ -1041,8 +1009,6 @@ mod tests {
         let quoted_out = AssetAmount::new(wbtc(), U256::from(5_000_000u64)); // synthetic
         // Route uses weth() as the canonical from-asset (what resolve_swap sees
         // after mapping Native→weth()); the route from/to assets must be members.
-        let route = Route::new_single_hop(weth(), wbtc(), TradeType::ExactIn);
-
         let prepared = pool
             .build_swap(
                 &c,
@@ -1051,7 +1017,6 @@ mod tests {
                     raw: dx,
                 },
                 Currency::Token(wbtc()),
-                &route,
                 &quoted_out,
                 &opts,
             )
@@ -1096,8 +1061,6 @@ mod tests {
 
         let dx = U256::from(5_000_000u64); // 0.05 WBTC (8 dec)
         let quoted_out = AssetAmount::new(weth(), U256::from(1_000_000_000_000_000_000u64));
-        let route = Route::new_single_hop(wbtc(), weth(), TradeType::ExactIn);
-
         let prepared = pool
             .build_swap(
                 &c,
@@ -1106,7 +1069,6 @@ mod tests {
                     raw: dx,
                 },
                 Currency::Native,
-                &route,
                 &quoted_out,
                 &opts,
             )
@@ -1164,7 +1126,6 @@ mod tests {
                     raw: U256::from(1_000u64),
                 },
                 Currency::Token(usdc()),
-                &Route::new_single_hop(weth(), usdc(), TradeType::ExactIn),
                 &AssetAmount::new(usdc(), U256::from(1_000u64)),
                 &opts,
             )
@@ -1180,7 +1141,6 @@ mod tests {
                     raw: U256::from(1_000u64),
                 },
                 Currency::Native,
-                &Route::new_single_hop(dai(), weth(), TradeType::ExactIn),
                 &AssetAmount::new(weth(), U256::from(1_000u64)),
                 &opts,
             )

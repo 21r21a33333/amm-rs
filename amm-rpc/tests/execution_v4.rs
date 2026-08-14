@@ -30,10 +30,9 @@ use amm_core::primitives::ratio::Bps;
 use amm_core::protocols::uniswap::v4::Hooks;
 use amm_core::slippage::Slippage;
 use amm_core::traits::pool::Pool;
-use amm_rpc::execution::prepared::Route;
 use amm_rpc::execution::{
     ChainConfig, Currency, CurrencyAmount, Deadline, ExecutionOptions, Recipient, Routers,
-    TradeType, as_executable,
+    as_executable,
 };
 use amm_rpc::protocols::uniswap_v4::{UniswapV4Source, V4PoolConfig};
 use amm_rpc::source::StateSource;
@@ -185,7 +184,6 @@ async fn wei_exact_v4_native_directions() {
             .quote(&AssetAmount::new(eth, eth_in), &usdc)
             .expect("pool must quote ETH→USDC");
 
-        let route = Route::new_single_hop(eth, usdc, TradeType::ExactIn);
         let prepared = exe
             .build_swap(
                 &cfg,
@@ -194,7 +192,6 @@ async fn wei_exact_v4_native_directions() {
                     raw: eth_in,
                 },
                 Currency::Token(usdc),
-                &route,
                 &quoted,
                 &opts,
             )
@@ -244,7 +241,6 @@ async fn wei_exact_v4_native_directions() {
             .quote(&AssetAmount::new(usdc, usdc_in), &eth)
             .expect("pool must quote USDC→ETH");
 
-        let route = Route::new_single_hop(usdc, eth, TradeType::ExactIn);
         let prepared = exe
             .build_swap(
                 &cfg,
@@ -253,7 +249,6 @@ async fn wei_exact_v4_native_directions() {
                     raw: usdc_in,
                 },
                 Currency::Native,
-                &route,
                 &quoted,
                 &opts,
             )
@@ -454,7 +449,6 @@ async fn wei_exact_v4_weth_pool_wrap_directions() {
 
         // Route: weth_asset → usdc, so the encoder sees a WETH-pool swap with
         // native ETH as the caller's currency.
-        let route = Route::new_single_hop(weth_asset, usdc, TradeType::ExactIn);
         let prepared = exe
             .build_swap(
                 &cfg,
@@ -463,7 +457,6 @@ async fn wei_exact_v4_weth_pool_wrap_directions() {
                     raw: eth_in,
                 },
                 Currency::Token(usdc),
-                &route,
                 &quoted,
                 &opts,
             )
@@ -532,7 +525,6 @@ async fn wei_exact_v4_weth_pool_wrap_directions() {
             .quote(&AssetAmount::new(usdc, usdc_in), &weth_asset)
             .expect("pool must quote USDC→WETH (native-out unwrap direction)");
 
-        let route = Route::new_single_hop(usdc, weth_asset, TradeType::ExactIn);
         let prepared = exe
             .build_swap(
                 &cfg,
@@ -541,7 +533,6 @@ async fn wei_exact_v4_weth_pool_wrap_directions() {
                     raw: usdc_in,
                 },
                 Currency::Native,
-                &route,
                 &quoted,
                 &opts,
             )
@@ -630,7 +621,6 @@ async fn wei_exact_v4_weth_pool_wrap_directions() {
             .quote_exact_out(&AssetAmount::new(usdc, usdc_out), &weth_asset)
             .expect("pool must quote exact-out USDC←WETH (native-in wrap direction)");
 
-        let route = Route::new_single_hop(weth_asset, usdc, TradeType::ExactOut);
         let prepared = exe
             .build_swap_exact_out(
                 &cfg,
@@ -639,7 +629,6 @@ async fn wei_exact_v4_weth_pool_wrap_directions() {
                     raw: usdc_out,
                 },
                 Currency::Native,
-                &route,
                 &quoted_in,
                 &opts,
             )
@@ -751,7 +740,6 @@ async fn v4_exact_in_delivers_to_distinct_recipient() {
         .quote(&AssetAmount::new(eth, eth_in), &usdc)
         .expect("pool must quote ETH→USDC");
 
-    let route = Route::new_single_hop(eth, usdc, TradeType::ExactIn);
     let prepared = exe
         .build_swap(
             &cfg,
@@ -760,7 +748,6 @@ async fn v4_exact_in_delivers_to_distinct_recipient() {
                 raw: eth_in,
             },
             Currency::Token(usdc),
-            &route,
             &quoted,
             &opts,
         )

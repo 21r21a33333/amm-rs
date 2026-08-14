@@ -14,9 +14,9 @@ use crate::execution::{
     error::BuildError,
     multicall::encode_multicall,
     options::ExecutionOptions,
-    prepared::{PreparedSwap, Route},
+    prepared::PreparedSwap,
     protocols::common,
-    types::{Currency, CurrencyAmount, TradeType},
+    types::{Currency, CurrencyAmount},
 };
 
 /// Solidity `address(2)` — "keep funds in the router" so a following unwrapWETH9 forwards ETH.
@@ -81,28 +81,18 @@ fn wrap(enc: &impl SwapRouter02, deadline: U256, calls: Vec<Bytes>) -> Result<By
 
 /// Exact-in build shared by the family. `pool` is the `&dyn Pool` for membership
 /// checks; `enc` supplies the protocol-specific encoding.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_exact_in(
     enc: &impl SwapRouter02,
     pool: &dyn Pool,
     ctx: &ChainConfig,
     amount_in: CurrencyAmount,
     to: Currency,
-    route: &Route,
     quoted_out: &AssetAmount,
     opts: &ExecutionOptions,
 ) -> Result<PreparedSwap, BuildError> {
-    let r = common::resolve_swap(
-        ctx,
-        pool,
-        amount_in.currency,
-        to,
-        route,
-        opts,
-        TradeType::ExactIn,
-    )?;
-    let sqrt_limit =
-        common::resolve_sqrt_limit(pool.assets(), opts.price_limit.as_ref(), route.hops.len())?;
+    let r = common::resolve_swap(ctx, pool, amount_in.currency, to, opts)?;
+    // Single-hop build_exact_in always has 2 hops; multi-hop rejection lives in the planner.
+    let sqrt_limit = common::resolve_sqrt_limit(pool.assets(), opts.price_limit.as_ref(), 2)?;
 
     let min = opts.slippage.min_amount_out(quoted_out);
     let router = enc.router(ctx)?;
@@ -196,28 +186,18 @@ pub(crate) fn build_exact_in(
 }
 
 /// Exact-out build shared by the family.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_exact_out(
     enc: &impl SwapRouter02,
     pool: &dyn Pool,
     ctx: &ChainConfig,
     amount_out: CurrencyAmount,
     from: Currency,
-    route: &Route,
     quoted_in: &AssetAmount,
     opts: &ExecutionOptions,
 ) -> Result<PreparedSwap, BuildError> {
-    let r = common::resolve_swap(
-        ctx,
-        pool,
-        from,
-        amount_out.currency,
-        route,
-        opts,
-        TradeType::ExactOut,
-    )?;
-    let sqrt_limit =
-        common::resolve_sqrt_limit(pool.assets(), opts.price_limit.as_ref(), route.hops.len())?;
+    let r = common::resolve_swap(ctx, pool, from, amount_out.currency, opts)?;
+    // Single-hop build_exact_out always has 2 hops; multi-hop rejection lives in the planner.
+    let sqrt_limit = common::resolve_sqrt_limit(pool.assets(), opts.price_limit.as_ref(), 2)?;
 
     let max = opts.slippage.max_amount_in(quoted_in);
     let router = enc.router(ctx)?;

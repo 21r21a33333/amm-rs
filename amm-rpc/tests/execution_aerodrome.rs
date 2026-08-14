@@ -28,10 +28,9 @@ use amm_core::primitives::ratio::Bps;
 use amm_core::protocols::aerodrome::BASE_POOL_FACTORY;
 use amm_core::slippage::Slippage;
 use amm_core::traits::pool::Pool;
-use amm_rpc::execution::prepared::Route;
 use amm_rpc::execution::{
     ChainConfig, Currency, CurrencyAmount, Deadline, ExecutionOptions, Recipient, Routers,
-    TradeType, as_executable,
+    as_executable,
 };
 use amm_rpc::source::StateSource;
 
@@ -194,7 +193,6 @@ async fn wei_exact_aerodrome_all_directions() {
             .quote(&AssetAmount::new(usdc, amt), &weth)
             .expect("volatile pool must quote USDC→WETH");
 
-        let route = Route::new_single_hop(usdc, weth, TradeType::ExactIn);
         let prepared = volatile_exe
             .build_swap(
                 &cfg,
@@ -203,7 +201,6 @@ async fn wei_exact_aerodrome_all_directions() {
                     raw: amt,
                 },
                 Currency::Token(weth),
-                &route,
                 &quoted,
                 &opts,
             )
@@ -251,7 +248,6 @@ async fn wei_exact_aerodrome_all_directions() {
             .quote(&AssetAmount::new(weth, eth_in), &usdc)
             .expect("volatile pool must quote WETH→USDC");
 
-        let route = Route::new_single_hop(weth, usdc, TradeType::ExactIn);
         let prepared = volatile_exe
             .build_swap(
                 &cfg,
@@ -260,7 +256,6 @@ async fn wei_exact_aerodrome_all_directions() {
                     raw: eth_in,
                 },
                 Currency::Token(usdc),
-                &route,
                 &quoted,
                 &opts,
             )
@@ -302,7 +297,6 @@ async fn wei_exact_aerodrome_all_directions() {
             .quote(&AssetAmount::new(usdc, amt), &weth)
             .expect("volatile pool must quote USDC→WETH");
 
-        let route = Route::new_single_hop(usdc, weth, TradeType::ExactIn);
         let prepared = volatile_exe
             .build_swap(
                 &cfg,
@@ -311,7 +305,6 @@ async fn wei_exact_aerodrome_all_directions() {
                     raw: amt,
                 },
                 Currency::Native,
-                &route,
                 &quoted,
                 &opts,
             )
@@ -362,7 +355,6 @@ async fn wei_exact_aerodrome_all_directions() {
             .quote(&AssetAmount::new(usdc, amt), &usdbc)
             .expect("stable pool must quote USDC→USDbC");
 
-        let route = Route::new_single_hop(usdc, usdbc, TradeType::ExactIn);
         let prepared = stable_exe
             .build_swap(
                 &cfg,
@@ -371,7 +363,6 @@ async fn wei_exact_aerodrome_all_directions() {
                     raw: amt,
                 },
                 Currency::Token(usdbc),
-                &route,
                 &quoted,
                 &opts,
             )

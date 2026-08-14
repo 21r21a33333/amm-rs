@@ -1,6 +1,7 @@
 //! The build-layer error: typed and total — no panics on caller input.
 
 use amm_core::primitives::asset::{AssetId, ChainId};
+use amm_core::primitives::pool::PoolKind;
 
 /// Which contract address is absent for a given chain.
 ///
@@ -76,6 +77,29 @@ pub enum BuildError {
     /// A calldata encoding step produced a value that overflows its target type.
     #[error("numeric overflow encoding the swap")]
     Overflow,
+
+    /// The route contained no pools.
+    #[error("route has no pools")]
+    EmptyRoute,
+
+    /// The path and pool sequence are disjoint at hop `at` (either the asset
+    /// lengths don't match or the hop assets are not both in that pool).
+    #[error("route is disjoint at hop {at}")]
+    DisjointRoute {
+        /// Zero-based index of the first disjoint hop.
+        at: usize,
+    },
+
+    /// A native-ETH asset appeared at a non-endpoint position in the path.
+    #[error("native ETH at a non-endpoint position in the route")]
+    NativeIntermediate,
+
+    /// Exact-out was requested through a pool kind that cannot do it.
+    #[error("exact-out unsupported by {kind:?}")]
+    UnsupportedExactOut {
+        /// The pool kind that rejected the exact-out request.
+        kind: PoolKind,
+    },
 }
 
 #[cfg(test)]

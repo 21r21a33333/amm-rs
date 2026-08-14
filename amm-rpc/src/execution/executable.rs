@@ -14,7 +14,7 @@ use crate::execution::{
     config::ChainConfig,
     error::BuildError,
     options::ExecutionOptions,
-    prepared::{PreparedSwap, Route},
+    prepared::PreparedSwap,
     types::{Currency, CurrencyAmount},
 };
 
@@ -45,7 +45,6 @@ pub trait Executable: private::Sealed {
         ctx: &ChainConfig,
         amount_in: CurrencyAmount,
         to: Currency,
-        route: &Route,
         quoted_out: &AssetAmount,
         opts: &ExecutionOptions,
     ) -> Result<PreparedSwap, BuildError>;
@@ -62,7 +61,6 @@ pub trait Executable: private::Sealed {
         ctx: &ChainConfig,
         amount_out: CurrencyAmount,
         from: Currency,
-        route: &Route,
         quoted_in: &AssetAmount,
         opts: &ExecutionOptions,
     ) -> Result<PreparedSwap, BuildError>;

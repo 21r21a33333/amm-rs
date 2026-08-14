@@ -95,19 +95,17 @@ Turn a quote into ready-to-sign calldata:
 ```rust,ignore
 use amm_rpc::execution::{
     as_executable, ChainConfig, Currency, CurrencyAmount, Deadline, ExecutionOptions,
-    Recipient, Route, TradeType,
+    Recipient,
 };
 
 let opts = ExecutionOptions::new(Slippage::from_bps(Bps(50)))   // 0.5% floor
     .with_recipient(Recipient::To(sender))
     .with_deadline(Deadline::AtTimestamp(deadline));
-let route = Route::new_single_hop(usdc, weth, TradeType::ExactIn);
 
 let prepared = as_executable(pools[0].as_ref())?.build_swap(
     &cfg,                                                       // ChainConfig with router addresses
     CurrencyAmount { currency: Currency::Token(usdc), raw: amount_in },
     Currency::Token(weth),
-    &route,
     &out,                                                       // the quote, for the slippage floor
     &opts,
 )?;

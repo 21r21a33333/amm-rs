@@ -12,8 +12,8 @@ use crate::execution::{
     config::ChainConfig,
     error::BuildError,
     options::{Deadline, ExecutionOptions, Recipient},
-    prepared::{ApprovalRequirement, PreparedSwap, Route},
-    types::{Currency, TradeType, UnsignedTx},
+    prepared::{ApprovalRequirement, PreparedSwap},
+    types::{Currency, UnsignedTx},
 };
 
 /// Rightmost 20 bytes of an asset's 32-byte token id as an EVM address.
@@ -66,20 +66,14 @@ pub(crate) struct ResolvedSwap {
 /// Like [`resolve_swap`], but resolves `Currency::Native` to `native_asset`
 /// instead of `ctx.weth`. Uniswap V4 passes `AssetId(B256::ZERO)` (address(0))
 /// because V4 treats native ETH as a first-class currency, not WETH.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_swap_with(
     _ctx: &ChainConfig,
     pool: &dyn Pool,
     in_currency: Currency,
     out_currency: Currency,
-    route: &Route,
     opts: &ExecutionOptions,
-    expected: TradeType,
     native_asset: AssetId,
 ) -> Result<ResolvedSwap, BuildError> {
-    if route.trade_type != expected {
-        return Err(BuildError::UnsupportedProtocol);
-    }
     let native_in = in_currency.is_native();
     let native_out = out_currency.is_native();
     if native_in && native_out {
@@ -109,28 +103,17 @@ pub(crate) fn resolve_swap_with(
     })
 }
 
-/// Run the preamble shared by every encoder: trade-type guard, native↔native
-/// rejection, input/output resolution (Native→WETH), pool-membership+distinctness
-/// check, and recipient+deadline resolution.
+/// Run the preamble shared by every encoder: native↔native rejection,
+/// input/output resolution (Native→WETH), pool-membership+distinctness check,
+/// and recipient+deadline resolution.
 pub(crate) fn resolve_swap(
     ctx: &ChainConfig,
     pool: &dyn Pool,
     in_currency: Currency,
     out_currency: Currency,
-    route: &Route,
     opts: &ExecutionOptions,
-    expected: TradeType,
 ) -> Result<ResolvedSwap, BuildError> {
-    resolve_swap_with(
-        ctx,
-        pool,
-        in_currency,
-        out_currency,
-        route,
-        opts,
-        expected,
-        ctx.weth,
-    )
+    resolve_swap_with(ctx, pool, in_currency, out_currency, opts, ctx.weth)
 }
 
 /// Map the amm-core price converter's QuoteError into a BuildError.
@@ -217,8 +200,7 @@ mod tests {
     use crate::execution::{
         config::{ChainConfig, Routers},
         options::{Deadline, ExecutionOptions, Recipient},
-        prepared::Route,
-        types::{Currency, TradeType},
+        types::Currency,
     };
 
     fn chain_id() -> ChainId {
@@ -263,19 +245,11 @@ mod tests {
         let p = pool(a, b);
         let c = ctx();
         let opts = opts_resolved(Address::repeat_byte(0x55), 9_999_999, 50);
-        let route = Route::new_single_hop(a, b, TradeType::ExactOut);
 
-        let err = resolve_swap(
-            &c,
-            &p,
-            Currency::Token(a),
-            Currency::Token(b),
-            &route,
-            &opts,
-            TradeType::ExactIn,
-        )
-        .expect_err("wrong trade type must fail");
-        assert_eq!(err, BuildError::UnsupportedProtocol);
+        // Trade-type guard has been removed; verify a valid token swap succeeds.
+        // (The test name is kept for history.)
+        let result = resolve_swap(&c, &p, Currency::Token(a), Currency::Token(b), &opts);
+        assert!(result.is_ok(), "ExactIn on a valid token pool must succeed");
     }
 
     #[test]
@@ -285,18 +259,9 @@ mod tests {
         let p = pool(w, b);
         let c = ctx();
         let opts = opts_resolved(Address::repeat_byte(0x55), 9_999_999, 50);
-        let route = Route::new_single_hop(w, b, TradeType::ExactIn);
 
-        let err = resolve_swap(
-            &c,
-            &p,
-            Currency::Native,
-            Currency::Native,
-            &route,
-            &opts,
-            TradeType::ExactIn,
-        )
-        .expect_err("native→native must fail");
+        let err = resolve_swap(&c, &p, Currency::Native, Currency::Native, &opts)
+            .expect_err("native→native must fail");
         assert_eq!(err, BuildError::NativeMismatch);
     }
 
@@ -308,18 +273,9 @@ mod tests {
         let p = pool(a, b);
         let c = ctx();
         let opts = opts_resolved(Address::repeat_byte(0x55), 9_999_999, 50);
-        let route = Route::new_single_hop(a, unknown, TradeType::ExactIn);
 
-        let err = resolve_swap(
-            &c,
-            &p,
-            Currency::Token(a),
-            Currency::Token(unknown),
-            &route,
-            &opts,
-            TradeType::ExactIn,
-        )
-        .expect_err("unknown asset must fail");
+        let err = resolve_swap(&c, &p, Currency::Token(a), Currency::Token(unknown), &opts)
+            .expect_err("unknown asset must fail");
         assert!(matches!(err, BuildError::AssetNotInPool { .. }));
     }
 
@@ -330,18 +286,9 @@ mod tests {
         let p = pool(w, b);
         let c = ctx();
         let opts = opts_resolved(Address::repeat_byte(0x55), 9_999_999, 50);
-        let route = Route::new_single_hop(w, b, TradeType::ExactIn);
 
-        let r = resolve_swap(
-            &c,
-            &p,
-            Currency::Native,
-            Currency::Token(b),
-            &route,
-            &opts,
-            TradeType::ExactIn,
-        )
-        .expect("native-in resolve must succeed");
+        let r = resolve_swap(&c, &p, Currency::Native, Currency::Token(b), &opts)
+            .expect("native-in resolve must succeed");
 
         assert_eq!(r.input, w, "Native input must resolve to WETH");
         assert!(r.native_in, "native_in must be true");
@@ -356,16 +303,13 @@ mod tests {
         let p = pool(zero_asset, b);
         let c = ctx();
         let opts = opts_resolved(Address::repeat_byte(0x55), 9_999_999, 50);
-        let route = Route::new_single_hop(zero_asset, b, TradeType::ExactIn);
 
         let r = super::resolve_swap_with(
             &c,
             &p,
             Currency::Native,
             Currency::Token(b),
-            &route,
             &opts,
-            TradeType::ExactIn,
             zero_asset,
         )
         .expect("resolve_swap_with native_asset=zero must succeed");

@@ -25,7 +25,7 @@ use crate::execution::{
     error::BuildError,
     executable::{Executable, Sealed},
     options::ExecutionOptions,
-    prepared::{PreparedSwap, Route},
+    prepared::PreparedSwap,
     protocols::swaprouter02::{self, SingleParams, SwapRouter02},
     types::{Currency, CurrencyAmount},
 };
@@ -123,11 +123,10 @@ impl Executable for AerodromeSlipstreamPool {
         ctx: &ChainConfig,
         amount_in: CurrencyAmount,
         to: Currency,
-        route: &Route,
         quoted_out: &AssetAmount,
         opts: &ExecutionOptions,
     ) -> Result<PreparedSwap, BuildError> {
-        swaprouter02::build_exact_in(self, self, ctx, amount_in, to, route, quoted_out, opts)
+        swaprouter02::build_exact_in(self, self, ctx, amount_in, to, quoted_out, opts)
     }
 
     fn build_swap_exact_out(
@@ -135,11 +134,10 @@ impl Executable for AerodromeSlipstreamPool {
         ctx: &ChainConfig,
         amount_out: CurrencyAmount,
         from: Currency,
-        route: &Route,
         quoted_in: &AssetAmount,
         opts: &ExecutionOptions,
     ) -> Result<PreparedSwap, BuildError> {
-        swaprouter02::build_exact_out(self, self, ctx, amount_out, from, route, quoted_in, opts)
+        swaprouter02::build_exact_out(self, self, ctx, amount_out, from, quoted_in, opts)
     }
 }
 
@@ -161,8 +159,7 @@ mod tests {
         error::BuildError,
         executable::Executable,
         options::{Deadline, ExecutionOptions, Recipient},
-        prepared::Route,
-        types::{Currency, CurrencyAmount, TradeType},
+        types::{Currency, CurrencyAmount},
     };
 
     // ─── test fixtures ───────────────────────────────────────────────────────
@@ -255,17 +252,8 @@ mod tests {
             raw: U256::from(500u64),
         };
         let quoted_out = AssetAmount::new(b, U256::from(1000u64));
-        let route = Route::new_single_hop(a, b, TradeType::ExactIn);
-
         let prepared = p
-            .build_swap(
-                &c,
-                amount_in,
-                Currency::Token(b),
-                &route,
-                &quoted_out,
-                &opts,
-            )
+            .build_swap(&c, amount_in, Currency::Token(b), &quoted_out, &opts)
             .expect("build_swap must succeed for ERC-20 exact-in");
 
         // tx.to == slipstream router, tx.value == 0
@@ -371,17 +359,8 @@ mod tests {
             raw: out_raw,
         };
         let quoted_in = AssetAmount::new(a, U256::from(500u64));
-        let route = Route::new_single_hop(a, b, TradeType::ExactOut);
-
         let prepared = p
-            .build_swap_exact_out(
-                &c,
-                amount_out,
-                Currency::Token(a),
-                &route,
-                &quoted_in,
-                &opts,
-            )
+            .build_swap_exact_out(&c, amount_out, Currency::Token(a), &quoted_in, &opts)
             .expect("build_swap_exact_out must succeed for ERC-20 exact-out");
 
         assert_eq!(
@@ -465,17 +444,8 @@ mod tests {
             raw: amount_in_raw,
         };
         let quoted_out = AssetAmount::new(b, U256::from(1000u64));
-        let route = Route::new_single_hop(w, b, TradeType::ExactIn);
-
         let prepared = p
-            .build_swap(
-                &c,
-                amount_in,
-                Currency::Token(b),
-                &route,
-                &quoted_out,
-                &opts,
-            )
+            .build_swap(&c, amount_in, Currency::Token(b), &quoted_out, &opts)
             .expect("native-in exact-in must succeed");
 
         assert_eq!(
@@ -537,10 +507,8 @@ mod tests {
             raw: amount_in_raw,
         };
         let quoted_out = AssetAmount::new(w, U256::from(1000u64));
-        let route = Route::new_single_hop(a, w, TradeType::ExactIn);
-
         let prepared = p
-            .build_swap(&c, amount_in, Currency::Native, &route, &quoted_out, &opts)
+            .build_swap(&c, amount_in, Currency::Native, &quoted_out, &opts)
             .expect("native-out exact-in must succeed");
 
         assert_eq!(
@@ -629,10 +597,8 @@ mod tests {
             raw: out_raw,
         };
         let quoted_in = AssetAmount::new(w, U256::from(500u64));
-        let route = Route::new_single_hop(w, b, TradeType::ExactOut);
-
         let prepared = p
-            .build_swap_exact_out(&c, amount_out, Currency::Native, &route, &quoted_in, &opts)
+            .build_swap_exact_out(&c, amount_out, Currency::Native, &quoted_in, &opts)
             .expect("native-in exact-out must succeed");
 
         // tx.value = max_amount_in = ceil(500 * 10100/10000) = 505
@@ -721,17 +687,8 @@ mod tests {
             raw: out_raw,
         };
         let quoted_in = AssetAmount::new(a, U256::from(500u64));
-        let route = Route::new_single_hop(a, w, TradeType::ExactOut);
-
         let prepared = p
-            .build_swap_exact_out(
-                &c,
-                amount_out,
-                Currency::Token(a),
-                &route,
-                &quoted_in,
-                &opts,
-            )
+            .build_swap_exact_out(&c, amount_out, Currency::Token(a), &quoted_in, &opts)
             .expect("native-out exact-out must succeed");
 
         assert_eq!(
@@ -819,10 +776,8 @@ mod tests {
             raw: U256::from(100u64),
         };
         let quoted_out = AssetAmount::new(w, U256::from(100u64));
-        let route = Route::new_single_hop(w, b, TradeType::ExactIn);
-
         let err = p
-            .build_swap(&c, amount_in, Currency::Native, &route, &quoted_out, &opts)
+            .build_swap(&c, amount_in, Currency::Native, &quoted_out, &opts)
             .expect_err("native→native must return NativeMismatch");
         assert_eq!(err, BuildError::NativeMismatch);
     }
@@ -840,10 +795,8 @@ mod tests {
             raw: U256::from(100u64),
         };
         let quoted_in = AssetAmount::new(w, U256::from(100u64));
-        let route = Route::new_single_hop(w, b, TradeType::ExactOut);
-
         let err = p
-            .build_swap_exact_out(&c, amount_out, Currency::Native, &route, &quoted_in, &opts)
+            .build_swap_exact_out(&c, amount_out, Currency::Native, &quoted_in, &opts)
             .expect_err("native→native exact-out must return NativeMismatch");
         assert_eq!(err, BuildError::NativeMismatch);
     }
@@ -866,17 +819,8 @@ mod tests {
             raw: U256::from(100u64),
         };
         let quoted_out = AssetAmount::new(b, U256::from(100u64));
-        let route = Route::new_single_hop(a, b, TradeType::ExactIn);
-
         let err = p
-            .build_swap(
-                &c,
-                amount_in,
-                Currency::Token(b),
-                &route,
-                &quoted_out,
-                &opts,
-            )
+            .build_swap(&c, amount_in, Currency::Token(b), &quoted_out, &opts)
             .expect_err("Sender recipient must fail");
         assert_eq!(err, BuildError::UnresolvedRecipient);
     }
@@ -901,77 +845,52 @@ mod tests {
             raw: U256::from(100u64),
         };
         let quoted_out = AssetAmount::new(b, U256::from(100u64));
-        let route = Route::new_single_hop(a, b, TradeType::ExactIn);
-
         let err = p
-            .build_swap(
-                &c,
-                amount_in,
-                Currency::Token(b),
-                &route,
-                &quoted_out,
-                &opts,
-            )
+            .build_swap(&c, amount_in, Currency::Token(b), &quoted_out, &opts)
             .expect_err("FromNow deadline must fail");
         assert_eq!(err, BuildError::UnresolvedDeadline);
     }
 
-    // ─── guard: wrong trade type → UnsupportedProtocol ──────────────────────
+    // ─── guard: native→native → NativeMismatch ──────────────────────────────
 
     #[test]
-    fn exact_out_route_in_build_swap_returns_unsupported_protocol() {
-        let a = asset(0x01);
+    fn both_native_in_build_swap_returns_native_mismatch() {
+        let w = weth_base();
         let b = asset(0x02);
-        let p = pool(a, b);
+        let p = pool(w, b);
         let c = ctx();
 
         let opts = opts_resolved(Address::repeat_byte(0x55), 9_999_999, 50);
         let amount_in = CurrencyAmount {
-            currency: Currency::Token(a),
+            currency: Currency::Native,
             raw: U256::from(100u64),
         };
         let quoted_out = AssetAmount::new(b, U256::from(100u64));
-        let route = Route::new_single_hop(a, b, TradeType::ExactOut); // wrong type
 
         let err = p
-            .build_swap(
-                &c,
-                amount_in,
-                Currency::Token(b),
-                &route,
-                &quoted_out,
-                &opts,
-            )
-            .expect_err("ExactOut route in build_swap must return UnsupportedProtocol");
-        assert_eq!(err, BuildError::UnsupportedProtocol);
+            .build_swap(&c, amount_in, Currency::Native, &quoted_out, &opts)
+            .expect_err("native→native in build_swap must return NativeMismatch");
+        assert_eq!(err, BuildError::NativeMismatch);
     }
 
     #[test]
-    fn exact_in_route_in_build_swap_exact_out_returns_unsupported_protocol() {
-        let a = asset(0x01);
+    fn both_native_in_build_swap_exact_out_returns_native_mismatch() {
+        let w = weth_base();
         let b = asset(0x02);
-        let p = pool(a, b);
+        let p = pool(w, b);
         let c = ctx();
 
         let opts = opts_resolved(Address::repeat_byte(0x55), 9_999_999, 50);
         let amount_out = CurrencyAmount {
-            currency: Currency::Token(b),
+            currency: Currency::Native,
             raw: U256::from(100u64),
         };
-        let quoted_in = AssetAmount::new(a, U256::from(100u64));
-        let route = Route::new_single_hop(a, b, TradeType::ExactIn); // wrong type
+        let quoted_in = AssetAmount::new(w, U256::from(100u64));
 
         let err = p
-            .build_swap_exact_out(
-                &c,
-                amount_out,
-                Currency::Token(a),
-                &route,
-                &quoted_in,
-                &opts,
-            )
-            .expect_err("ExactIn route in build_swap_exact_out must return UnsupportedProtocol");
-        assert_eq!(err, BuildError::UnsupportedProtocol);
+            .build_swap_exact_out(&c, amount_out, Currency::Native, &quoted_in, &opts)
+            .expect_err("native→native in build_swap_exact_out must return NativeMismatch");
+        assert_eq!(err, BuildError::NativeMismatch);
     }
 
     // ─── single-hop price_limit encodes non-zero sqrtPriceLimitX96 ──────────
@@ -997,17 +916,8 @@ mod tests {
             raw: U256::from(100u64),
         };
         let quoted_out = AssetAmount::new(b, U256::from(100u64));
-        let route = Route::new_single_hop(a, b, TradeType::ExactIn);
-
         let prepared = p
-            .build_swap(
-                &c,
-                amount_in,
-                Currency::Token(b),
-                &route,
-                &quoted_out,
-                &opts,
-            )
+            .build_swap(&c, amount_in, Currency::Token(b), &quoted_out, &opts)
             .expect("single-hop price_limit must succeed");
 
         // ERC-20 single call: raw exactInputSingle
@@ -1031,15 +941,16 @@ mod tests {
         );
     }
 
-    // ─── multi-hop price_limit → UnsupportedProtocol ────────────────────────
+    // ─── single-hop price_limit succeeds (multi-hop rejection is planner-side) ─
 
     #[test]
     fn multi_hop_price_limit_returns_unsupported_protocol() {
+        // Single-hop build always passes hops=2 to resolve_sqrt_limit; the
+        // multi-hop + price_limit rejection is a planner concern, not encoder-side.
         use amm_core::primitives::price::Price;
         use amm_core::primitives::ratio::Ratio;
 
         let a = asset(0x01);
-        let mid = asset(0x05);
         let b = asset(0x02);
         let p = pool(a, b);
         let c = ctx();
@@ -1055,20 +966,10 @@ mod tests {
             raw: U256::from(100u64),
         };
         let quoted_out = AssetAmount::new(b, U256::from(100u64));
-        let mut route = Route::new_single_hop(a, b, TradeType::ExactIn);
-        route.hops.insert(1, mid);
 
-        let err = p
-            .build_swap(
-                &c,
-                amount_in,
-                Currency::Token(b),
-                &route,
-                &quoted_out,
-                &opts,
-            )
-            .expect_err("multi-hop + price_limit must return UnsupportedProtocol");
-        assert_eq!(err, BuildError::UnsupportedProtocol);
+        // Single-hop + price_limit succeeds; hops=2 is always below the 3-hop gate.
+        p.build_swap(&c, amount_in, Currency::Token(b), &quoted_out, &opts)
+            .expect("single-hop + price_limit must succeed for Slipstream");
     }
 
     // ─── as_executable dispatch ──────────────────────────────────────────────

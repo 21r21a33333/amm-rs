@@ -27,10 +27,9 @@ use amm_core::primitives::pool::{ExchangeId, PoolKey};
 use amm_core::primitives::ratio::Bps;
 use amm_core::slippage::Slippage;
 use amm_core::traits::pool::Pool;
-use amm_rpc::execution::prepared::Route;
 use amm_rpc::execution::{
     ChainConfig, Currency, CurrencyAmount, Deadline, ExecutionOptions, Recipient, Routers,
-    TradeType, as_executable,
+    as_executable,
 };
 use amm_rpc::source::StateSource;
 
@@ -165,7 +164,6 @@ async fn wei_exact_slipstream_all_directions() {
             .quote(&AssetAmount::new(usdc, amt), &weth)
             .expect("pool must quote USDC→WETH");
 
-        let route = Route::new_single_hop(usdc, weth, TradeType::ExactIn);
         let prepared = exe
             .build_swap(
                 &cfg,
@@ -174,7 +172,6 @@ async fn wei_exact_slipstream_all_directions() {
                     raw: amt,
                 },
                 Currency::Token(weth),
-                &route,
                 &quoted,
                 &opts,
             )
@@ -223,7 +220,6 @@ async fn wei_exact_slipstream_all_directions() {
             .quote_exact_out(&AssetAmount::new(weth, target), &usdc)
             .expect("pool must quote exact-out WETH←USDC");
 
-        let route = Route::new_single_hop(usdc, weth, TradeType::ExactOut);
         let prepared = exe
             .build_swap_exact_out(
                 &cfg,
@@ -232,7 +228,6 @@ async fn wei_exact_slipstream_all_directions() {
                     raw: target,
                 },
                 Currency::Token(usdc),
-                &route,
                 &quoted_in,
                 &opts,
             )
@@ -294,7 +289,6 @@ async fn wei_exact_slipstream_all_directions() {
             .quote(&AssetAmount::new(weth, eth_in), &usdc)
             .expect("pool must quote WETH→USDC");
 
-        let route = Route::new_single_hop(weth, usdc, TradeType::ExactIn);
         let prepared = exe
             .build_swap(
                 &cfg,
@@ -303,7 +297,6 @@ async fn wei_exact_slipstream_all_directions() {
                     raw: eth_in,
                 },
                 Currency::Token(usdc),
-                &route,
                 &quoted,
                 &opts,
             )
@@ -345,7 +338,6 @@ async fn wei_exact_slipstream_all_directions() {
             .quote(&AssetAmount::new(usdc, amt), &weth)
             .expect("pool must quote USDC→WETH");
 
-        let route = Route::new_single_hop(usdc, weth, TradeType::ExactIn);
         let prepared = exe
             .build_swap(
                 &cfg,
@@ -354,7 +346,6 @@ async fn wei_exact_slipstream_all_directions() {
                     raw: amt,
                 },
                 Currency::Native,
-                &route,
                 &quoted,
                 &opts,
             )
@@ -412,7 +403,6 @@ async fn wei_exact_slipstream_all_directions() {
             .quote(&AssetAmount::new(usdc, large_amt), &weth)
             .expect("pool must quote large USDC→WETH");
 
-        let route = Route::new_single_hop(usdc, weth, TradeType::ExactIn);
         let prepared = exe
             .build_swap(
                 &cfg,
@@ -421,7 +411,6 @@ async fn wei_exact_slipstream_all_directions() {
                     raw: large_amt,
                 },
                 Currency::Token(weth),
-                &route,
                 &quoted,
                 &opts,
             )
