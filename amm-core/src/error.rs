@@ -6,6 +6,7 @@
 //! which is not a math failure. I/O errors live in the separate `amm-rpc` crate.
 
 use crate::primitives::asset::AssetId;
+use crate::primitives::pool::PoolId;
 
 /// A math error produced while quoting a swap or computing a price.
 ///
@@ -47,6 +48,12 @@ pub enum QuoteError {
     /// This pool does not support the requested operation (e.g. exact-out).
     #[error("operation unsupported by this pool")]
     Unsupported,
+    /// A pool on the path does not support exact-out solving.
+    #[error("pool {pool:?} does not support exact-out quoting")]
+    ExactOutUnavailable {
+        /// The pool that lacks exact-out capability.
+        pool: PoolId,
+    },
 }
 
 /// A string-parsing / construction error.
