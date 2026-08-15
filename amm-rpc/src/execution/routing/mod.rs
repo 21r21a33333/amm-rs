@@ -3,8 +3,9 @@
 //! just a 1-pool route. The planner (later tasks) turns a `Route` into
 //! encoded calldata by dispatching to per-pool `Executable` encoders.
 
-pub mod segment;
-pub use segment::{RouterKind, Segment, partition};
+pub mod family;
+pub mod router_span;
+pub use router_span::{RouterKind, RouterSpan, partition};
 
 use amm_core::primitives::asset::AssetId;
 use amm_core::traits::pool::Pool;

@@ -55,42 +55,42 @@ impl RouterKind {
 /// A maximal contiguous run of pools that share the same on-chain router.
 ///
 /// `pools` is an index range into `Route::pools`; it never contains the
-/// concrete pool references themselves so `Segment` is cheaply `Clone + Copy`.
+/// concrete pool references themselves so `RouterSpan` is cheaply `Clone + Copy`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Segment {
-    /// The router this segment will be submitted through.
+pub struct RouterSpan {
+    /// The router this span will be submitted through.
     pub kind: RouterKind,
     /// Half-open index range `[start, end)` into the parent route's pool list.
     pub pools: Range<usize>,
 }
 
-/// Partition `route.pools` into maximal same-router [`Segment`]s.
+/// Partition `route.pools` into maximal same-router [`RouterSpan`]s.
 ///
 /// The result is a total, ordered, gap-free partition of `0..route.pools.len()`:
-/// - `segments[0].pools.start == 0`
-/// - `segments.last().pools.end == route.pools.len()`
-/// - `segments[i].pools.end == segments[i+1].pools.start` for every adjacent pair
+/// - `spans[0].pools.start == 0`
+/// - `spans.last().pools.end == route.pools.len()`
+/// - `spans[i].pools.end == spans[i+1].pools.start` for every adjacent pair
 ///
 /// Returns [`BuildError::UnsupportedProtocol`] if any pool has no classifiable
 /// router (i.e. [`RouterKind::of`] returns `None`).
-pub fn partition(route: &Route<'_>) -> Result<Vec<Segment>, BuildError> {
-    let mut segments: Vec<Segment> = Vec::new();
+pub fn partition(route: &Route<'_>) -> Result<Vec<RouterSpan>, BuildError> {
+    let mut spans: Vec<RouterSpan> = Vec::new();
 
     for (i, pool) in route.pools.iter().enumerate() {
         let kind = RouterKind::of(*pool).ok_or(BuildError::UnsupportedProtocol)?;
 
-        // Extend the last segment when it already has this router kind;
-        // otherwise open a fresh segment at this index.
-        match segments.last_mut() {
-            Some(seg) if seg.kind == kind => seg.pools.end = i + 1,
-            _ => segments.push(Segment {
+        // Extend the last span when it already has this router kind;
+        // otherwise open a fresh span at this index.
+        match spans.last_mut() {
+            Some(span) if span.kind == kind => span.pools.end = i + 1,
+            _ => spans.push(RouterSpan {
                 kind,
                 pools: i..i + 1,
             }),
         }
     }
 
-    Ok(segments)
+    Ok(spans)
 }
 
 #[cfg(test)]
@@ -143,7 +143,7 @@ mod tests {
             _amount_in: &AssetAmount,
             _to: &AssetId,
         ) -> Result<AssetAmount, QuoteError> {
-            // Not exercised by segmentation tests.
+            // Not exercised by partition tests.
             Err(QuoteError::Unsupported)
         }
 
@@ -210,9 +210,9 @@ mod tests {
     }
 
     #[test]
-    fn contiguous_same_router_pools_form_one_segment() {
+    fn contiguous_same_router_pools_form_one_span() {
         // Route: V3, V4, CurveStable, AerodromeVolatile
-        // Expected segments: [Uni(0..2), Curve(2..3), Aero(3..4)]
+        // Expected spans: [Uni(0..2), Curve(2..3), Aero(3..4)]
         let v3 = univ3_pool();
         let v4 = univ4_pool();
         let crv = curve_pool();
@@ -246,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn segmentation_is_a_total_ordered_partition() {
+    fn partition_is_total_and_ordered() {
         let v3 = univ3_pool();
         let v4 = univ4_pool();
         let crv = curve_pool();
@@ -271,14 +271,14 @@ mod tests {
         assert_eq!(segs.first().unwrap().pools.start, 0);
         // Partition ends at the end of the pool list.
         assert_eq!(segs.last().unwrap().pools.end, route.pools.len());
-        // Adjacent segments are contiguous — no gaps, no overlaps.
+        // Adjacent spans are contiguous — no gaps, no overlaps.
         for w in segs.windows(2) {
             assert_eq!(w[0].pools.end, w[1].pools.start);
         }
     }
 
     #[test]
-    fn single_pool_route_yields_one_segment() {
+    fn single_pool_route_yields_one_span() {
         let v3 = univ3_pool();
         let route = Route {
             pools: vec![&v3],
@@ -292,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn all_same_router_pools_form_one_segment() {
+    fn all_same_router_pools_form_one_span() {
         let v2 = univ2_pool();
         let v3 = univ3_pool();
         let v4 = univ4_pool();
@@ -340,7 +340,7 @@ mod tests {
         assert_eq!(partition(&route), Err(BuildError::UnsupportedProtocol));
     }
 
-    /// Property: for any sequence of known router kinds the flattened segment
+    /// Property: for any sequence of known router kinds the flattened span
     /// ranges cover `0..n` exactly and are gap-free.
     #[test]
     fn property_partition_covers_all_pools_gap_free() {
@@ -377,7 +377,7 @@ mod tests {
             assert_eq!(segs.first().unwrap().pools.start, 0, "len={len}");
             // Partition ends at the pool count.
             assert_eq!(segs.last().unwrap().pools.end, len, "len={len}");
-            // No gaps between adjacent segments.
+            // No gaps between adjacent spans.
             for w in segs.windows(2) {
                 assert_eq!(w[0].pools.end, w[1].pools.start, "len={len}");
             }
@@ -385,9 +385,9 @@ mod tests {
             // Flattened kinds equal the input router-kind sequence.
             let flattened_kinds: Vec<RouterKind> = segs
                 .iter()
-                .flat_map(|seg| {
-                    let k = seg.kind;
-                    std::iter::repeat_n(k, seg.pools.len())
+                .flat_map(|span| {
+                    let k = span.kind;
+                    std::iter::repeat_n(k, span.pools.len())
                 })
                 .collect();
             let expected_kinds: Vec<RouterKind> =

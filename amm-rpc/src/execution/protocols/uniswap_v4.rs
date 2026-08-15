@@ -80,7 +80,7 @@ pub const ACTION_SETTLE_ALL: u8 = 0x0c;
 pub const ACTION_TAKE: u8 = 0x0e;
 
 /// V4 amount sentinel: take/settle the full open delta for the currency.
-const OPEN_DELTA: U256 = U256::ZERO;
+pub(crate) const OPEN_DELTA: U256 = U256::ZERO;
 
 /// Universal Router recipient sentinel: the router's own address.
 /// Used as the destination for `WRAP_ETH` so the wrapped WETH stays in the
@@ -102,7 +102,8 @@ pub const ACTIONS_EXACT_OUT: [u8; 3] =
 /// WETH balance, not from the user.
 ///
 /// `[SWAP_EXACT_IN_SINGLE, SETTLE, TAKE]`
-const ACTIONS_WRAP_EXACT_IN: [u8; 3] = [ACTION_SWAP_EXACT_IN_SINGLE, ACTION_SETTLE, ACTION_TAKE];
+pub(crate) const ACTIONS_WRAP_EXACT_IN: [u8; 3] =
+    [ACTION_SWAP_EXACT_IN_SINGLE, ACTION_SETTLE, ACTION_TAKE];
 
 /// Packed action sequence for an exact-out wrap swap: SETTLE from the router's
 /// WETH balance.
@@ -117,31 +118,31 @@ const ACTIONS_WRAP_EXACT_OUT: [u8; 3] = [ACTION_SWAP_EXACT_OUT_SINGLE, ACTION_SE
 
 /// `TAKE` param `(currency, recipient, OPEN_DELTA)`: move `currency`'s full
 /// positive delta to `recipient`. The swap action enforces the slippage floor.
-fn take_param(currency: Address, recipient: Address) -> Bytes {
+pub(crate) fn take_param(currency: Address, recipient: Address) -> Bytes {
     <(Address, Address, U256)>::abi_encode_params(&(currency, recipient, OPEN_DELTA)).into()
 }
 
 /// `SETTLE_ALL` param `(currency, amount)`: settle `currency` up to `amount`, paid
 /// by the user (Permit2 for an ERC-20, or tx.value for address(0) ETH).
-fn settle_all_param(currency: Address, amount: U256) -> Bytes {
+pub(crate) fn settle_all_param(currency: Address, amount: U256) -> Bytes {
     <(Address, U256)>::abi_encode_params(&(currency, amount)).into()
 }
 
 /// `SETTLE` param `(currency, OPEN_DELTA, payerIsUser=false)`: settle `currency`'s
 /// full debt from the router's balance — pays wrapped WETH after `WRAP_ETH`.
-fn settle_from_router_param(currency: Address) -> Bytes {
+pub(crate) fn settle_from_router_param(currency: Address) -> Bytes {
     <(Address, U256, bool)>::abi_encode_params(&(currency, OPEN_DELTA, false)).into()
 }
 
 /// `WRAP_ETH` command input `(ADDRESS_THIS, amount)`: wrap `amount` native ETH into
 /// WETH held by the router.
-fn wrap_eth_input(amount: U256) -> Bytes {
+pub(crate) fn wrap_eth_input(amount: U256) -> Bytes {
     <(Address, U256)>::abi_encode_params(&(ADDRESS_THIS, amount)).into()
 }
 
 /// `UNWRAP_WETH` command input `(recipient, min_out)`: unwrap the router's WETH to
 /// `recipient`, reverting below `min_out`.
-fn unwrap_weth_input(recipient: Address, min_out: U256) -> Bytes {
+pub(crate) fn unwrap_weth_input(recipient: Address, min_out: U256) -> Bytes {
     <(Address, U256)>::abi_encode_params(&(recipient, min_out)).into()
 }
 
@@ -193,7 +194,9 @@ sol! {
 ///
 /// `assets()[0]` is always `currency0` (numerically smaller); the pool stores
 /// them pre-sorted by the pool manager.
-fn build_pool_key(pool: &UniswapV4Pool) -> Result<(PoolKey, Address, Address), BuildError> {
+pub(crate) fn build_pool_key(
+    pool: &UniswapV4Pool,
+) -> Result<(PoolKey, Address, Address), BuildError> {
     let c0 = common::evm_addr(&pool.assets()[0]);
     let c1 = common::evm_addr(&pool.assets()[1]);
     let fee = U24::try_from(pool.key_fee()).map_err(|_| BuildError::Overflow)?;
@@ -210,7 +213,7 @@ fn build_pool_key(pool: &UniswapV4Pool) -> Result<(PoolKey, Address, Address), B
 
 /// Assemble the `V4_SWAP` input bytes:
 /// `abi.encode(bytes actions, bytes[] params)` via `abi_encode_params`.
-fn build_v4_swap_input(actions: &[u8], params: Vec<Bytes>) -> Bytes {
+pub(crate) fn build_v4_swap_input(actions: &[u8], params: Vec<Bytes>) -> Bytes {
     let actions_bytes = Bytes::from(actions.to_vec());
     <(Bytes, Vec<Bytes>)>::abi_encode_params(&(actions_bytes, params)).into()
 }

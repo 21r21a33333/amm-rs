@@ -11,8 +11,23 @@
 //! future multi-command routes (in-stream Permit2 permits, post-unwrap dust
 //! sweeps).
 
-use alloy::primitives::{Bytes, U256};
-use alloy::{sol, sol_types::SolCall};
+use alloy::primitives::{Address, Bytes, U256};
+use alloy::{
+    sol,
+    sol_types::{SolCall, SolValue},
+};
+
+/// UR command: Uniswap V3 exact-in swap.
+pub const V3_SWAP_EXACT_IN: u8 = 0x00;
+
+/// UR command: Uniswap V3 exact-out swap.
+pub const V3_SWAP_EXACT_OUT: u8 = 0x01;
+
+/// UR command: Uniswap V2 exact-in swap.
+pub const V2_SWAP_EXACT_IN: u8 = 0x08;
+
+/// UR command: Uniswap V2 exact-out swap.
+pub const V2_SWAP_EXACT_OUT: u8 = 0x09;
 
 /// Universal Router command byte: Uniswap V4 swap.
 pub const V4_SWAP: u8 = 0x10;
@@ -40,6 +55,90 @@ pub const PERMIT2_PERMIT: u8 = 0x0a;
 /// Forward-looking — not emitted by the current single-hop encoders; reserved for
 /// future multi-command routes (e.g. post-unwrap dust sweep).
 pub const SWEEP: u8 = 0x04;
+
+/// Amount sentinel: use the router's entire balance of the input token.
+///
+/// Equals 2^255 (top bit set). Limbs are little-endian 64-bit words, so limb[3]
+/// holds the most-significant word — setting it to `0x8000_0000_0000_0000` sets
+/// exactly bit 255.
+pub const CONTRACT_BALANCE: U256 = U256::from_limbs([0, 0, 0, 0x8000_0000_0000_0000]);
+
+/// Recipient sentinel: the transaction sender (`address(1)`).
+pub const MSG_SENDER: Address = Address::with_last_byte(1);
+
+/// Recipient sentinel: the router itself (`address(2)`), holds intermediates mid-route.
+pub const ADDRESS_THIS: Address = Address::with_last_byte(2);
+
+/// Encode a Uniswap V3 multi-hop path: `token ‖ fee(u24 be) ‖ token ‖ …`.
+///
+/// `fees.len() == tokens.len() - 1`. When `reversed`, emit the path back to
+/// front (exact-out requires the reversed path).
+pub fn v3_path(tokens: &[Address], fees: &[u32], reversed: bool) -> Bytes {
+    let mut out = Vec::with_capacity(tokens.len() * 20 + fees.len() * 3);
+    let push = |out: &mut Vec<u8>, tok: &Address, fee: Option<u32>| {
+        out.extend_from_slice(tok.as_slice());
+        if let Some(f) = fee {
+            out.extend_from_slice(&f.to_be_bytes()[1..4]); // low 3 bytes = u24
+        }
+    };
+    match reversed {
+        false => {
+            for (i, tok) in tokens.iter().enumerate() {
+                push(&mut out, tok, fees.get(i).copied());
+            }
+        }
+        true => {
+            for (i, tok) in tokens.iter().enumerate().rev() {
+                let fee = i.checked_sub(1).and_then(|j| fees.get(j).copied());
+                push(&mut out, tok, fee);
+            }
+        }
+    }
+    out.into()
+}
+
+/// V3 command input: `(recipient, amount, limit, path, payerIsUser)`. `amount`/
+/// `limit` are amountIn/amountOutMin (exact-in) or amountOut/amountInMax (exact-out).
+/// `_exact_in` is documentation-only — the caller selects swap direction via the
+/// command byte (`V3_SWAP_EXACT_IN` / `V3_SWAP_EXACT_OUT`), not this flag.
+pub fn v3_swap_input(
+    _exact_in: bool,
+    recipient: Address,
+    amount: U256,
+    limit: U256,
+    path: Bytes,
+    payer_is_user: bool,
+) -> Bytes {
+    <(Address, U256, U256, Bytes, bool)>::abi_encode_params(&(
+        recipient,
+        amount,
+        limit,
+        path,
+        payer_is_user,
+    ))
+    .into()
+}
+
+/// V2 command input: `(recipient, amount, limit, address[] path, payerIsUser)`.
+/// `_exact_in` is documentation-only — the caller selects swap direction via the
+/// command byte (`V2_SWAP_EXACT_IN` / `V2_SWAP_EXACT_OUT`), not this flag.
+pub fn v2_swap_input(
+    _exact_in: bool,
+    recipient: Address,
+    amount: U256,
+    limit: U256,
+    path: Vec<Address>,
+    payer_is_user: bool,
+) -> Bytes {
+    <(Address, U256, U256, Vec<Address>, bool)>::abi_encode_params(&(
+        recipient,
+        amount,
+        limit,
+        path,
+        payer_is_user,
+    ))
+    .into()
+}
 
 sol! {
     /// Minimal ABI surface for the Uniswap Universal Router.
@@ -158,5 +257,77 @@ mod tests {
         assert_eq!(UNWRAP_WETH, 0x0c);
         assert_eq!(PERMIT2_PERMIT, 0x0a);
         assert_eq!(SWEEP, 0x04);
+    }
+
+    #[test]
+    fn v2_v3_command_constants_have_expected_values() {
+        assert_eq!(V3_SWAP_EXACT_IN, 0x00);
+        assert_eq!(V3_SWAP_EXACT_OUT, 0x01);
+        assert_eq!(V2_SWAP_EXACT_IN, 0x08);
+        assert_eq!(V2_SWAP_EXACT_OUT, 0x09);
+        // Sentinels match Uniswap v4-periphery ActionConstants.
+        assert_eq!(ADDRESS_THIS, Address::with_last_byte(2));
+        assert_eq!(MSG_SENDER, Address::with_last_byte(1));
+        // CONTRACT_BALANCE == 2^255 (highest bit of U256).
+        assert_eq!(CONTRACT_BALANCE, U256::from(1u8) << 255);
+    }
+
+    #[test]
+    fn v3_path_encodes_forward_and_reversed() {
+        let t0 = Address::with_last_byte(0xA0);
+        let t1 = Address::with_last_byte(0xB1);
+        let t2 = Address::with_last_byte(0xC2);
+        let fwd = v3_path(&[t0, t1, t2], &[500, 3000], false);
+        // 20 + 3 + 20 + 3 + 20 = 66 bytes
+        assert_eq!(fwd.len(), 66);
+        assert_eq!(&fwd[0..20], t0.as_slice());
+        assert_eq!(&fwd[20..23], &[0x00, 0x01, 0xf4]); // 500 as u24 big-endian
+        assert_eq!(&fwd[23..43], t1.as_slice());
+        // reversed swaps token order and fee order
+        let rev = v3_path(&[t0, t1, t2], &[500, 3000], true);
+        assert_eq!(&rev[0..20], t2.as_slice());
+        assert_eq!(&rev[20..23], &[0x00, 0x0b, 0xb8]); // 3000 as u24
+    }
+
+    #[test]
+    fn v3_swap_input_round_trip() {
+        let recipient = Address::with_last_byte(0x11);
+        let amount = U256::from(1_000_000u64);
+        let limit = U256::from(900_000u64);
+        let path = Bytes::from(vec![0xaa, 0xbb, 0xcc]);
+        let payer_is_user = true;
+
+        let encoded = v3_swap_input(true, recipient, amount, limit, path.clone(), payer_is_user);
+        let decoded = <(Address, U256, U256, Bytes, bool)>::abi_decode_params(&encoded)
+            .expect("failed to decode V3 swap input");
+
+        assert_eq!(decoded.0, recipient);
+        assert_eq!(decoded.1, amount);
+        assert_eq!(decoded.2, limit);
+        assert_eq!(decoded.3, path);
+        assert_eq!(decoded.4, payer_is_user);
+    }
+
+    #[test]
+    fn v2_swap_input_round_trip() {
+        let recipient = Address::with_last_byte(0x22);
+        let amount = U256::from(2_000_000u64);
+        let limit = U256::from(1_800_000u64);
+        let path = vec![
+            Address::with_last_byte(0xA0),
+            Address::with_last_byte(0xA1),
+            Address::with_last_byte(0xA2),
+        ];
+        let payer_is_user = false;
+
+        let encoded = v2_swap_input(false, recipient, amount, limit, path.clone(), payer_is_user);
+        let decoded = <(Address, U256, U256, Vec<Address>, bool)>::abi_decode_params(&encoded)
+            .expect("failed to decode V2 swap input");
+
+        assert_eq!(decoded.0, recipient);
+        assert_eq!(decoded.1, amount);
+        assert_eq!(decoded.2, limit);
+        assert_eq!(decoded.3, path);
+        assert_eq!(decoded.4, payer_is_user);
     }
 }
