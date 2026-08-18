@@ -1,10 +1,13 @@
-//! Matrix vocabulary: `Case` model and execution outcome enums.
+//! Matrix vocabulary: `Case` and `PlanCase` models and execution outcome enums.
 //!
-//! Consumed by the runner (Task 7) and Phases 2–3 (case synthesis, execution).
+//! `Case` drives the single-hop runner (`run_case`); `PlanCase` drives the
+//! multi-hop plan harness (`run_plan_case`).  The two structs are kept separate
+//! so that adding multi-hop fields does not churn the single-hop matrix.
 
 use alloy::primitives::U256;
 use amm_core::primitives::asset::ChainId;
 use amm_rpc::execution::routing::ExactOutPolicy;
+use amm_rpc::execution::types::TradeType;
 
 /// Which token in the fixture is the input side of the trade.
 ///
@@ -85,6 +88,42 @@ pub enum BuildErrorKind {
     UnsupportedExactOut,
     UnsupportedProtocol,
     NativeIntermediate,
+}
+
+// ── Multi-hop plan case ────────────────────────────────────────────────────────
+
+/// One multi-hop execution proof: drives the public `Plan` executor against a
+/// revm fork and asserts the end-to-end output meets `expect`.
+///
+/// # Field invariants
+/// - `pools.len() + 1 == path.len()` — one token per boundary.
+/// - `path` entries are hex EVM addresses (e.g. `"0xa0b8…"`) interpreted by the
+///   runner as `AssetId`s via `asset(chain, addr.parse::<Address>())`.
+/// - `trade_type` is always `ExactIn` for Plan 3 (exact-out is Task 9).
+#[allow(dead_code)]
+pub struct PlanCase {
+    /// Human-readable label for assertion messages and logs.
+    pub name: &'static str,
+    /// EIP-155 chain identifier; determines which `ChainConfig` to build.
+    pub chain: ChainId,
+    /// Fixture names in hop order — each name must be present in `FIXTURES`.
+    /// `pools.len()` must equal `path.len() - 1`.
+    pub pools: &'static [&'static str],
+    /// Token addresses in hop order: `[in, hop₁, …, out]`.
+    /// Use canonical hex addresses (`"0x…"`) matching the fixture's token0/token1.
+    pub path: &'static [&'static str],
+    /// Raw input amount in the input token's base units (wei, µUSDC, …).
+    pub amount: U256,
+    /// Exact-in or exact-out; only `ExactIn` is supported by Plan 3.
+    pub trade_type: TradeType,
+    /// Whether the route's input edge is the chain's native token (ETH).
+    pub native_in: bool,
+    /// Whether the route's output edge should be unwrapped to native ETH.
+    pub native_out: bool,
+    /// Where the final output lands.
+    pub recipient: RecipientKind,
+    /// Asserted on-chain outcome for the end-to-end output.
+    pub expect: Expect,
 }
 
 #[allow(dead_code)]

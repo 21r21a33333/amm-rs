@@ -107,6 +107,22 @@ fn curve_cases() -> Vec<Case> {
             approval: ApprovalKind::Erc20,
             expect: Expect::WeiExact,
         },
+        // sUSD (StableSwapV0) DAI→USDC — verifies whether V0's on-chain exchange
+        // diverges from get_dy the same way 3pool (V1) does.
+        Case {
+            name: "curve_susd_v0_exact_in_dai_usdc",
+            chain: ChainId(1),
+            pools: &["curve_susd_v0"],
+            direction: Direction::Forward, // DAI → USDC
+            trade: Trade::ExactIn {
+                amount_in: U256::from(1_000_000_000_000_000_000_000u128), // 1 000 DAI (18 dp)
+            },
+            native_in: false,
+            native_out: false,
+            recipient: RecipientKind::Sender,
+            approval: ApprovalKind::Erc20,
+            expect: Expect::WeiExact,
+        },
         // Old test: wei_exact_curve_3pool_stable_i128, Direction 2 (USDC→USDT).
         // Mapped here as Reverse (USDC→DAI) since fixture token0=DAI, token1=USDC.
         // The original test swapped USDC→USDT (coin[1]→coin[2]); the matrix runner

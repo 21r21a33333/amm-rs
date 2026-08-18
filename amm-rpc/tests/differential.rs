@@ -1118,18 +1118,15 @@ mod curve {
                 dx: E18,
                 int128_indices: true,
             },
-            Case {
-                label: "curve V1 3pool DAI->USDC",
-                pool: address!("0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7"),
-                variant: CurveVariant::StableSwapV1,
-                coins: &[(DAI, 18), (USDC, 6), (USDT, 6)],
-                base_pool: None,
-                eth_variant: None,
-                i: 0,
-                j: 1,
-                dx: E18,
-                int128_indices: true,
-            },
+            // NOTE: curve V1 (3pool) is intentionally NOT differentiated against
+            // `get_dy` here. 3pool is the one Curve variant whose on-chain
+            // `exchange` (fee-before-denorm) diverges from its `get_dy` view
+            // (fee-after-denorm) by ≤1 wei, so our quote models `exchange` (the
+            // delivered output), not `get_dy`. Its wei-exactness vs the delivered
+            // swap is proven by the revm execution matrix (`execution_curve.rs`,
+            // `curve_susd_v0` + `curve_3pool` rows), which is the correct oracle
+            // for a delivery quote. All other variants have `get_dy == exchange`
+            // and stay differentiated against `get_dy` below.
             Case {
                 label: "curve V2 fraxusdc FRAX->USDC",
                 pool: address!("0xDcEF968d416a41Cdac0ED8702fAC8128A64241A2"),

@@ -17,3 +17,11 @@ missing_docs = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# Fork of curve-math with StableSwapV1 `get_amount_out` modeling the delivered
+# on-chain `exchange` output (fee-before-denorm) instead of the `get_dy` view,
+# making Curve 3pool-family *execution* wei-exact. Upstream PR:
+# https://github.com/sunce86/curve-math/pull/113
+[patch."https://github.com/sunce86/curve-math"]
+curve-math = { git = "https://github.com/21r21a33333/curve-math", branch = "fix/stableswap-v1-exchange-rounding" }
+curve-adapter = { git = "https://github.com/21r21a33333/curve-math", branch = "fix/stableswap-v1-exchange-rounding" }

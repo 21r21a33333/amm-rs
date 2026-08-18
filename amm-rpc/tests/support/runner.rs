@@ -1,17 +1,20 @@
-//! `run_case` — the single-hop execution engine for the matrix test suite.
+//! `run_case` / `run_plan_case` — single-hop and multi-hop execution engines.
 //!
-//! This module is the generalization of the per-protocol execution proofs in
+//! `run_case` is the generalization of the per-protocol execution proofs in
 //! `execution_v3.rs`, `execution_v4.rs`, and `execution_curve.rs`. It drives
 //! one [`Case`] row against a live revm fork and asserts the on-chain output
 //! equals (or beats) the off-chain quote to the wei.
 //!
+//! `run_plan_case` drives one [`PlanCase`] against the same fork by looping
+//! `Plan::next_tx`, funding only the first span's input token, and threading
+//! each span's observed output as the next span's input.  The final output is
+//! asserted against the `PlanCase::expect` contract.
+//!
 //! # Design
 //!
-//! * Single-hop only (Plan 3 adds the multi-hop seam via a public executor).
+//! * `run_case` is single-hop only; `run_plan_case` handles multi-hop via Plan.
 //! * Pure `match` dispatch throughout — no if/else chains.
-//! * Snapshot/revert is the caller's responsibility; the runner does a
-//!   snapshot before any state mutation and reverts unconditionally at the
-//!   end so that a `Vec<Case>` can share a single fork.
+//! * Snapshot/revert wraps the whole case; a `Vec<Case>` can share one fork.
 //! * Residue check is Uniswap-family only: Curve and Aerodrome call the pool
 //!   directly — no universal router holds intermediate funds.
 
@@ -19,12 +22,15 @@
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
-use amm_core::primitives::asset::AssetAmount;
-use amm_rpc::execution::{ChainConfig, Currency, CurrencyAmount, as_executable, error::BuildError};
+use amm_core::primitives::asset::{AssetAmount, AssetId};
+use amm_rpc::execution::routing::{ExactOutPolicy, RouterKind};
+use amm_rpc::execution::{
+    ChainConfig, Currency, CurrencyAmount, Recipient, as_executable, error::BuildError, plan,
+};
 
 use super::{
-    BuildErrorKind, Case, Direction, Expect, Fixture, RecipientKind, Trade, asset, exec_opts,
-    fixtures, fork::Fork,
+    BuildErrorKind, Case, Direction, Expect, Fixture, PlanCase, RecipientKind, Trade, asset,
+    exec_opts, fixtures, fork::Fork,
 };
 
 // ── Fixed impersonated addresses ──────────────────────────────────────────────
@@ -37,6 +43,24 @@ const DISTINCT_RECIPIENT: Address = Address::repeat_byte(0xD1);
 
 /// 1 ETH in wei — used as a headroom buffer for native-out and exact-out funding.
 const ONE_ETH: U256 = U256::from_limbs([1_000_000_000_000_000_000u64, 0, 0, 0]);
+
+/// Known ERC-20 `balanceOf` mapping slots by token address. Authoritative for
+/// funding a multi-hop route's first input, where the token may be a Curve
+/// pool's third coin (outside the two-token fixture struct). Returns `None` for
+/// tokens not in the table (the caller falls back to the fixture's slot).
+fn known_balance_slot(token: Address) -> Option<u64> {
+    use alloy::primitives::address;
+    // Ethereum mainnet + Base.
+    match token {
+        t if t == address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48") => Some(9), // USDC (ETH)
+        t if t == address!("6B175474E89094C44Da98b954EedeAC495271d0F") => Some(2), // DAI
+        t if t == address!("dAC17F958D2ee523a2206206994597C13D831ec7") => Some(2), // USDT
+        t if t == address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2") => Some(3), // WETH
+        t if t == address!("2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599") => Some(0), // WBTC
+        t if t == address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913") => Some(9), // USDC (Base)
+        _ => None,
+    }
+}
 
 // ── Public entry-point ────────────────────────────────────────────────────────
 
@@ -74,24 +98,12 @@ where
     // ── Build currencies ──────────────────────────────────────────────────────
 
     let chain = case.chain.0;
-    let in_currency = resolve_currency(chain, in_token, case.native_in);
-    let out_currency = resolve_currency(chain, out_token, case.native_out);
-
-    // Asset IDs used for quoting are the pool's ACTUAL currencies from the
-    // fixture — WETH for WETH-holding pools (V2/V3/V4-WETH), address(0) for a
-    // native-ETH V4 pool. The `native_in`/`native_out` flags only change the
-    // `Currency` handed to the builder (wrap/unwrap) and the funding path; they
-    // must not rewrite the quote asset (resolving native→WETH would look up WETH
-    // in a pool that holds address(0) and fail with AssetNotInPool).
-    let in_asset_id = asset(chain, in_token.addr);
-    let out_asset_id = asset(chain, out_token.addr);
+    let (in_currency, out_currency, in_asset_id, out_asset_id) =
+        resolve_swap_currencies(chain, in_token, out_token, case);
 
     // ── Recipient ─────────────────────────────────────────────────────────────
 
-    let recipient = match case.recipient {
-        RecipientKind::Sender => SENDER,
-        RecipientKind::Distinct => DISTINCT_RECIPIENT,
-    };
+    let recipient = resolve_recipient(&case.recipient);
 
     let opts = exec_opts(SENDER).with_recipient(amm_rpc::execution::Recipient::To(recipient));
 
@@ -103,64 +115,17 @@ where
 
     let exe = as_executable(pool.as_ref()).expect("pool must be Executable");
 
-    let build_result = match &case.trade {
-        Trade::ExactIn { amount_in } => {
-            let quoted = pool
-                .quote(&AssetAmount::new(in_asset_id, *amount_in), &out_asset_id)
-                .expect("pool must produce an exact-in quote");
-
-            let result = exe.build_swap(
-                cfg,
-                CurrencyAmount {
-                    currency: in_currency,
-                    raw: *amount_in,
-                },
-                out_currency,
-                &quoted,
-                &opts,
-            );
-            // Carry the quoted output amount so the outcome asserter can use it.
-            result.map(|p| (p, quoted.raw))
-        }
-
-        Trade::ExactOut {
-            amount_out,
-            policy: _,
-        } => {
-            // Attempt exact-out via the pool's reverse quoter. If the pool
-            // does not implement ExactOut, build_swap_exact_out will return
-            // UnsupportedExactOut — which is the expected error for RejectBuild
-            // cases. For pools that do support it we get the input ceiling.
-            //
-            // `policy` is ExactOutPolicy; for single-hop the only behavioural
-            // distinction is Strict vs OrBetter, which maps to whether we error
-            // or execute-as-exact-in. Since build_swap_exact_out is the pool's
-            // own path (no multi-hop routing), the policy is informational here;
-            // the runner delegates fully to the Executable API and the outcome
-            // assertion handles Exact vs AtLeast accordingly.
-            let quoted_in = match pool.as_exact_out() {
-                Some(eo) => eo
-                    .quote_exact_out(&AssetAmount::new(out_asset_id, *amount_out), &in_asset_id)
-                    .expect("exact-out quoter must produce an input estimate"),
-                // No ExactOut support: let build_swap_exact_out return the
-                // typed error so RejectBuild cases catch it cleanly.
-                None => AssetAmount::new(in_asset_id, U256::ZERO),
-            };
-
-            let result = exe.build_swap_exact_out(
-                cfg,
-                CurrencyAmount {
-                    currency: out_currency,
-                    raw: *amount_out,
-                },
-                in_currency,
-                &quoted_in,
-                &opts,
-            );
-            // The expected output for exact-out is the exact target amount.
-            result.map(|p| (p, *amount_out))
-        }
-    };
+    let build_result = build_swap_result(
+        exe,
+        cfg,
+        pool.as_ref(),
+        in_currency,
+        out_currency,
+        in_asset_id,
+        out_asset_id,
+        &opts,
+        case,
+    );
 
     // ── Negative case: builder must reject ────────────────────────────────────
 
@@ -231,27 +196,8 @@ where
 
     // ── ExactOut input-spend bound check ──────────────────────────────────────
 
-    // Verify the sender did not over-spend the input token beyond the
-    // max_spent ceiling declared in the prepared swap. Mirrors
-    // execution_v3.rs:247-256 (`assert!(usdc_spent <= max_spent)`).
-    //
-    // Native-in note: gas_price=0, so the sender's ETH delta equals the amount
-    // actually consumed by the router (the router refunds any unused WETH back
-    // as ETH). The before/after native balance therefore cleanly measures spend.
     if let (Some(in_before), Trade::ExactOut { .. }) = (in_before_exact_out, &case.trade) {
-        if let Some(ms) = &prepared.max_spent {
-            let in_after = match case.native_in {
-                true => fork.native_balance(SENDER),
-                false => fork.erc20_balance(in_token.addr, SENDER),
-            };
-            let spent = in_before - in_after;
-            assert!(
-                spent <= ms.raw,
-                "{}: input spent {spent} exceeds max_spent {}",
-                case.name,
-                ms.raw
-            );
-        }
+        assert_exact_out_spend(fork, in_token, case, &prepared, in_before);
     }
 
     // ── Residue check (Uniswap-family only) ───────────────────────────────────
@@ -262,11 +208,9 @@ where
     if let Ok(router) = cfg.router_universal() {
         // Skip residue for native addresses (address(0)) — those are not ERC-20.
         let mut residue_tokens: Vec<Address> = Vec::new();
-        if in_token.addr != Address::ZERO {
-            residue_tokens.push(in_token.addr);
-        }
-        if out_token.addr != Address::ZERO && out_token.addr != in_token.addr {
-            residue_tokens.push(out_token.addr);
+        push_residue_token(&mut residue_tokens, in_token.addr);
+        if out_token.addr != in_token.addr {
+            push_residue_token(&mut residue_tokens, out_token.addr);
         }
         if !residue_tokens.is_empty() {
             fork.assert_zero_residue(router, &residue_tokens);
@@ -288,6 +232,498 @@ where
     // ── Revert so subsequent cases start from clean state ─────────────────────
 
     fork.revert(snap);
+}
+
+// ── Multi-hop plan harness ────────────────────────────────────────────────────
+
+/// Execute `case` against `fork` under `cfg`, driving the public `Plan`
+/// executor's `next_tx` loop and asserting the end-to-end output satisfies
+/// `case.expect`.
+///
+/// # Flow
+///
+/// 1. Refresh all `case.pools` at the fork's block.
+/// 2. Build a `Route` via `make_route`; resolve path addresses to `AssetId`s.
+/// 3. Construct `Plan` via `amm_rpc::execution::plan`.
+/// 4. Fund **only** the first span's input (intermediates flow through the sender).
+/// 5. Loop: for each span — auto-detect and apply approval, submit, read the
+///    span's output delta, pass it as `observed` to the next call.
+/// 6. After the loop: assert the final recipient's end-to-end delta vs `case.expect`;
+///    assert zero residue on the Universal Router for each Uniswap span's tokens.
+/// 7. Snapshot/revert wraps the whole case.
+///
+/// # Panics
+///
+/// * When a fixture name is unknown.
+/// * When the path address cannot be parsed.
+/// * When `plan()` returns an error (bad route or unsupported protocol).
+/// * When any span's transaction reverts.
+pub async fn run_plan_case<P>(fork: &mut Fork<P>, cfg: &ChainConfig, case: &PlanCase)
+where
+    P: Provider + Clone,
+{
+    // ── Snapshot before any mutation ──────────────────────────────────────────
+    let snap = fork.snapshot();
+
+    // ── Resolve path addresses to AssetId ────────────────────────────────────
+    let path = resolve_path(case);
+
+    // ── Refresh all pools at this fork's block ────────────────────────────────
+    let block = fork.block_number();
+    let pool_boxes = super::route::refresh_pools(case.pools, fork.provider().clone(), block).await;
+    let pool_refs: Vec<&dyn amm_core::traits::pool::Pool> =
+        pool_boxes.iter().map(|b| b.as_ref()).collect();
+
+    // ── Build route + plan ────────────────────────────────────────────────────
+    let route = super::route::make_route(pool_refs, path.clone(), case.trade_type);
+
+    // Recipient: Sender → SENDER, Distinct → DISTINCT_RECIPIENT.
+    let recipient = resolve_recipient(&case.recipient);
+
+    // Execution options: 50 bps slippage, explicit recipient, far-future deadline.
+    // The deadline must be an AbsoluteTimestamp so `plan()` can resolve it once.
+    let opts = exec_opts(SENDER).with_recipient(Recipient::To(recipient));
+
+    let mut p = plan(
+        cfg,
+        &route,
+        case.amount,
+        &opts,
+        SENDER,
+        case.native_in,
+        case.native_out,
+        ExactOutPolicy::Strict,
+    )
+    .unwrap_or_else(|e| panic!("PlanCase {}: plan() failed: {e:?}", case.name));
+
+    // ── Fund the FIRST span's input only ──────────────────────────────────────
+    fund_first_span(fork, case, &path);
+
+    // ── Collect the spans before entering the loop ────────────────────────────
+    // We need the span list to determine each span's output token index and
+    // whether it is Uniswap-family (for zero-residue assertions later).
+    // Plan::spans() was added as a minimal public accessor for this purpose.
+    let spans: Vec<_> = p.spans().to_vec();
+    let tx_count = p.tx_count();
+
+    // ── Track the final recipient's output delta end-to-end ──────────────────
+    // Read the output-side balance before submitting any span; compare after
+    // the loop to get the true end-to-end delta.
+    let final_out_token_addr: Address = Address::from_word(path[path.len() - 1].token);
+    let final_balance_before = match case.native_out {
+        true => fork.native_balance(recipient),
+        false => fork.erc20_balance(final_out_token_addr, recipient),
+    };
+
+    // ── Drive the Plan loop ───────────────────────────────────────────────────
+    let observed = drive_spans(fork, cfg, &mut p, &spans, tx_count, recipient, case, &path);
+
+    // ── Assert end-to-end output ──────────────────────────────────────────────
+    // Read the final recipient's balance now and diff against the snapshot
+    // taken before any span was submitted.
+    let final_balance_after = match case.native_out {
+        true => fork.native_balance(recipient),
+        false => fork.erc20_balance(final_out_token_addr, recipient),
+    };
+    let total_delta = final_balance_after - final_balance_before;
+
+    // The quoted final output from `plan` is `observed.raw` after the loop
+    // (the last span's on-chain output is exact for exact-in).
+    let expected_out = observed.as_ref().map(|a| a.raw).unwrap_or(U256::ZERO);
+
+    assert_outcome(&case.expect, total_delta, expected_out, case.name);
+
+    // ── Distinct-recipient isolation ──────────────────────────────────────────
+    assert_distinct_isolation_plan(fork, case, final_out_token_addr);
+
+    // ── Zero-residue check for Uniswap spans ──────────────────────────────────
+    assert_uniswap_residue_plan(fork, cfg, &spans, &path);
+
+    // ── Revert so subsequent cases start from clean state ─────────────────────
+    fork.revert(snap);
+}
+
+// ── Private helpers — shared ──────────────────────────────────────────────────
+
+/// Map `RecipientKind` to the impersonated address used in EVM submissions.
+/// `Sender` → `SENDER`; `Distinct` → `DISTINCT_RECIPIENT`.
+/// Byte-identical in both `run_case` and `run_plan_case`; lifted here to avoid
+/// duplication.
+fn resolve_recipient(kind: &RecipientKind) -> Address {
+    match kind {
+        RecipientKind::Sender => SENDER,
+        RecipientKind::Distinct => DISTINCT_RECIPIENT,
+    }
+}
+
+/// Push `addr` onto `v` only when it is non-zero (not native ETH) and not
+/// already present.  Used by both residue collectors to avoid double-checking
+/// the same token.
+fn push_residue_token(v: &mut Vec<Address>, addr: Address) {
+    if addr != Address::ZERO && !v.contains(&addr) {
+        v.push(addr);
+    }
+}
+
+// ── Private helpers — run_case ────────────────────────────────────────────────
+
+/// Resolve the `Currency`, `AssetId` pair for in/out sides of a single-hop swap.
+///
+/// Asset IDs used for quoting are the pool's ACTUAL currencies from the
+/// fixture — WETH for WETH-holding pools (V2/V3/V4-WETH), address(0) for a
+/// native-ETH V4 pool. The `native_in`/`native_out` flags only change the
+/// `Currency` handed to the builder (wrap/unwrap) and the funding path; they
+/// must not rewrite the quote asset (resolving native→WETH would look up WETH
+/// in a pool that holds address(0) and fail with AssetNotInPool).
+fn resolve_swap_currencies(
+    chain: u64,
+    in_token: &super::fixtures::TokenInfo,
+    out_token: &super::fixtures::TokenInfo,
+    case: &Case,
+) -> (Currency, Currency, AssetId, AssetId) {
+    let in_currency = resolve_currency(chain, in_token, case.native_in);
+    let out_currency = resolve_currency(chain, out_token, case.native_out);
+    let in_asset_id = asset(chain, in_token.addr);
+    let out_asset_id = asset(chain, out_token.addr);
+    (in_currency, out_currency, in_asset_id, out_asset_id)
+}
+
+/// Build the swap and carry the expected output amount.
+///
+/// Owns the entire `match &case.trade { ExactIn.. / ExactOut.. }` build block
+/// including the reverse-quote sub-block for exact-out.  Returns
+/// `(prepared, expected_out)` on success, or a `BuildError` on the path that
+/// the `RejectBuild` assertion catches.
+#[allow(clippy::too_many_arguments)]
+fn build_swap_result(
+    exe: &dyn amm_rpc::execution::Executable,
+    cfg: &ChainConfig,
+    pool: &dyn amm_core::traits::pool::Pool,
+    in_currency: Currency,
+    out_currency: Currency,
+    in_asset_id: AssetId,
+    out_asset_id: AssetId,
+    opts: &amm_rpc::execution::ExecutionOptions,
+    case: &Case,
+) -> Result<(amm_rpc::execution::PreparedSwap, U256), BuildError> {
+    match &case.trade {
+        Trade::ExactIn { amount_in } => {
+            let quoted = pool
+                .quote(&AssetAmount::new(in_asset_id, *amount_in), &out_asset_id)
+                .expect("pool must produce an exact-in quote");
+
+            let result = exe.build_swap(
+                cfg,
+                CurrencyAmount {
+                    currency: in_currency,
+                    raw: *amount_in,
+                },
+                out_currency,
+                &quoted,
+                opts,
+            );
+            // Carry the quoted output amount so the outcome asserter can use it.
+            result.map(|p| (p, quoted.raw))
+        }
+
+        Trade::ExactOut {
+            amount_out,
+            policy: _,
+        } => {
+            // Attempt exact-out via the pool's reverse quoter. If the pool
+            // does not implement ExactOut, build_swap_exact_out will return
+            // UnsupportedExactOut — which is the expected error for RejectBuild
+            // cases. For pools that do support it we get the input ceiling.
+            //
+            // `policy` is ExactOutPolicy; for single-hop the only behavioural
+            // distinction is Strict vs OrBetter, which maps to whether we error
+            // or execute-as-exact-in. Since build_swap_exact_out is the pool's
+            // own path (no multi-hop routing), the policy is informational here;
+            // the runner delegates fully to the Executable API and the outcome
+            // assertion handles Exact vs AtLeast accordingly.
+            let quoted_in = match pool.as_exact_out() {
+                Some(eo) => eo
+                    .quote_exact_out(&AssetAmount::new(out_asset_id, *amount_out), &in_asset_id)
+                    .expect("exact-out quoter must produce an input estimate"),
+                // No ExactOut support: let build_swap_exact_out return the
+                // typed error so RejectBuild cases catch it cleanly.
+                None => AssetAmount::new(in_asset_id, U256::ZERO),
+            };
+
+            let result = exe.build_swap_exact_out(
+                cfg,
+                CurrencyAmount {
+                    currency: out_currency,
+                    raw: *amount_out,
+                },
+                in_currency,
+                &quoted_in,
+                opts,
+            );
+            // The expected output for exact-out is the exact target amount.
+            result.map(|p| (p, *amount_out))
+        }
+    }
+}
+
+/// Assert the ExactOut max-spent bound: the actual input spent must not exceed
+/// `prepared.max_spent`.
+///
+/// Mirrors execution_v3.rs:247-256 (`assert!(usdc_spent <= max_spent)`).
+///
+/// Native-in note: gas_price=0, so the sender's ETH delta equals the amount
+/// actually consumed by the router (the router refunds any unused WETH back
+/// as ETH). The before/after native balance therefore cleanly measures spend.
+fn assert_exact_out_spend<P>(
+    fork: &mut Fork<P>,
+    in_token: &super::fixtures::TokenInfo,
+    case: &Case,
+    prepared: &amm_rpc::execution::PreparedSwap,
+    in_before: U256,
+) where
+    P: Provider + Clone,
+{
+    if let Some(ms) = &prepared.max_spent {
+        let in_after = match case.native_in {
+            true => fork.native_balance(SENDER),
+            false => fork.erc20_balance(in_token.addr, SENDER),
+        };
+        let spent = in_before - in_after;
+        assert!(
+            spent <= ms.raw,
+            "{}: input spent {spent} exceeds max_spent {}",
+            case.name,
+            ms.raw
+        );
+    }
+}
+
+// ── Private helpers — run_plan_case ──────────────────────────────────────────
+
+/// Parse `case.path` hex addresses into chain-scoped `AssetId`s.
+///
+/// `case.path` entries are hex EVM addresses; parse each to `Address` then
+/// build the chain-scoped `AssetId` used by the pool and routing layers.
+fn resolve_path(case: &PlanCase) -> Vec<AssetId> {
+    let chain = case.chain.0;
+    case.path
+        .iter()
+        .map(|hex| {
+            let addr: Address = hex
+                .parse()
+                .unwrap_or_else(|_| panic!("PlanCase {}: invalid address {hex}", case.name));
+            asset(chain, addr)
+        })
+        .collect()
+}
+
+/// Fund the first span's input token only.
+///
+/// Subsequent spans receive their input from the previous span's output which
+/// lands on SENDER.  Only the first span's input must be pre-funded.
+///
+/// Resolves the input token's balance slot via `known_balance_slot` first
+/// (authoritative for Curve third-coin inputs), then falls back to the
+/// fixture's two-token match.
+fn fund_first_span<P>(fork: &mut Fork<P>, case: &PlanCase, path: &[AssetId])
+where
+    P: Provider + Clone,
+{
+    let first_token_addr: Address = Address::from_word(path[0].token);
+    let first_fx = fixtures::fixture(case.pools[0]);
+    // Resolve the input token's balance slot. A 2-token fixture's token0/token1
+    // covers most pools, but a 3-coin Curve pool's input may be its third coin
+    // (not token0/token1) — so consult the known-slots table by address first,
+    // falling back to the fixture's two-token match.
+    let first_token_slot = known_balance_slot(first_token_addr).unwrap_or(
+        match first_token_addr == first_fx.token0.addr {
+            true => first_fx.token0.balance_slot,
+            false => first_fx.token1.balance_slot,
+        },
+    );
+
+    match case.native_in {
+        true => {
+            // native_in: fund native ETH with 2× amount + 1 ETH headroom.
+            fork.fund_native(SENDER, case.amount * U256::from(2u64) + ONE_ETH);
+        }
+        false => {
+            // ERC-20 input: slot-inject 2× amount and verify the read-back.
+            fork.fund_erc20_verified(
+                SENDER,
+                first_token_addr,
+                first_token_slot,
+                case.amount * U256::from(2u64),
+            );
+            // Also seed a small ETH buffer so the EVM does not reject the tx.
+            fork.fund_native(SENDER, ONE_ETH);
+        }
+    }
+}
+
+/// Drive the `Plan::next_tx` loop, applying approvals and submitting each span.
+///
+/// Returns the last `observed` `AssetAmount` after the loop (the final span's
+/// on-chain output), or `None` if the plan produced zero transactions.
+#[allow(clippy::too_many_arguments)]
+fn drive_spans<P>(
+    fork: &mut Fork<P>,
+    cfg: &ChainConfig,
+    p: &mut amm_rpc::execution::Plan<'_>,
+    spans: &[amm_rpc::execution::routing::RouterSpan],
+    tx_count: usize,
+    recipient: Address,
+    case: &PlanCase,
+    path: &[AssetId],
+) -> Option<AssetAmount>
+where
+    P: Provider + Clone,
+{
+    let mut observed: Option<AssetAmount> = None;
+    let mut span_idx: usize = 0;
+
+    while let Some(tx) = p.next_tx(observed).unwrap_or_else(|e| {
+        panic!(
+            "PlanCase {}: next_tx span {span_idx} failed: {e:?}",
+            case.name
+        )
+    }) {
+        let span = &spans[span_idx];
+        let is_last = span_idx == tx_count - 1;
+
+        // ── Approval auto-detect ──────────────────────────────────────────────
+        // Each span declares its own approval requirement in `tx.approval`.
+        // Uniswap UR spans use Permit2; single-pool V3/Curve/Aero spans approve
+        // the router/pool contract directly.
+        if let Some(req) = &tx.approval {
+            let token = Address::from_word(req.token.token);
+            let permit2_addr = cfg.permit2().unwrap_or_default();
+            match req.spender == permit2_addr {
+                true => {
+                    // Uniswap Universal Router path: ERC-20 → Permit2 → UR.
+                    fork.permit2_approve(
+                        SENDER,
+                        token,
+                        req.spender,    // permit2
+                        super::dsl::UR, // UR is the Permit2 downstream spender
+                        req.min_allowance,
+                        1_000_000_000_000u64, // far-future expiration that fits uint48
+                    );
+                }
+                false => {
+                    // Direct-approval path (V3 router, Aerodrome router, …).
+                    fork.approve(SENDER, token, req.spender, req.min_allowance);
+                }
+            }
+        }
+
+        // ── Determine this span's output token and recipient ──────────────────
+        // `span.pools.end` is the boundary index into `route.path` for this
+        // span's output token.  For the last span, that is the route end;
+        // for earlier spans it is an intermediate token that lands on SENDER.
+        let out_token_idx = span.pools.end;
+        let out_asset_id = path[out_token_idx];
+        let out_token_addr = Address::from_word(out_asset_id.token);
+
+        // Balance of the span's output party before submission.
+        // Non-final spans deliver to SENDER; the final span to the recipient.
+        let span_recipient = match is_last {
+            true => recipient,
+            false => SENDER,
+        };
+        let balance_before = match is_last && case.native_out {
+            true => fork.native_balance(span_recipient),
+            false => fork.erc20_balance(out_token_addr, span_recipient),
+        };
+
+        // ── Submit ────────────────────────────────────────────────────────────
+        assert!(
+            fork.submit(SENDER, &tx.tx),
+            "PlanCase {}: span {} reverted",
+            case.name,
+            span_idx,
+        );
+
+        // ── Measure output delta ──────────────────────────────────────────────
+        let balance_after = match is_last && case.native_out {
+            true => fork.native_balance(span_recipient),
+            false => fork.erc20_balance(out_token_addr, span_recipient),
+        };
+        let delta = balance_after - balance_before;
+
+        // The observed output becomes the next span's input amount.
+        observed = Some(AssetAmount::new(out_asset_id, delta));
+        span_idx += 1;
+    }
+
+    observed
+}
+
+/// Assert the distinct-recipient isolation invariant for `run_plan_case`.
+///
+/// When the recipient is Distinct, assert the SENDER did not receive the
+/// final output (only intermediate tokens should pass through SENDER).
+fn assert_distinct_isolation_plan<P>(
+    fork: &mut Fork<P>,
+    case: &PlanCase,
+    final_out_token_addr: Address,
+) where
+    P: Provider + Clone,
+{
+    if matches!(case.recipient, RecipientKind::Distinct) {
+        // We only check the final output token here; intermediate residue is
+        // covered by the zero-residue check below for Uniswap spans.
+        let sender_out_after = match case.native_out {
+            true => fork.native_balance(SENDER),
+            false => fork.erc20_balance(final_out_token_addr, SENDER),
+        };
+        // SENDER was seeded with ONE_ETH for gas; only assert ERC-20 isolation.
+        if !case.native_out {
+            // After all spans complete, the SENDER should not hold any of the
+            // final output token (the last span paid the distinct recipient).
+            assert_eq!(
+                sender_out_after,
+                U256::ZERO,
+                "PlanCase {}: SENDER must not receive final output when recipient is Distinct",
+                case.name,
+            );
+        }
+    }
+}
+
+/// Assert zero residue on the Universal Router for all Uniswap-family spans.
+///
+/// The Universal Router may hold intermediate token balances while executing
+/// a multi-hop swap; those must be fully swept.  Check after all spans.
+fn assert_uniswap_residue_plan<P>(
+    fork: &mut Fork<P>,
+    cfg: &ChainConfig,
+    spans: &[amm_rpc::execution::routing::RouterSpan],
+    path: &[AssetId],
+) where
+    P: Provider + Clone,
+{
+    if let Ok(router) = cfg.router_universal() {
+        // Collect intermediate tokens touched by each Uniswap-family span.
+        // Span boundaries: path[span.pools.start..=span.pools.end].
+        // We check every non-zero ERC-20 address in those boundary slots.
+        let mut residue_tokens: Vec<Address> = Vec::new();
+        for span in spans {
+            if span.kind != RouterKind::UniswapUniversal {
+                // Non-Uniswap spans do not route through the UR.
+                continue;
+            }
+            // Check all tokens that this Uniswap span could hold:
+            // input (path[start]), any intermediates, and output (path[end]).
+            for asset_id in path.iter().take(span.pools.end + 1).skip(span.pools.start) {
+                let addr = Address::from_word(asset_id.token);
+                push_residue_token(&mut residue_tokens, addr);
+            }
+        }
+        if !residue_tokens.is_empty() {
+            fork.assert_zero_residue(router, &residue_tokens);
+        }
+    }
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────

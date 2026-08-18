@@ -140,6 +140,7 @@ pub struct Fixture {
 const DAI: Address = address!("6B175474E89094C44Da98b954EedeAC495271d0F");
 const USDC_MAINNET: Address = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
 const USDT: Address = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+const SUSD: Address = address!("57Ab1ec28D129707052df4dF418D58a2D46d5f51");
 const WETH_MAINNET: Address = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
 const WBTC: Address = address!("2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599");
 const CRVUSD: Address = address!("f939E0A03FB07F59A73314E73794Be0E57ac1b4E");
@@ -149,6 +150,7 @@ const TC_NG_TOKEN: Address = address!("1cfa5641c01406aB8AC350dEd7d735ec41298372"
 const V2_USDC_WETH_PAIR: Address = address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc");
 const V3_USDC_WETH_POOL: Address = address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640");
 const CURVE_3POOL: Address = address!("bEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7");
+const CURVE_SUSD: Address = address!("A5407eAE9Ba41422680e2e00537571bcC53efBfD");
 const CURVE_TRICRYPTO2: Address = address!("D51a44d3FaE010294C616388b506AcdA1bfAAE46");
 const CURVE_STABLE_NG: Address = address!("4DEcE678ceceb27446b35C672dC7d61F30bAD69E");
 const CURVE_TWOCRYPTO_NG: Address = address!("592878b920101946fb5915ab97961bc546f211cc");
@@ -186,6 +188,9 @@ const AERO_FACTORY_BASE: Address = address!("420DD381b31aEf6683db6B902084cB0FFEC
 static COINS_3POOL: &[Address] = &[DAI, USDC_MAINNET, USDT];
 #[cfg(feature = "curve")]
 static DECIMALS_3POOL: &[u8] = &[18, 6, 6];
+// sUSD pool (StableSwapV0) coins: DAI, USDC, USDT, sUSD.
+static COINS_SUSD: &[Address] = &[DAI, USDC_MAINNET, USDT, SUSD];
+static DECIMALS_SUSD: &[u8] = &[18, 6, 6, 18];
 
 #[cfg(feature = "curve")]
 static COINS_TRICRYPTO2: &[Address] = &[USDT, WBTC, WETH_MAINNET];
@@ -251,12 +256,11 @@ pub static FIXTURES: LazyLock<Vec<Fixture>> = LazyLock::new(|| {
             default_block: 20_000_000,
         },
         // Multi-hop hop-2 pool (WETH/USDT 0.05% on mainnet).
-        // TODO(verify-on-fork): confirm address AND token0/token1 order at the pinned block.
+        // WETH/USDT 0.3% pool on mainnet (verified on-fork: token0=WETH,
+        // token1=USDT, fee=3000). Address-sorted: WETH 0xC02a… < USDT 0xdAC1….
         Fixture {
-            name: "weth_usdt_v3_005",
+            name: "weth_usdt_v3",
             chain: ChainId(1),
-            // Canonical WETH/USDT 0.05% pool on mainnet (address-sorted).
-            // WETH 0xC02a… < USDT 0xdAC1… → token0 = WETH, token1 = USDT.
             pool: address!("4e68Ccd3E89f51C3074ca5072bbAC773960dFa36"),
             token0: TokenInfo {
                 addr: WETH_MAINNET,
@@ -268,11 +272,11 @@ pub static FIXTURES: LazyLock<Vec<Fixture>> = LazyLock::new(|| {
                 decimals: 6,
                 balance_slot: SLOT_USDT,
             },
-            adapter: Adapter::UniswapV3 { fee: 500 },
+            adapter: Adapter::UniswapV3 { fee: 3000 },
             default_block: 20_000_000,
         },
-        // Multi-hop hop-2 pool (DAI/USDC 0.01% on mainnet).
-        // TODO(verify-on-fork): confirm address/slot at pinned block 20_000_000.
+        // DAI/USDC 0.01% pool on mainnet (verified on-fork: token0=DAI,
+        // token1=USDC, fee=100).
         Fixture {
             name: "dai_usdc_v3",
             chain: ChainId(1),
@@ -442,6 +446,29 @@ pub static FIXTURES: LazyLock<Vec<Fixture>> = LazyLock::new(|| {
                 variant: CurveVariant::StableSwapV1,
                 coins: COINS_3POOL,
                 decimals: DECIMALS_3POOL,
+            },
+            default_block: 20_000_000,
+        });
+        // sUSD pool (StableSwapV0, 2020-era) — same legacy StableSwap lineage as
+        // 3pool, used to verify whether V0's `exchange` diverges from `get_dy`.
+        v.push(Fixture {
+            name: "curve_susd_v0",
+            chain: ChainId(1),
+            pool: CURVE_SUSD,
+            token0: TokenInfo {
+                addr: DAI,
+                decimals: 18,
+                balance_slot: SLOT_DAI,
+            },
+            token1: TokenInfo {
+                addr: USDC_MAINNET,
+                decimals: 6,
+                balance_slot: SLOT_USDC,
+            },
+            adapter: Adapter::Curve {
+                variant: CurveVariant::StableSwapV0,
+                coins: COINS_SUSD,
+                decimals: DECIMALS_SUSD,
             },
             default_block: 20_000_000,
         });

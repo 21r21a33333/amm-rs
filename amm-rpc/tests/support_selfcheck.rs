@@ -15,20 +15,21 @@ use amm_core::primitives::asset::ChainId;
 use support::{ApprovalKind, Case, Direction, Expect, RecipientKind, Trade};
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires $AMM_RPC_FORK_URL (Ethereum mainnet archive node)"]
+#[ignore = "requires $AMM_RPC_FORK_URL"]
 async fn fixtures_refresh_and_slots_are_correct_mainnet() {
-    // Open the fork at block 20_000_000 (pre-V4). Each fixture is refreshed at
-    // its own `default_block` so that V4 fixtures (launched after 20M) are also
-    // exercised — the alloy provider can read any block regardless of the revm
-    // fork's pinned block, and the slot-deal writes are block-agnostic here.
+    // Refresh every fixture at the FORK's own block (default 20M, overridable via
+    // AMM_FORK_BLOCK). All catalog pools — including V4 — exist at any recent
+    // block, so pinning AMM_FORK_BLOCK to a recent height lets a keyless full
+    // node serve the state; the default 20M needs an archive node.
     let Some((mut fork, _pinned_block)) =
         support::open_fork("AMM_RPC_FORK_URL", 20_000_000, ChainId(1)).await
     else {
         return;
     };
+    let block = fork.block_number();
 
     for fx in support::mainnet_fixtures() {
-        let pool = support::refresh(fx, fork.provider().clone(), fx.default_block).await;
+        let pool = support::refresh(fx, fork.provider().clone(), block).await;
         assert!(
             pool.assets().len() >= 2,
             "{} must load at least two assets",
