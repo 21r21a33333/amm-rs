@@ -77,10 +77,14 @@ where
     let in_currency = resolve_currency(chain, in_token, case.native_in);
     let out_currency = resolve_currency(chain, out_token, case.native_out);
 
-    // Asset IDs used for quoting (pool math always works on wrapped tokens).
-    // For native: resolve to WETH (cfg.weth).
-    let in_asset_id = in_currency.resolve(cfg.weth);
-    let out_asset_id = out_currency.resolve(cfg.weth);
+    // Asset IDs used for quoting are the pool's ACTUAL currencies from the
+    // fixture — WETH for WETH-holding pools (V2/V3/V4-WETH), address(0) for a
+    // native-ETH V4 pool. The `native_in`/`native_out` flags only change the
+    // `Currency` handed to the builder (wrap/unwrap) and the funding path; they
+    // must not rewrite the quote asset (resolving native→WETH would look up WETH
+    // in a pool that holds address(0) and fail with AssetNotInPool).
+    let in_asset_id = asset(chain, in_token.addr);
+    let out_asset_id = asset(chain, out_token.addr);
 
     // ── Recipient ─────────────────────────────────────────────────────────────
 

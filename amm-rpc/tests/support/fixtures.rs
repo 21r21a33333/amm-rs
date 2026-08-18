@@ -381,8 +381,11 @@ pub static FIXTURES: LazyLock<Vec<Fixture>> = LazyLock::new(|| {
             token1: TokenInfo {
                 addr: USDBC,
                 decimals: 6,
-                // TODO(verify-on-fork): confirm USDbC balanceOf slot at block 30_000_000.
-                balance_slot: 0,
+                // USDbC is a proxy (EIP-1967 impl 0x1833c6…) with a non-standard
+                // balance layout — not in mapping slots 0..40, so it cannot be
+                // funded via simple slot-stuffing. Only usable as swap OUTPUT
+                // (USDC→USDbC), never as a funded input. Slot is a placeholder.
+                balance_slot: 9,
             },
             adapter: Adapter::Aerodrome {
                 stable: true,

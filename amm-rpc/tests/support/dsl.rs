@@ -49,10 +49,8 @@ pub const WETH_MAINNET: Address = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C
 /// Source: `execution_aerodrome.rs` line 40 — `const ROUTER`.
 pub const AERODROME_ROUTER: Address = address!("0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43");
 
-/// Aerodrome (Solidly) pool factory on Base.
-/// Source: `amm_core::protocols::aerodrome::BASE_POOL_FACTORY` (used in
-/// `execution_aerodrome.rs` line 175 as `BASE_POOL_FACTORY`).
-pub const AERODROME_FACTORY: Address = address!("0x420DD381b31aEf6683db6B902084cB0FFECe40Da");
+/// Aerodrome (Solidly) pool factory on Base — reuse the library constant (DRY).
+pub const AERODROME_FACTORY: Address = amm_core::protocols::aerodrome::BASE_POOL_FACTORY;
 
 /// Aerodrome Slipstream SwapRouter on Base.
 /// Source: `execution_slipstream.rs` line 39 — `const ROUTER`.
