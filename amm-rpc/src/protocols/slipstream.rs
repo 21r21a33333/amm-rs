@@ -370,14 +370,14 @@ mod tests {
     }
 
     /// End-to-end refresh against a forked Base RPC (Slipstream is a Base
-    /// deployment). Gated: set `AMM_RPC_BASE_FORK_URL` and run with
+    /// deployment). Gated: set `AMM_RPC_FORK_URL_BASE` and run with
     /// `cargo test -p amm-rpc -- --ignored`.
     #[tokio::test]
-    #[ignore = "requires a forked Base RPC at $AMM_RPC_BASE_FORK_URL"]
+    #[ignore = "requires a forked Base RPC at $AMM_RPC_FORK_URL_BASE"]
     async fn refresh_base_weth_usdc_slipstream_pool_quotes() {
         use alloy::primitives::address;
 
-        let Ok(url) = std::env::var("AMM_RPC_BASE_FORK_URL") else {
+        let Ok(url) = std::env::var("AMM_RPC_FORK_URL_BASE") else {
             return;
         };
         let provider = crate::provider::make_provider(&url).unwrap();

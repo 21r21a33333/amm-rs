@@ -34,7 +34,7 @@
 //!
 //! Gated: each test returns early unless its RPC env var is set.
 //! - Ethereum: `AMM_RPC_FORK_URL`
-//! - Base:     `AMM_RPC_BASE_FORK_URL`
+//! - Base:     `AMM_RPC_FORK_URL_BASE`
 //!
 //! Run: `cargo test -p amm-rpc --all-features --test differential -- --nocapture`
 
@@ -734,9 +734,9 @@ async fn resolve_aero_pool(
 }
 
 #[tokio::test]
-#[ignore = "live: needs a Base RPC at $AMM_RPC_BASE_FORK_URL"]
+#[ignore = "live: needs a Base RPC at $AMM_RPC_FORK_URL_BASE"]
 async fn diff_aerodrome_v2() {
-    let Some(fork) = Fork::open("AMM_RPC_BASE_FORK_URL").await else {
+    let Some(fork) = Fork::open("AMM_RPC_FORK_URL_BASE").await else {
         return;
     };
     let factory = address!("0x420DD381b31aEf6683db6B902084cB0FFECe40Da");
@@ -843,9 +843,9 @@ async fn diff_aerodrome_v2() {
 // ─── Aerodrome Slipstream (Base) ───────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore = "live: needs a Base RPC at $AMM_RPC_BASE_FORK_URL"]
+#[ignore = "live: needs a Base RPC at $AMM_RPC_FORK_URL_BASE"]
 async fn diff_aerodrome_slipstream() {
-    let Some(fork) = Fork::open("AMM_RPC_BASE_FORK_URL").await else {
+    let Some(fork) = Fork::open("AMM_RPC_FORK_URL_BASE").await else {
         return;
     };
     let cl_factory = address!("0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A");
