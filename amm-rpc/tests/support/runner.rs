@@ -25,7 +25,8 @@ use alloy::providers::Provider;
 use amm_core::primitives::asset::{AssetAmount, AssetId};
 use amm_rpc::execution::routing::{ExactOutPolicy, RouterKind};
 use amm_rpc::execution::{
-    ChainConfig, Currency, CurrencyAmount, Recipient, as_executable, error::BuildError, plan,
+    ChainConfig, Currency, CurrencyAmount, Recipient, TradeType, as_executable, error::BuildError,
+    plan,
 };
 
 use super::{
@@ -284,6 +285,13 @@ where
     // The deadline must be an AbsoluteTimestamp so `plan()` can resolve it once.
     let opts = exec_opts(SENDER).with_recipient(Recipient::To(recipient));
 
+    // Exact-out policy is inferred from the expected outcome: `AtLeast` means the
+    // caller wants OrBetter (deliver ≥ target); anything else is Strict (deliver
+    // == target). Ignored for exact-in routes.
+    let policy = match case.expect {
+        Expect::AtLeast => ExactOutPolicy::OrBetter,
+        _ => ExactOutPolicy::Strict,
+    };
     let mut p = plan(
         cfg,
         &route,
@@ -292,7 +300,7 @@ where
         SENDER,
         case.native_in,
         case.native_out,
-        ExactOutPolicy::Strict,
+        policy,
     )
     .unwrap_or_else(|e| panic!("PlanCase {}: plan() failed: {e:?}", case.name));
 
@@ -327,9 +335,13 @@ where
     };
     let total_delta = final_balance_after - final_balance_before;
 
-    // The quoted final output from `plan` is `observed.raw` after the loop
-    // (the last span's on-chain output is exact for exact-in).
-    let expected_out = observed.as_ref().map(|a| a.raw).unwrap_or(U256::ZERO);
+    // The reference the outcome is asserted against: for exact-in it's the last
+    // span's on-chain output (`observed`); for exact-out it's the caller's target
+    // (`case.amount`) — Strict must deliver exactly it, OrBetter at least it.
+    let expected_out = match case.trade_type {
+        TradeType::ExactOut => case.amount,
+        _ => observed.as_ref().map(|a| a.raw).unwrap_or(U256::ZERO),
+    };
 
     assert_outcome(&case.expect, total_delta, expected_out, case.name);
 

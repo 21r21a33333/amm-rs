@@ -179,6 +179,8 @@ const USDBC: Address = address!("d9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA");
 const AERO_VOL_WETH_USDC: Address = address!("cDAC0d6c6C59727a65F871236188350531885C43");
 const AERO_STABLE_USDC_USDBC: Address = address!("27a8Afa3Bd49406e48a074350fB7b2020c43B2bD");
 const SLIPSTREAM_WETH_USDC: Address = address!("b2cc224c1c9feE385f8ad6a55b4d94E92359DC59");
+const SLIPSTREAM_USDC_CBBTC: Address = address!("4e962BB3889Bf030368F56810A9c96B83CB3E778");
+const CBBTC: Address = address!("cbB7C0000aB88B473b1f5aFd9ef808440eed33Bf");
 
 // ── Base infrastructure ───────────────────────────────────────────────────────
 const AERO_FACTORY_BASE: Address = address!("420DD381b31aEf6683db6B902084cB0FFECe40Da");
@@ -417,6 +419,27 @@ pub static FIXTURES: LazyLock<Vec<Fixture>> = LazyLock::new(|| {
             adapter: Adapter::Slipstream {
                 tick_spacing: 100, // WETH/USDC CL pool tick spacing (read from chain)
             },
+            default_block: 30_000_000,
+        },
+        // Slipstream USDC/cbBTC CL pool (ts=100) — chains with slipstream_weth_usdc
+        // to form a 2-hop Slipstream span WETH→USDC→cbBTC. Verified on-fork:
+        // token0=USDC, token1=cbBTC, tickSpacing=100, ~4.3M USDC liquidity.
+        Fixture {
+            name: "slipstream_usdc_cbbtc",
+            chain: ChainId(8453),
+            pool: SLIPSTREAM_USDC_CBBTC,
+            token0: TokenInfo {
+                addr: USDC_BASE,
+                decimals: 6,
+                balance_slot: SLOT_USDC,
+            },
+            token1: TokenInfo {
+                // cbBTC is swap OUTPUT only (never funded); slot unused.
+                addr: CBBTC,
+                decimals: 8,
+                balance_slot: 0,
+            },
+            adapter: Adapter::Slipstream { tick_spacing: 100 },
             default_block: 30_000_000,
         },
     ];

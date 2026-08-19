@@ -44,7 +44,10 @@ use amm_core::slippage::Slippage;
 use amm_rpc::execution::routing::{ExactOutPolicy, Route};
 use amm_rpc::execution::types::TradeType;
 use amm_rpc::execution::{ChainConfig, Deadline, ExecutionOptions, Recipient, Routers, plan};
-use support::{Expect, PlanCase, RecipientKind, mainnet_chain_config, open_fork, run_plan_case};
+use support::{
+    Expect, PlanCase, RecipientKind, base_chain_config, mainnet_chain_config, open_fork,
+    run_plan_case,
+};
 
 // ── Verified token address constants ─────────────────────────────────────────
 //
@@ -188,6 +191,24 @@ fn multihop_uniswap_cases() -> Vec<PlanCase> {
             native_out: false,
             recipient: RecipientKind::Distinct,
             expect: Expect::WeiExact,
+        },
+        // ── Case 6: 2-hop all-V3 EXACT-OUT (USDC → WETH → exact USDT) ─────────
+        //
+        // Single Uniswap span, Strict exact-out → one `V3_SWAP_EXACT_OUT` command
+        // over the reversed path (USDT‖3000‖WETH‖500‖USDC) with amountInMaximum.
+        // Proves `build_uniswap_span_exact_out` on-chain: the recipient receives
+        // EXACTLY the target, and the input spent is bounded by max_spent.
+        PlanCase {
+            name: "multihop_v3_exact_out_usdc_weth_usdt",
+            chain: ChainId(1),
+            pools: &["usdc_weth_v3_005", "weth_usdt_v3"],
+            path: &[USDC, WETH, USDT],
+            amount: U256::from(500_000_000u64), // target 500 USDT (6 dp)
+            trade_type: TradeType::ExactOut,
+            native_in: false,
+            native_out: false,
+            recipient: RecipientKind::Sender,
+            expect: Expect::Exact,
         },
     ]
 }
@@ -746,5 +767,99 @@ fn structural_uniswap_span_wellformed_2_to_6_hops() {
             prepared.max_spent.is_none(),
             "{n}-hop exact-in must not carry max_spent"
         );
+    }
+}
+
+// ── Base: Aerodrome multi-pool span (Task 8) ─────────────────────────────────
+//
+// Two consecutive Aerodrome pools partition into ONE Aerodrome span, executed as
+// a single router `swapExactTokensForTokens` with a 2-element `Route[]` (one
+// volatile hop + one stable hop). Proves `build_aerodrome_span` on-chain.
+
+/// Base WETH (18 dp).
+const WETH_BASE: &str = "0x4200000000000000000000000000000000000006";
+/// Base native USDC (6 dp).
+const USDC_BASE: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+/// Base USDbC (6 dp) — swap output only (proxy, not slot-fundable).
+const USDBC_BASE: &str = "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA";
+
+fn multihop_aerodrome_base_cases() -> Vec<PlanCase> {
+    vec![
+        // 2-hop Aerodrome: WETH →(volatile)→ USDC →(stable)→ USDbC.
+        // Pools: aero_vol_weth_usdc (WETH/USDC volatile) + aero_stable_usdc_usdbc
+        // (USDC/USDbC stable). Both RouterKind::Aerodrome → one span, one router
+        // call with Route[] = [{WETH,USDC,stable=false},{USDC,USDbC,stable=true}].
+        PlanCase {
+            name: "multihop_aero_weth_usdc_usdbc",
+            chain: ChainId(8453),
+            pools: &["aero_vol_weth_usdc", "aero_stable_usdc_usdbc"],
+            path: &[WETH_BASE, USDC_BASE, USDBC_BASE],
+            amount: U256::from(100_000_000_000_000_000u64), // 0.1 WETH (18 dp)
+            trade_type: TradeType::ExactIn,
+            native_in: false,
+            native_out: false,
+            recipient: RecipientKind::Sender,
+            expect: Expect::WeiExact,
+        },
+    ]
+}
+
+/// Aerodrome multi-hop span fork proof on Base. Gated on `$AMM_RPC_FORK_URL_BASE`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires $AMM_RPC_FORK_URL_BASE"]
+async fn multihop_aerodrome_base_matrix() {
+    let Some((mut fork, _block)) =
+        open_fork("AMM_RPC_FORK_URL_BASE", 30_000_000, ChainId(8453)).await
+    else {
+        return;
+    };
+    let cfg = base_chain_config();
+    for case in multihop_aerodrome_base_cases() {
+        run_plan_case(&mut fork, &cfg, &case).await;
+    }
+}
+
+// ── Base: Slipstream multi-pool span (Task 8) ────────────────────────────────
+//
+// Two consecutive Slipstream (Aerodrome CL) pools partition into ONE Slipstream
+// span, executed as a single path-encoded `exactInput`. Proves
+// `build_slipstream_span` + `slipstream_path` (int24 tickSpacing) on-chain.
+
+/// Base cbBTC (8 dp) — swap output only.
+const CBBTC_BASE: &str = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf";
+
+fn multihop_slipstream_base_cases() -> Vec<PlanCase> {
+    vec![
+        // 2-hop Slipstream: WETH →(CL ts=100)→ USDC →(CL ts=100)→ cbBTC.
+        // Pools: slipstream_weth_usdc + slipstream_usdc_cbbtc. Both
+        // RouterKind::Slipstream → one span, one `exactInput` with a path-encoded
+        // WETH‖100‖USDC‖100‖cbBTC (int24 tick spacing between tokens).
+        PlanCase {
+            name: "multihop_slipstream_weth_usdc_cbbtc",
+            chain: ChainId(8453),
+            pools: &["slipstream_weth_usdc", "slipstream_usdc_cbbtc"],
+            path: &[WETH_BASE, USDC_BASE, CBBTC_BASE],
+            amount: U256::from(100_000_000_000_000_000u64), // 0.1 WETH (18 dp)
+            trade_type: TradeType::ExactIn,
+            native_in: false,
+            native_out: false,
+            recipient: RecipientKind::Sender,
+            expect: Expect::WeiExact,
+        },
+    ]
+}
+
+/// Slipstream multi-hop span fork proof on Base. Gated on `$AMM_RPC_FORK_URL_BASE`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires $AMM_RPC_FORK_URL_BASE"]
+async fn multihop_slipstream_base_matrix() {
+    let Some((mut fork, _block)) =
+        open_fork("AMM_RPC_FORK_URL_BASE", 30_000_000, ChainId(8453)).await
+    else {
+        return;
+    };
+    let cfg = base_chain_config();
+    for case in multihop_slipstream_base_cases() {
+        run_plan_case(&mut fork, &cfg, &case).await;
     }
 }
