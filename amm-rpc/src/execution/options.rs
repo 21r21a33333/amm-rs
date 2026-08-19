@@ -83,6 +83,12 @@ pub struct ExecutionOptions {
     pub price_limit: Option<Price>,
     /// How the router is permitted to spend the input token.
     pub approval: ApprovalMode,
+    /// The transaction sender, injected by [`resolve`] at the edge. `None`
+    /// until resolved. Receiver-less swap ABIs (e.g. some Curve `exchange`
+    /// variants that always pay `msg.sender`) read this to verify they can
+    /// honor the requested recipient — they can only deliver to the sender, so
+    /// a recipient that differs is rejected rather than silently mis-delivered.
+    pub sender: Option<Address>,
 }
 
 impl ExecutionOptions {
@@ -103,6 +109,7 @@ impl ExecutionOptions {
             deadline: Deadline::FromNow(Duration::from_secs(DEFAULT_TTL_SECS)),
             price_limit: None,
             approval: ApprovalMode::AssumeApproved,
+            sender: None,
         }
     }
 
@@ -137,6 +144,8 @@ impl ExecutionOptions {
 ///
 /// - `Deadline::FromNow(ttl)` → `Deadline::AtTimestamp(now.saturating_add(ttl.as_secs()))`
 /// - `Recipient::Sender`      → `Recipient::To(sender)`
+/// - `sender`                 → `Some(sender)` (so receiver-less pools can
+///   verify they are able to deliver to the resolved recipient)
 /// - All other variants pass through unchanged.
 pub fn resolve(mut opts: ExecutionOptions, now: u64, sender: Address) -> ExecutionOptions {
     opts.deadline = match opts.deadline {
@@ -147,6 +156,7 @@ pub fn resolve(mut opts: ExecutionOptions, now: u64, sender: Address) -> Executi
         Recipient::Sender => Recipient::To(sender),
         other => other,
     };
+    opts.sender = Some(sender);
     opts
 }
 
@@ -167,6 +177,7 @@ mod tests {
         assert_eq!(opts.deadline, Deadline::FromNow(Duration::from_secs(300)));
         assert!(opts.price_limit.is_none());
         assert_eq!(opts.approval, ApprovalMode::AssumeApproved);
+        assert_eq!(opts.sender, None);
     }
 
     #[test]
@@ -216,6 +227,7 @@ mod tests {
         let resolved = resolve(opts, now, sender);
         assert_eq!(resolved.deadline, Deadline::AtTimestamp(now + 300));
         assert_eq!(resolved.recipient, Recipient::To(sender));
+        assert_eq!(resolved.sender, Some(sender));
     }
 
     #[test]

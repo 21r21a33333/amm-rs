@@ -875,6 +875,7 @@ fn assert_build_error(
             (BuildErrorKind::UnsupportedExactOut, BuildError::UnsupportedExactOut { .. }) => {}
             (BuildErrorKind::UnsupportedProtocol, BuildError::UnsupportedProtocol) => {}
             (BuildErrorKind::NativeIntermediate, BuildError::NativeIntermediate) => {}
+            (BuildErrorKind::RecipientNotSupported, BuildError::RecipientNotSupported) => {}
             _ => panic!("{name}: expected build error {kind:?}, got: {err:?}"),
         },
     }

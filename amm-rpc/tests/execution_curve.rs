@@ -181,12 +181,25 @@ fn curve_cases() -> Vec<Case> {
             approval: ApprovalKind::Erc20,
             expect: Expect::RejectBuild(BuildErrorKind::UnsupportedProtocol),
         },
-        // No distinct-recipient row for the 3pool: Curve StableI128 `exchange`
-        // has no receiver argument, so output always lands at msg.sender.
-        // Distinct-recipient delivery is only provable on receiver-capable Curve
-        // variants (not among the current fixtures). NOTE: the library's Curve
-        // build_swap currently accepts a distinct recipient and silently delivers
-        // to the sender instead of erroring — flagged as a separate fix.
+        // Distinct-recipient reject: Curve StableI128 `exchange` has no receiver
+        // argument — output always lands at msg.sender — so the builder must
+        // reject a recipient that differs from the sender rather than silently
+        // mis-delivering. (Receiver-capable Curve variants that CAN honor a
+        // distinct recipient are not among the current fixtures.)
+        Case {
+            name: "curve_3pool_distinct_recipient_reject",
+            chain: ChainId(1),
+            pools: &["curve_3pool"],
+            direction: Direction::Forward, // DAI → USDC
+            trade: Trade::ExactIn {
+                amount_in: U256::from(1_000_000_000_000_000_000u64), // 1 DAI (18 dp)
+            },
+            native_in: false,
+            native_out: false,
+            recipient: RecipientKind::Distinct,
+            approval: ApprovalKind::Erc20,
+            expect: Expect::RejectBuild(BuildErrorKind::RecipientNotSupported),
+        },
         // ── curve_tricrypto2 ───────────────────────────────────────────────────
         //
         // Old test: wei_exact_tricrypto2_crypto_u256_use_eth, USDT→WETH (i=0,j=2).

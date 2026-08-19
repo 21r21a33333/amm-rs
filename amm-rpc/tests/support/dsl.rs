@@ -93,12 +93,15 @@ pub fn key2(exchange: &str, chain: u64, pool: Address, a: Address, b: Address) -
 /// - 50 bps slippage
 /// - Explicit recipient (`sender`)
 /// - Absolute deadline (`u64::MAX / 2`) — no `resolve` call needed.
-///
-/// Body copied verbatim from `execution_v2.rs` line 97.
+/// - `sender` recorded so receiver-less encoders (e.g. some Curve ABIs) can
+///   verify delivery. Callers that then override the recipient to a distinct
+///   address exercise the receiver-less rejection path.
 pub fn exec_opts(sender: Address) -> ExecutionOptions {
-    ExecutionOptions::new(Slippage::from_bps(Bps(50)))
+    let mut opts = ExecutionOptions::new(Slippage::from_bps(Bps(50)))
         .with_recipient(Recipient::To(sender))
-        .with_deadline(Deadline::AtTimestamp(u64::MAX / 2))
+        .with_deadline(Deadline::AtTimestamp(u64::MAX / 2));
+    opts.sender = Some(sender);
+    opts
 }
 
 // ── Chain-config builders ─────────────────────────────────────────────────────

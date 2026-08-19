@@ -88,6 +88,7 @@ pub enum BuildErrorKind {
     UnsupportedExactOut,
     UnsupportedProtocol,
     NativeIntermediate,
+    RecipientNotSupported,
 }
 
 // ── Multi-hop plan case ────────────────────────────────────────────────────────

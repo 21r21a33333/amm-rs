@@ -100,6 +100,16 @@ pub enum BuildError {
         /// The pool kind that rejected the exact-out request.
         kind: PoolKind,
     },
+
+    /// The pool's swap ABI has no `receiver` parameter — it always pays
+    /// `msg.sender` — so it cannot deliver output to a recipient other than the
+    /// transaction sender. Returned when such a pool is asked to build a swap
+    /// whose resolved recipient does not equal the sender (or when the sender is
+    /// unknown, i.e. options were not resolved via
+    /// [`crate::execution::options::resolve`]). Prevents silently mis-delivering
+    /// output to the sender instead of the requested recipient.
+    #[error("pool cannot deliver output to a recipient other than the transaction sender")]
+    RecipientNotSupported,
 }
 
 #[cfg(test)]

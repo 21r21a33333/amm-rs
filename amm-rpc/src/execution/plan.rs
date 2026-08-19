@@ -552,9 +552,13 @@ impl<'a> Plan<'a> {
             true => Currency::Native,
             false => Currency::Token(self.route.path[end]),
         };
-        // Per-span options: override the recipient to this span's payee.
+        // Per-span options: override the recipient to this span's payee, and
+        // record the transaction sender so receiver-less single-pool encoders
+        // (e.g. some Curve `exchange` ABIs) can verify they are able to deliver
+        // to this span's recipient rather than silently paying msg.sender.
         let mut span_opts = self.opts.clone();
         span_opts.recipient = Recipient::To(recipient);
+        span_opts.sender = Some(self.sender);
 
         // For an OrBetter final span, force the floor to exactly `target` by
         // pairing a zero-slippage tolerance with `quoted_out = target`; otherwise

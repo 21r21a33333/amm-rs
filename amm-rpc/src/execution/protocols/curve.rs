@@ -39,12 +39,15 @@
 //!   `Recipient::To(sender)` by `options::resolve` at the router edge before any
 //!   encoder runs, so the builder always receives a concrete address; on these
 //!   receiver-less ABIs that address can only be honored when it equals the
-//!   transaction sender — which the builder cannot verify. Callers must avoid
-//!   routing to a receiver-less pool when the intended recipient differs from the
-//!   transaction sender.
+//!   transaction sender. `options::resolve` also records the sender in
+//!   `opts.sender`, so the builder *can* verify: it rejects with
+//!   [`BuildError::RecipientNotSupported`] when the resolved recipient differs
+//!   from the sender (or when the sender is unknown, i.e. options were not
+//!   resolved). This turns a silent mis-delivery — output landing at the sender
+//!   instead of the intended recipient — into a hard, typed error.
 
 #[cfg(feature = "curve")]
-use alloy::primitives::U256;
+use alloy::primitives::{Address, U256};
 #[cfg(feature = "curve")]
 use alloy::{sol, sol_types::SolCall};
 #[cfg(feature = "curve")]
@@ -98,6 +101,27 @@ sol! {
     /// the call. The selector differs from `0x394747c5`.
     interface ICurveCryptoReceiver {
         function exchange(uint256 i, uint256 j, uint256 dx, uint256 min_dy, address receiver) external returns (uint256);
+    }
+}
+
+// ── Receiver-less delivery guard ──────────────────────────────────────────────
+
+/// Receiver-less Curve ABIs (`StableI128`, `StableI128Ng`, `CryptoU256UseEth`)
+/// have no `receiver` parameter — the pool always pays `msg.sender`. Such a pool
+/// can only honor a recipient that equals the transaction sender.
+///
+/// Verify that here so output is never silently mis-delivered: reject unless
+/// `opts.sender` is known and equals `recipient`. A `None` sender means options
+/// were not resolved via [`crate::execution::options::resolve`], so delivery
+/// cannot be proven — reject as well.
+#[cfg(feature = "curve")]
+fn ensure_delivers_to_sender(
+    opts: &ExecutionOptions,
+    recipient: Address,
+) -> Result<(), BuildError> {
+    match opts.sender {
+        Some(sender) if sender == recipient => Ok(()),
+        _ => Err(BuildError::RecipientNotSupported),
     }
 }
 
@@ -177,6 +201,9 @@ impl Executable for CurvePool {
         // Build the family-specific calldata; everything else is shared.
         let data = match self.interface() {
             Some(CurveInterface::StableI128) | Some(CurveInterface::StableI128Ng) => {
+                // Receiver-less ABI: the pool pays msg.sender. Reject any
+                // recipient we cannot prove equals the sender.
+                ensure_delivers_to_sender(opts, r.recipient)?;
                 // StableSwap-NG uses the same `exchange(int128,int128,uint256,uint256)`
                 // selector and args as the classic V1 ABI (selector `0x3df02124`).
                 // The only difference is that NG returns `uint256`; that does not
@@ -194,6 +221,10 @@ impl Executable for CurvePool {
                 call.abi_encode()
             }
             Some(CurveInterface::CryptoU256UseEth) => {
+                // Receiver-less ABI: no `receiver` arg, the pool pays msg.sender
+                // (native-out unwraps WETH to msg.sender). Reject any recipient
+                // we cannot prove equals the sender.
+                ensure_delivers_to_sender(opts, r.recipient)?;
                 // use_eth=true enables the pool's native-ETH path on either
                 // side: native-in → the call is payable and the pool wraps the
                 // received ETH; native-out → the pool unwraps WETH before
@@ -386,11 +417,15 @@ mod tests {
         ChainConfig::new(chain_id(), weth())
     }
 
-    /// Fully-resolved execution options.
+    /// Fully-resolved execution options. The sender is set equal to `to` so
+    /// receiver-less Curve ABIs (which pay `msg.sender`) accept the recipient;
+    /// tests that exercise the recipient≠sender rejection build opts explicitly.
     fn opts_resolved(to: Address, deadline_ts: u64, slippage_bps: u16) -> ExecutionOptions {
-        ExecutionOptions::new(Slippage::from_bps(Bps(slippage_bps)))
+        let mut opts = ExecutionOptions::new(Slippage::from_bps(Bps(slippage_bps)))
             .with_recipient(Recipient::To(to))
-            .with_deadline(Deadline::AtTimestamp(deadline_ts))
+            .with_deadline(Deadline::AtTimestamp(deadline_ts));
+        opts.sender = Some(to);
+        opts
     }
 
     // ── selector sanity ────────────────────────────────────────────────────────
@@ -1155,5 +1190,116 @@ mod tests {
     fn as_executable_is_some_for_curve_pool() {
         let pool = stable_3pool();
         assert!(as_executable(&pool as &dyn Pool).is_some());
+    }
+
+    // ── receiver-less delivery guard ──────────────────────────────────────────
+
+    /// A receiver-less `StableI128` pool asked to deliver to a recipient that
+    /// differs from the sender must return `RecipientNotSupported` rather than
+    /// silently encoding an `exchange` that pays `msg.sender`.
+    #[test]
+    fn stable_i128_distinct_recipient_is_rejected() {
+        let pool = stable_3pool();
+        let c = ctx();
+        // opts_resolved sets sender == recipient; override recipient to a
+        // DIFFERENT address so recipient != sender.
+        let mut opts = opts_resolved(Address::repeat_byte(0x55), 9_999_999, 50);
+        opts.recipient = Recipient::To(Address::repeat_byte(0xEE));
+
+        let err = pool
+            .build_swap(
+                &c,
+                CurrencyAmount {
+                    currency: Currency::Token(dai()),
+                    raw: U256::from(1_000_000_000_000_000_000u64),
+                },
+                Currency::Token(usdc()),
+                &AssetAmount::new(usdc(), U256::from(1_000_000_000_000_000_000u64)),
+                &opts,
+            )
+            .expect_err("distinct recipient on receiver-less StableI128 must be rejected");
+        assert_eq!(err, BuildError::RecipientNotSupported);
+    }
+
+    /// The same guard applies to `CryptoU256UseEth` (native-out unwraps WETH to
+    /// `msg.sender`, so it too cannot honor a distinct recipient).
+    #[test]
+    fn crypto_use_eth_distinct_recipient_is_rejected() {
+        let pool = crypto_3pool();
+        let c = ctx();
+        let mut opts = opts_resolved(Address::repeat_byte(0x66), 9_999_999, 50);
+        opts.recipient = Recipient::To(Address::repeat_byte(0xEE));
+
+        let err = pool
+            .build_swap(
+                &c,
+                CurrencyAmount {
+                    currency: Currency::Token(usdt()),
+                    raw: U256::from(1_000_000_000u64),
+                },
+                Currency::Token(wbtc()),
+                &AssetAmount::new(wbtc(), U256::from(1_000_000u64)),
+                &opts,
+            )
+            .expect_err("distinct recipient on receiver-less CryptoU256UseEth must be rejected");
+        assert_eq!(err, BuildError::RecipientNotSupported);
+    }
+
+    /// An unresolved sender (`opts.sender == None`) also cannot prove delivery,
+    /// so a receiver-less pool rejects even when the recipient happens to match
+    /// the eventual sender.
+    #[test]
+    fn receiver_less_unknown_sender_is_rejected() {
+        let pool = stable_3pool();
+        let c = ctx();
+        let to = Address::repeat_byte(0x55);
+        // Build opts WITHOUT setting sender (bypass opts_resolved's sender wiring).
+        let opts = ExecutionOptions::new(Slippage::from_bps(Bps(50)))
+            .with_recipient(Recipient::To(to))
+            .with_deadline(Deadline::AtTimestamp(9_999_999));
+
+        let err = pool
+            .build_swap(
+                &c,
+                CurrencyAmount {
+                    currency: Currency::Token(dai()),
+                    raw: U256::from(1_000_000_000_000_000_000u64),
+                },
+                Currency::Token(usdc()),
+                &AssetAmount::new(usdc(), U256::from(1_000_000_000_000_000_000u64)),
+                &opts,
+            )
+            .expect_err("unknown sender on receiver-less pool must be rejected");
+        assert_eq!(err, BuildError::RecipientNotSupported);
+    }
+
+    /// A receiver-CAPABLE pool (`CryptoU256Receiver`) still honors a distinct
+    /// recipient — the guard must not over-reach to pools with a `receiver` arg.
+    #[test]
+    fn crypto_receiver_distinct_recipient_is_allowed() {
+        let pool = crypto_receiver_pool();
+        let c = ctx();
+        let mut opts = opts_resolved(Address::repeat_byte(0x99), 9_999_999, 50);
+        let distinct = Address::repeat_byte(0xEE);
+        opts.recipient = Recipient::To(distinct);
+
+        let prepared = pool
+            .build_swap(
+                &c,
+                CurrencyAmount {
+                    currency: Currency::Token(weth()),
+                    raw: U256::from(100_000_000_000_000_000u64),
+                },
+                Currency::Token(tc_ng_token()),
+                &AssetAmount::new(tc_ng_token(), U256::from(1_000_000_000_000_000_000u64)),
+                &opts,
+            )
+            .expect("receiver-capable pool must accept a distinct recipient");
+        let decoded = ICurveCryptoReceiver::exchangeCall::abi_decode(&prepared.tx.data)
+            .expect("must decode as CryptoReceiver");
+        assert_eq!(
+            decoded.receiver, distinct,
+            "receiver must be the distinct recipient"
+        );
     }
 }
