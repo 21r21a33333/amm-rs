@@ -323,6 +323,12 @@ fn curve_cases() -> Vec<Case> {
             approval: ApprovalKind::Erc20,
             expect: Expect::WeiExact,
         },
+        // Note: OrBetter exact-out on Curve degrades to exact-in with the floor
+        // pinned to the target — but that degradation lives in the `plan()`
+        // executor, not the single-pool `Executable` path this runner exercises
+        // (`build_swap_exact_out` would just return UnsupportedProtocol here). The
+        // true Curve OrBetter degradation is fork-proven end-to-end by
+        // `multihop_curve_exact_out_orbetter_usdc_usdt_weth` in execution_multihop.rs.
     ]
 }
 

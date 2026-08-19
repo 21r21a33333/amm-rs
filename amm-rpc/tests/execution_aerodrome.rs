@@ -204,6 +204,13 @@ fn aerodrome_cases() -> Vec<Case> {
         // non-standard balance layout (not in mapping slots 0..40), so it can't
         // be funded via slot-stuffing. The stable-swap math is proven by the
         // Forward (USDC→USDbC) row above, which needs no USDbC funding.
+        //
+        // Note: OrBetter exact-out on Aerodrome degrades to exact-in with the
+        // floor pinned to the target inside the `plan()` executor — not the
+        // single-pool `Executable` path this runner drives (which would return
+        // UnsupportedProtocol from `build_swap_exact_out`). The family-agnostic
+        // OrBetter degradation is fork-proven end-to-end via the Curve span in
+        // `multihop_curve_exact_out_orbetter_usdc_usdt_weth` (execution_multihop.rs).
     ]
 }
 

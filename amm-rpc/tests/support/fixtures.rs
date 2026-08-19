@@ -216,6 +216,9 @@ static DECIMALS_TWOCRYPTO_NG: &[u8] = &[18, 18];
 /// Curve entries are only pushed when the `curve` feature is enabled, which is
 /// why this is a `LazyLock<Vec<Fixture>>` rather than a plain `static` slice.
 pub static FIXTURES: LazyLock<Vec<Fixture>> = LazyLock::new(|| {
+    // `v` is only mutated (via `v.push`) when the `curve` feature adds the Curve
+    // fixtures below; without it the binding is never mutated.
+    #[cfg_attr(not(feature = "curve"), allow(unused_mut))]
     let mut v: Vec<Fixture> = vec![
         // ── Uniswap V2 ───────────────────────────────────────────────────────
         Fixture {

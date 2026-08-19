@@ -210,6 +210,24 @@ fn slipstream_cases() -> Vec<Case> {
             approval: ApprovalKind::Erc20,
             expect: Expect::WeiExact,
         },
+        // OrBetter exact-out: Slipstream supports Strict, but a caller may still
+        // choose OrBetter — backward-solve the WETH input for a 500-USDC target,
+        // then run exact-in with the floor pinned to 500 USDC (deliver ≥, AtLeast).
+        Case {
+            name: "slipstream_exact_out_orbetter_forward_weth_usdc",
+            chain: ChainId(8453),
+            pools: &["slipstream_weth_usdc"],
+            direction: Direction::Forward, // spend WETH side
+            trade: Trade::ExactOut {
+                amount_out: U256::from(500_000_000u64), // 500 USDC (6 dp)
+                policy: ExactOutPolicy::OrBetter,
+            },
+            native_in: false,
+            native_out: false,
+            recipient: RecipientKind::Sender,
+            approval: ApprovalKind::Erc20,
+            expect: Expect::AtLeast,
+        },
     ]
 }
 

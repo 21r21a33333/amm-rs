@@ -292,7 +292,7 @@ where
         Expect::AtLeast => ExactOutPolicy::OrBetter,
         _ => ExactOutPolicy::Strict,
     };
-    let mut p = plan(
+    let plan_result = plan(
         cfg,
         &route,
         case.amount,
@@ -301,8 +301,25 @@ where
         case.native_in,
         case.native_out,
         policy,
-    )
-    .unwrap_or_else(|e| panic!("PlanCase {}: plan() failed: {e:?}", case.name));
+    );
+
+    // Plan-level rejection (e.g. Strict exact-out through a span family with no
+    // exact-out builder): assert plan() returns the expected error and stop
+    // before funding/submitting anything.
+    if let Expect::RejectBuild(ref kind) = case.expect {
+        match plan_result {
+            Ok(_) => panic!(
+                "PlanCase {}: expected plan() to reject with {kind:?} but it succeeded",
+                case.name
+            ),
+            Err(ref e) => assert_plan_build_error(e, kind, case.name),
+        }
+        fork.revert(snap);
+        return;
+    }
+
+    let mut p =
+        plan_result.unwrap_or_else(|e| panic!("PlanCase {}: plan() failed: {e:?}", case.name));
 
     // ── Fund the FIRST span's input only ──────────────────────────────────────
     fund_first_span(fork, case, &path);
@@ -554,19 +571,30 @@ where
         },
     );
 
+    // For exact-in, `case.amount` is the input, so 2× covers it. For exact-out,
+    // `case.amount` is the OUTPUT target — the required input varies with price
+    // and decimals (and can dwarf the target's raw magnitude, e.g. WETH→cbBTC),
+    // so slot-inject a large, decimals-agnostic balance. Each span's ERC-20
+    // approval is bounded to its `max_spent`, so the router pulls only what the
+    // swap needs; over-funding is harmless and the spent-delta bound still holds.
+    let erc20_fund = match case.trade_type {
+        TradeType::ExactIn => case.amount * U256::from(2u64),
+        _ => U256::from(10u64).pow(U256::from(30u64)),
+    };
+    let native_fund = match case.trade_type {
+        TradeType::ExactIn => case.amount * U256::from(2u64) + ONE_ETH,
+        _ => U256::from(10u64).pow(U256::from(24u64)), // 1e24 wei ≈ 1e6 ETH
+    };
+
     match case.native_in {
         true => {
-            // native_in: fund native ETH with 2× amount + 1 ETH headroom.
-            fork.fund_native(SENDER, case.amount * U256::from(2u64) + ONE_ETH);
+            // native_in: fund native ETH (2× amount for exact-in, a large
+            // ceiling for exact-out) with headroom.
+            fork.fund_native(SENDER, native_fund);
         }
         false => {
-            // ERC-20 input: slot-inject 2× amount and verify the read-back.
-            fork.fund_erc20_verified(
-                SENDER,
-                first_token_addr,
-                first_token_slot,
-                case.amount * U256::from(2u64),
-            );
+            // ERC-20 input: slot-inject the fund amount and verify the read-back.
+            fork.fund_erc20_verified(SENDER, first_token_addr, first_token_slot, erc20_fund);
             // Also seed a small ETH buffer so the EVM does not reject the tx.
             fork.fund_native(SENDER, ONE_ETH);
         }
@@ -861,6 +889,34 @@ fn assert_outcome(expect: &Expect, delta: U256, expected_out: U256, name: &str) 
         // RejectBuild is handled before this function is reached.
         Expect::RejectBuild(_) => unreachable!("RejectBuild must be handled before assert_outcome"),
     }
+}
+
+/// Assert a `plan()` error matches the expected `BuildErrorKind` discriminant.
+///
+/// The multi-hop analogue of [`assert_build_error`]: `plan()` returns
+/// `Result<Plan, BuildError>` (not `Result<PreparedSwap, _>`), so the reject is
+/// asserted on the error directly.
+fn assert_plan_build_error(err: &BuildError, kind: &BuildErrorKind, name: &str) {
+    let matched = matches!(
+        (kind, err),
+        (
+            BuildErrorKind::UnsupportedExactOut,
+            BuildError::UnsupportedExactOut { .. }
+        ) | (
+            BuildErrorKind::UnsupportedProtocol,
+            BuildError::UnsupportedProtocol
+        ) | (
+            BuildErrorKind::NativeIntermediate,
+            BuildError::NativeIntermediate
+        ) | (
+            BuildErrorKind::RecipientNotSupported,
+            BuildError::RecipientNotSupported
+        )
+    );
+    assert!(
+        matched,
+        "{name}: expected plan() error {kind:?}, got: {err:?}"
+    );
 }
 
 /// Assert that `result` is `Err` and its discriminant matches `kind`.

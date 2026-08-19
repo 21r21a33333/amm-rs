@@ -45,8 +45,8 @@ use amm_rpc::execution::routing::{ExactOutPolicy, Route};
 use amm_rpc::execution::types::TradeType;
 use amm_rpc::execution::{ChainConfig, Deadline, ExecutionOptions, Recipient, Routers, plan};
 use support::{
-    Expect, PlanCase, RecipientKind, base_chain_config, mainnet_chain_config, open_fork,
-    run_plan_case,
+    BuildErrorKind, Expect, PlanCase, RecipientKind, base_chain_config, mainnet_chain_config,
+    open_fork, run_plan_case,
 };
 
 // ── Verified token address constants ─────────────────────────────────────────
@@ -63,6 +63,9 @@ const USDC: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
 const WETH: &str = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
 /// USDT on Ethereum mainnet (6 dp, slot 2).
 const USDT: &str = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
+/// crvUSD on Ethereum mainnet (18 dp) — output-only in the Curve matrix.
+#[cfg(feature = "curve")]
+const CRVUSD: &str = "0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E";
 
 // ── Case table ─────────────────────────────────────────────────────────────────
 
@@ -210,6 +213,22 @@ fn multihop_uniswap_cases() -> Vec<PlanCase> {
             recipient: RecipientKind::Sender,
             expect: Expect::Exact,
         },
+        // Multi-hop OrBetter exact-out: same 2-hop route, but the caller accepts
+        // ≥ 500 USDT. The executor backward-solves the input, then runs a forward
+        // exact-in span with the FINAL floor pinned to 500 USDT — deliver ≥ target
+        // (AtLeast). Exercises OrBetter degradation across a multi-pool span.
+        PlanCase {
+            name: "multihop_v3_exact_out_orbetter_usdc_weth_usdt",
+            chain: ChainId(1),
+            pools: &["usdc_weth_v3_005", "weth_usdt_v3"],
+            path: &[USDC, WETH, USDT],
+            amount: U256::from(500_000_000u64), // target ≥ 500 USDT (6 dp)
+            trade_type: TradeType::ExactOut,
+            native_in: false,
+            native_out: false,
+            recipient: RecipientKind::Sender,
+            expect: Expect::AtLeast,
+        },
     ]
 }
 
@@ -351,6 +370,42 @@ fn multihop_cross_router_cases() -> Vec<PlanCase> {
             // Sender: keeps both cases uniform and avoids a distinct-recipient
             // assertion that depends on the final Uniswap span's recipient override,
             // which is not yet fork-verified in this task.
+            recipient: RecipientKind::Sender,
+            expect: Expect::WeiExact,
+        },
+        // ── Case 3: native-in cross-router (ETH → V3 → Curve) ──────────────────
+        //
+        // ETH →(usdc_weth_v3: WETH→USDC)→ USDC →(curve_3pool: USDC→USDT)→ USDT.
+        // The FIRST span (Uniswap) takes native ETH (tx.value); its USDC output
+        // lands at SENDER, then the Curve span pulls it to USDT. Proves a native
+        // edge at a cross-router boundary. 0.1 ETH in.
+        PlanCase {
+            name: "cross_router_native_in_eth_usdc_usdt",
+            chain: ChainId(1),
+            pools: &["usdc_weth_v3_005", "curve_3pool"],
+            path: &[WETH, USDC, USDT],
+            amount: U256::from(100_000_000_000_000_000u64), // 0.1 ETH (18 dp)
+            trade_type: TradeType::ExactIn,
+            native_in: true,
+            native_out: false,
+            recipient: RecipientKind::Sender,
+            expect: Expect::WeiExact,
+        },
+        // ── Case 4: native-out cross-router (Curve → V3 → ETH) ─────────────────
+        //
+        // USDT →(curve_3pool: USDT→USDC)→ USDC →(usdc_weth_v3: USDC→WETH→ETH).
+        // The Curve span delivers USDC to SENDER; the FINAL Uniswap span unwraps
+        // WETH and pays SENDER native ETH. Proves a native output edge across a
+        // cross-router boundary. 1 000 USDT in.
+        PlanCase {
+            name: "cross_router_native_out_usdt_usdc_eth",
+            chain: ChainId(1),
+            pools: &["curve_3pool", "usdc_weth_v3_005"],
+            path: &[USDT, USDC, WETH],
+            amount: U256::from(1_000_000_000u64), // 1 000 USDT (6 dp)
+            trade_type: TradeType::ExactIn,
+            native_in: false,
+            native_out: true,
             recipient: RecipientKind::Sender,
             expect: Expect::WeiExact,
         },
@@ -801,6 +856,21 @@ fn multihop_aerodrome_base_cases() -> Vec<PlanCase> {
             recipient: RecipientKind::Sender,
             expect: Expect::WeiExact,
         },
+        // Strict exact-out over an Aerodrome span must be REJECTED at plan() time:
+        // the Solidly router has no exact-out entrypoint, so the Strict gate
+        // returns UnsupportedExactOut before any calldata is built.
+        PlanCase {
+            name: "multihop_aero_exact_out_strict_reject",
+            chain: ChainId(8453),
+            pools: &["aero_vol_weth_usdc", "aero_stable_usdc_usdbc"],
+            path: &[WETH_BASE, USDC_BASE, USDBC_BASE],
+            amount: U256::from(100_000_000u64), // 100 USDbC target (6 dp)
+            trade_type: TradeType::ExactOut,
+            native_in: false,
+            native_out: false,
+            recipient: RecipientKind::Sender,
+            expect: Expect::RejectBuild(BuildErrorKind::UnsupportedExactOut),
+        },
     ]
 }
 
@@ -846,6 +916,22 @@ fn multihop_slipstream_base_cases() -> Vec<PlanCase> {
             recipient: RecipientKind::Sender,
             expect: Expect::WeiExact,
         },
+        // Multi-hop STRICT exact-out over a Slipstream span — Slipstream is the
+        // only non-Uniswap family with a true multi-hop exact-out builder
+        // (`build_slipstream_span_exact_out`, path-encoded `exactOutput` over the
+        // reversed path). Deliver EXACTLY 0.001 cbBTC, input bounded by max_spent.
+        PlanCase {
+            name: "multihop_slipstream_exact_out_weth_usdc_cbbtc",
+            chain: ChainId(8453),
+            pools: &["slipstream_weth_usdc", "slipstream_usdc_cbbtc"],
+            path: &[WETH_BASE, USDC_BASE, CBBTC_BASE],
+            amount: U256::from(100_000u64), // target 0.001 cbBTC (8 dp)
+            trade_type: TradeType::ExactOut,
+            native_in: false,
+            native_out: false,
+            recipient: RecipientKind::Sender,
+            expect: Expect::Exact,
+        },
     ]
 }
 
@@ -860,6 +946,138 @@ async fn multihop_slipstream_base_matrix() {
     };
     let cfg = base_chain_config();
     for case in multihop_slipstream_base_cases() {
+        run_plan_case(&mut fork, &cfg, &case).await;
+    }
+}
+
+// ── Curve multi-hop (mainnet, CurveRouterNG) ────────────────────────────────────
+
+/// Atomic multi-pool Curve spans via CurveRouterNG (Plan 3b). Every case is one
+/// Curve span → one `exchange(...)` transaction (tx_count == 1, atomic). Two
+/// consecutive Curve pools sharing a coin form the chain.
+///
+/// pool_type coverage on-chain: 1 (StableSwapV1 3pool), 3 (TriCryptoV1
+/// tricrypto2), 10 (StableSwapNG). pool_type 2/20/30 are covered by the
+/// builder's `pool_type_table_is_ng_aware` unit test — no deeply-liquid chained
+/// fixture exists for them, and a thin NG token would make the fork case flaky.
+#[cfg(feature = "curve")]
+fn multihop_curve_cases() -> Vec<PlanCase> {
+    vec![
+        // USDC →(3pool)→ USDT →(tricrypto2)→ WETH. pool_type 1 then 3.
+        PlanCase {
+            name: "multihop_curve_usdc_usdt_weth",
+            chain: ChainId(1),
+            pools: &["curve_3pool", "curve_tricrypto2"],
+            path: &[USDC, USDT, WETH],
+            amount: U256::from(1_000_000_000u64), // 1000 USDC (6 dp)
+            trade_type: TradeType::ExactIn,
+            native_in: false,
+            native_out: false,
+            recipient: RecipientKind::Sender,
+            expect: Expect::WeiExact,
+        },
+        // DAI →(3pool)→ USDC →(stable_ng)→ crvUSD. pool_type 1 then 10.
+        PlanCase {
+            name: "multihop_curve_stable_ng_dai_usdc_crvusd",
+            chain: ChainId(1),
+            pools: &["curve_3pool", "curve_stable_ng"],
+            path: &[DAI, USDC, CRVUSD],
+            amount: U256::from(1_000_000_000_000_000_000_000u128), // 1000 DAI (18 dp)
+            trade_type: TradeType::ExactIn,
+            native_in: false,
+            native_out: false,
+            recipient: RecipientKind::Sender,
+            expect: Expect::WeiExact,
+        },
+        // Native-out: USDC →(3pool)→ USDT →(tricrypto2)→ ETH. The router unwraps
+        // WETH and pays the receiver native ETH (tricrypto2 = use_eth endpoint).
+        PlanCase {
+            name: "multihop_curve_native_out_usdc_usdt_eth",
+            chain: ChainId(1),
+            pools: &["curve_3pool", "curve_tricrypto2"],
+            path: &[USDC, USDT, WETH],
+            amount: U256::from(1_000_000_000u64), // 1000 USDC (6 dp)
+            trade_type: TradeType::ExactIn,
+            native_in: false,
+            native_out: true,
+            recipient: RecipientKind::Sender,
+            expect: Expect::WeiExact,
+        },
+        // Native-in: ETH →(tricrypto2)→ USDT →(3pool)→ DAI. tx.value carries the
+        // ETH; the router wraps at the tricrypto2 (use_eth) endpoint.
+        PlanCase {
+            name: "multihop_curve_native_in_eth_usdt_dai",
+            chain: ChainId(1),
+            pools: &["curve_tricrypto2", "curve_3pool"],
+            path: &[WETH, USDT, DAI],
+            amount: U256::from(500_000_000_000_000_000u64), // 0.5 ETH (18 dp)
+            trade_type: TradeType::ExactIn,
+            native_in: true,
+            native_out: false,
+            recipient: RecipientKind::Sender,
+            expect: Expect::WeiExact,
+        },
+        // Distinct recipient: USDC →(3pool)→ USDT →(tricrypto2)→ WETH delivered to
+        // a DIFFERENT address. CurveRouterNG's `_receiver` makes this atomic even
+        // though the underlying pools are receiver-less (contrast the single-pool
+        // encoder, which must reject a distinct recipient here).
+        PlanCase {
+            name: "multihop_curve_distinct_recipient_usdc_usdt_weth",
+            chain: ChainId(1),
+            pools: &["curve_3pool", "curve_tricrypto2"],
+            path: &[USDC, USDT, WETH],
+            amount: U256::from(1_000_000_000u64), // 1000 USDC (6 dp)
+            trade_type: TradeType::ExactIn,
+            native_in: false,
+            native_out: false,
+            recipient: RecipientKind::Distinct,
+            expect: Expect::WeiExact,
+        },
+        // OrBetter exact-out over a multi-pool Curve span — Curve has no exact-out
+        // entrypoint, so OrBetter is the only way to get exact-out behavior:
+        // backward-solve the USDC input for a 0.1-WETH target, then run the Curve
+        // span exact-in with the final floor pinned to the target (deliver ≥).
+        PlanCase {
+            name: "multihop_curve_exact_out_orbetter_usdc_usdt_weth",
+            chain: ChainId(1),
+            pools: &["curve_3pool", "curve_tricrypto2"],
+            path: &[USDC, USDT, WETH],
+            amount: U256::from(100_000_000_000_000_000u64), // target ≥ 0.1 WETH (18 dp)
+            trade_type: TradeType::ExactOut,
+            native_in: false,
+            native_out: false,
+            recipient: RecipientKind::Sender,
+            expect: Expect::AtLeast,
+        },
+        // Strict exact-out over a Curve span must be REJECTED at plan() time:
+        // CurveRouterNG has no exact-out entrypoint, so the Strict gate returns
+        // UnsupportedExactOut before any calldata is built.
+        PlanCase {
+            name: "multihop_curve_exact_out_strict_reject",
+            chain: ChainId(1),
+            pools: &["curve_3pool", "curve_tricrypto2"],
+            path: &[USDC, USDT, WETH],
+            amount: U256::from(100_000_000_000_000_000u64), // 0.1 WETH target
+            trade_type: TradeType::ExactOut,
+            native_in: false,
+            native_out: false,
+            recipient: RecipientKind::Sender,
+            expect: Expect::RejectBuild(BuildErrorKind::UnsupportedExactOut),
+        },
+    ]
+}
+
+/// Curve multi-hop span fork proof on mainnet. Gated on `$AMM_RPC_FORK_URL`.
+#[cfg(feature = "curve")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires $AMM_RPC_FORK_URL"]
+async fn multihop_curve_matrix() {
+    let Some((mut fork, _block)) = open_fork("AMM_RPC_FORK_URL", 20_000_000, ChainId(1)).await
+    else {
+        return;
+    };
+    let cfg = mainnet_chain_config();
+    for case in multihop_curve_cases() {
         run_plan_case(&mut fork, &cfg, &case).await;
     }
 }

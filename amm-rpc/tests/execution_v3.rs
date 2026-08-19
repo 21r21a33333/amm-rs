@@ -172,6 +172,25 @@ fn v3_cases() -> Vec<Case> {
             approval: ApprovalKind::Erc20,
             expect: Expect::WeiExact,
         },
+        // OrBetter exact-out: caller asks for exactly 0.1 WETH but accepts more.
+        // The executor backward-solves the input, then runs exact-in with the
+        // floor pinned to the target — delivering ≥ 0.1 WETH (AtLeast). Exercises
+        // the OrBetter degrade path on a family that DOES support Strict exact-out.
+        Case {
+            name: "v3_exact_out_orbetter_forward_usdc_weth",
+            chain: ChainId(1),
+            pools: &["usdc_weth_v3_005"],
+            direction: Direction::Forward,
+            trade: Trade::ExactOut {
+                amount_out: U256::from(100_000_000_000_000_000u128), // 0.1 WETH
+                policy: ExactOutPolicy::OrBetter,
+            },
+            native_in: false,
+            native_out: false,
+            recipient: RecipientKind::Sender,
+            approval: ApprovalKind::Erc20,
+            expect: Expect::AtLeast,
+        },
         // Note: V3 routes via SwapRouter02 with a direct ERC-20 approval — it
         // never uses Permit2 or the Universal Router, so there is no Permit2 row.
     ]

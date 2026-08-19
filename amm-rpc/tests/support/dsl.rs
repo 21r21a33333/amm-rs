@@ -43,6 +43,10 @@ pub const V3_ROUTER: Address = address!("0x68b3465833fb72A70ecDF485E0e4C7bD8665F
 /// Source: `execution_v2.rs` line 40 — `const WETH_ADDR`.
 pub const WETH_MAINNET: Address = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
 
+/// CurveRouterNG (v1.2) on Ethereum — the atomic multi-hop `exchange` router.
+/// Verified on-chain to hold the 6-arg `exchange` selector 0xc872a3c5.
+pub const CURVE_ROUTER: Address = address!("0x45312ea0eFf7E09C83CBE249fa1d7598c4C8cd4e");
+
 // ── Base infrastructure addresses ─────────────────────────────────────────────
 
 /// Aerodrome (Solidly) Router on Base.
@@ -116,6 +120,7 @@ pub fn mainnet_chain_config() -> ChainConfig {
     routers.v2 = Some(V2_ROUTER);
     routers.v3 = Some(V3_ROUTER);
     routers.pool_manager = Some(V4_MANAGER);
+    routers.curve = Some(CURVE_ROUTER);
     ChainConfig::new(ChainId(1), asset(1, WETH_MAINNET)).with_routers(routers)
 }
 
