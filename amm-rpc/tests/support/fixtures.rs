@@ -390,11 +390,11 @@ pub static FIXTURES: LazyLock<Vec<Fixture>> = LazyLock::new(|| {
             token1: TokenInfo {
                 addr: USDBC,
                 decimals: 6,
-                // USDbC is a proxy (EIP-1967 impl 0x1833c6…) with a non-standard
-                // balance layout — not in mapping slots 0..40, so it cannot be
-                // funded via simple slot-stuffing. Only usable as swap OUTPUT
-                // (USDC→USDbC), never as a funded input. Slot is a placeholder.
-                balance_slot: 9,
+                // USDbC is a proxy (EIP-1967 impl 0x1833c6…); its balanceOf
+                // mapping lives at Solidity slot 51 (verified on-chain — beyond
+                // the 0..40 range originally probed, which is why it was thought
+                // unfundable). Usable as a funded swap INPUT.
+                balance_slot: 51,
             },
             adapter: Adapter::Aerodrome {
                 stable: true,
@@ -535,8 +535,11 @@ pub static FIXTURES: LazyLock<Vec<Fixture>> = LazyLock::new(|| {
             token1: TokenInfo {
                 addr: CRVUSD,
                 decimals: 18,
-                // TODO(verify-on-fork): confirm crvUSD balanceOf slot at block 20_000_000.
-                balance_slot: 0,
+                // crvUSD is a Vyper contract: its balanceOf mapping uses the
+                // reversed key order at slot 1. Funding routes through the
+                // runner's `vyper_balance_slot` table (which overrides this
+                // Solidity-order field), so `crvUSD` can be a swap INPUT.
+                balance_slot: 1,
             },
             adapter: Adapter::Curve {
                 variant: CurveVariant::StableSwapNG,
@@ -559,7 +562,7 @@ pub static FIXTURES: LazyLock<Vec<Fixture>> = LazyLock::new(|| {
             token1: TokenInfo {
                 addr: TC_NG_TOKEN,
                 decimals: 18,
-                // TODO(verify-on-fork): confirm TC_NG_TOKEN balanceOf slot at block 20_000_000.
+                // Verified on-chain: TC_NG_TOKEN balanceOf is Solidity slot 0.
                 balance_slot: 0,
             },
             adapter: Adapter::Curve {

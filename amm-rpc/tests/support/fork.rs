@@ -172,13 +172,47 @@ impl<P: Provider + Clone> Fork<P> {
     /// `balance_slot` is the Solidity `mapping(address => uint256)` base slot
     /// (must be < 256 for the single-byte fast path used here).
     pub fn fund_erc20(&mut self, holder: Address, token: Address, balance_slot: u64, amount: U256) {
+        self.fund_erc20_layout(holder, token, balance_slot, amount, false);
+    }
+
+    /// Like [`fund_erc20`], but for **Vyper** contracts (e.g. crvUSD), whose
+    /// `HashMap` storage reverses the mapping-key operand order:
+    /// `keccak256(pad(slot) ++ pad(holder))` instead of Solidity's
+    /// `keccak256(pad(holder) ++ pad(slot))`.
+    pub fn fund_erc20_vyper(
+        &mut self,
+        holder: Address,
+        token: Address,
+        balance_slot: u64,
+        amount: U256,
+    ) {
+        self.fund_erc20_layout(holder, token, balance_slot, amount, true);
+    }
+
+    /// Slot-stuff an ERC-20 balance, computing the mapping key in either the
+    /// Solidity order (`vyper == false`) or the Vyper order (`vyper == true`).
+    fn fund_erc20_layout(
+        &mut self,
+        holder: Address,
+        token: Address,
+        balance_slot: u64,
+        amount: U256,
+        vyper: bool,
+    ) {
         debug_assert!(balance_slot < 256, "wide slots need full-word encoding");
-        // Solidity mapping slot: keccak256( key ++ base_slot )
-        // Layout (64 bytes): [0..12) = zero pad, [12..32) = holder, [32..64) = slot big-endian
+        // Mapping slot = keccak256(A ++ B). Solidity: A=holder-word, B=slot-word.
+        // Vyper HashMap reverses the operands: A=slot-word, B=holder-word.
         let mut pre = [0u8; 64];
-        pre[12..32].copy_from_slice(holder.as_slice());
-        // base slot fits in one byte; place it in the last byte of the 32-byte word
-        pre[63] = balance_slot as u8;
+        match vyper {
+            false => {
+                pre[12..32].copy_from_slice(holder.as_slice());
+                pre[63] = balance_slot as u8;
+            }
+            true => {
+                pre[31] = balance_slot as u8;
+                pre[44..64].copy_from_slice(holder.as_slice());
+            }
+        }
         let slot = U256::from_be_bytes(*keccak256(pre));
 
         let db = self.db.as_mut().expect("db must be present");
@@ -241,6 +275,24 @@ impl<P: Provider + Clone> Fork<P> {
         self.fund_erc20(holder, token, slot, amount);
         let got = self.erc20_balance(token, holder);
         assert_eq!(got, amount, "balance slot {slot} for {token} looks wrong");
+    }
+
+    /// Vyper-order variant of [`fund_erc20_verified`] (crvUSD and other Vyper
+    /// tokens): funds via the reversed mapping-key order, then asserts read-back.
+    #[allow(dead_code)]
+    pub fn fund_erc20_vyper_verified(
+        &mut self,
+        holder: Address,
+        token: Address,
+        slot: u64,
+        amount: U256,
+    ) {
+        self.fund_erc20_vyper(holder, token, slot, amount);
+        let got = self.erc20_balance(token, holder);
+        assert_eq!(
+            got, amount,
+            "vyper balance slot {slot} for {token} looks wrong"
+        );
     }
 
     /// Apply the swap's approval requirement from `from`, dispatching by kind:

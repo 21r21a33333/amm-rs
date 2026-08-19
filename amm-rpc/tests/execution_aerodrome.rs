@@ -200,10 +200,24 @@ fn aerodrome_cases() -> Vec<Case> {
             approval: ApprovalKind::Erc20,
             expect: Expect::WeiExact,
         },
-        // No USDbC-input (stable Reverse) row: USDbC is a proxy with a
-        // non-standard balance layout (not in mapping slots 0..40), so it can't
-        // be funded via slot-stuffing. The stable-swap math is proven by the
-        // Forward (USDC→USDbC) row above, which needs no USDbC funding.
+        // Reverse (USDbC → USDC): USDbC as the FUNDED INPUT. USDbC's balanceOf
+        // lives at Solidity slot 51 (verified on-chain — beyond the 0..40 range
+        // originally probed), so it can be slot-funded after all. Proves the
+        // stable-swap in the opposite direction with a proxy-token input.
+        Case {
+            name: "aero_stable_exact_in_reverse_usdbc_usdc",
+            chain: ChainId(8453),
+            pools: &["aero_stable_usdc_usdbc"],
+            direction: Direction::Reverse, // USDbC → USDC
+            trade: Trade::ExactIn {
+                amount_in: U256::from(1_000_000_000u64), // 1 000 USDbC (6 dp)
+            },
+            native_in: false,
+            native_out: false,
+            recipient: RecipientKind::Sender,
+            approval: ApprovalKind::Erc20,
+            expect: Expect::WeiExact,
+        },
         //
         // Note: OrBetter exact-out on Aerodrome degrades to exact-in with the
         // floor pinned to the target inside the `plan()` executor — not the

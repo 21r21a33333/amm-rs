@@ -303,6 +303,23 @@ fn curve_cases() -> Vec<Case> {
             approval: ApprovalKind::Erc20,
             expect: Expect::WeiExact,
         },
+        // Reverse (crvUSD → USDC): crvUSD as the FUNDED INPUT. crvUSD is a Vyper
+        // contract whose balanceOf mapping uses the reversed key order (slot 1) —
+        // funded via the runner's Vyper path. Proves crvUSD-input works end-to-end.
+        Case {
+            name: "curve_stable_ng_exact_in_reverse_crvusd_usdc",
+            chain: ChainId(1),
+            pools: &["curve_stable_ng"],
+            direction: Direction::Reverse, // crvUSD → USDC
+            trade: Trade::ExactIn {
+                amount_in: U256::from(1_000_000_000_000_000_000_000u128), // 1 000 crvUSD (18 dp)
+            },
+            native_in: false,
+            native_out: false,
+            recipient: RecipientKind::Sender,
+            approval: ApprovalKind::Erc20,
+            expect: Expect::WeiExact,
+        },
         // ── curve_twocrypto_ng ─────────────────────────────────────────────────
         //
         // Old test: wei_exact_twocrypto_ng_weth_to_tc_ng_token.
@@ -316,6 +333,23 @@ fn curve_cases() -> Vec<Case> {
             direction: Direction::Forward, // WETH → TC_NG_TOKEN
             trade: Trade::ExactIn {
                 amount_in: U256::from(100_000_000_000_000_000u128), // 0.1 WETH (18 dp)
+            },
+            native_in: false,
+            native_out: false,
+            recipient: RecipientKind::Sender,
+            approval: ApprovalKind::Erc20,
+            expect: Expect::WeiExact,
+        },
+        // Reverse (TC_NG_TOKEN → WETH): TC_NG_TOKEN as the FUNDED INPUT, exercising
+        // its verified Solidity slot 0. 100 TC_NG_TOKEN — a negligible fraction of
+        // the pool, so price impact is minimal and the quote is wei-exact.
+        Case {
+            name: "curve_twocrypto_ng_exact_in_reverse_token_weth",
+            chain: ChainId(1),
+            pools: &["curve_twocrypto_ng"],
+            direction: Direction::Reverse, // TC_NG_TOKEN → WETH
+            trade: Trade::ExactIn {
+                amount_in: U256::from(100_000_000_000_000_000_000u128), // 100 TC_NG_TOKEN (18 dp)
             },
             native_in: false,
             native_out: false,

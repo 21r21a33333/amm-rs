@@ -45,6 +45,34 @@ const DISTINCT_RECIPIENT: Address = Address::repeat_byte(0xD1);
 /// 1 ETH in wei — used as a headroom buffer for native-out and exact-out funding.
 const ONE_ETH: U256 = U256::from_limbs([1_000_000_000_000_000_000u64, 0, 0, 0]);
 
+/// Vyper-storage tokens whose `balanceOf` mapping reverses the key order
+/// (`keccak(slot ++ holder)` instead of Solidity's `keccak(holder ++ slot)`).
+/// Returns the base slot for `fund_erc20_vyper`; consulted before
+/// [`known_balance_slot`] so Vyper tokens fund at the correct storage key.
+fn vyper_balance_slot(token: Address) -> Option<u64> {
+    use alloy::primitives::address;
+    match token {
+        // crvUSD (Curve.Fi USD, a Vyper contract) — verified slot 1, reversed.
+        t if t == address!("f939E0A03FB07F59A73314E73794Be0E57ac1b4E") => Some(1),
+        _ => None,
+    }
+}
+
+/// Slot-stuff an ERC-20 balance, dispatching to the Vyper-order funder for
+/// tokens in [`vyper_balance_slot`] and the Solidity-order funder otherwise.
+fn fund_erc20_dispatch<P: Provider + Clone>(
+    fork: &mut Fork<P>,
+    holder: Address,
+    token: Address,
+    fallback_slot: u64,
+    amount: U256,
+) {
+    match vyper_balance_slot(token) {
+        Some(vslot) => fork.fund_erc20_vyper_verified(holder, token, vslot, amount),
+        None => fork.fund_erc20_verified(holder, token, fallback_slot, amount),
+    }
+}
+
 /// Known ERC-20 `balanceOf` mapping slots by token address. Authoritative for
 /// funding a multi-hop route's first input, where the token may be a Curve
 /// pool's third coin (outside the two-token fixture struct). Returns `None` for
@@ -594,7 +622,8 @@ where
         }
         false => {
             // ERC-20 input: slot-inject the fund amount and verify the read-back.
-            fork.fund_erc20_verified(SENDER, first_token_addr, first_token_slot, erc20_fund);
+            // Vyper tokens (crvUSD) use the reversed mapping-key order.
+            fund_erc20_dispatch(fork, SENDER, first_token_addr, first_token_slot, erc20_fund);
             // Also seed a small ETH buffer so the EVM does not reject the tx.
             fork.fund_native(SENDER, ONE_ETH);
         }
@@ -812,7 +841,8 @@ fn fund_input<P>(
                 fork.fund_native(SENDER, *amount_in + ONE_ETH);
             }
             false => {
-                fork.fund_erc20_verified(
+                fund_erc20_dispatch(
+                    fork,
                     SENDER,
                     in_token.addr,
                     in_token.balance_slot,
@@ -841,7 +871,8 @@ fn fund_input<P>(
                     .as_ref()
                     .map(|ms| ms.raw)
                     .unwrap_or(ONE_ETH);
-                fork.fund_erc20_verified(
+                fund_erc20_dispatch(
+                    fork,
                     SENDER,
                     in_token.addr,
                     in_token.balance_slot,
