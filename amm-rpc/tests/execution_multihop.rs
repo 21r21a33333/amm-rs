@@ -66,6 +66,9 @@ const USDT: &str = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
 /// crvUSD on Ethereum mainnet (18 dp) — output-only in the Curve matrix.
 #[cfg(feature = "curve")]
 const CRVUSD: &str = "0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E";
+/// TwoCrypto-NG token (18 dp) — output-only; pairs with WETH in curve_twocrypto_ng.
+#[cfg(feature = "curve")]
+const TC_NG_TOKEN: &str = "0x1cfa5641c01406aB8AC350dEd7d735ec41298372";
 
 // ── Case table ─────────────────────────────────────────────────────────────────
 
@@ -957,9 +960,17 @@ async fn multihop_slipstream_base_matrix() {
 /// consecutive Curve pools sharing a coin form the chain.
 ///
 /// pool_type coverage on-chain: 1 (StableSwapV1 3pool), 3 (TriCryptoV1
-/// tricrypto2), 10 (StableSwapNG). pool_type 2/20/30 are covered by the
-/// builder's `pool_type_table_is_ng_aware` unit test — no deeply-liquid chained
-/// fixture exists for them, and a thin NG token would make the fork case flaky.
+/// tricrypto2), 10 (StableSwapNG), 20 (TwoCrypto-NG). pool_type 2 and 30 differ
+/// from the fork-proven 3 and 20 only by the `n_coins` constant within the SAME
+/// interface (`CryptoU256UseEth`: 2↔3; `CryptoU256Receiver`: 20↔30) — a trivial
+/// branch covered by the builder's `pool_type_table_is_ng_aware` unit test, so
+/// both interface families and both n_coins branches are exercised without
+/// hunting two more deeply-liquid fixtures.
+///
+/// Multi-hop Permit2 is exercised implicitly: every Uniswap Universal Router
+/// span emits a Permit2 approval on its input (see `build_uniswap_span`), which
+/// `drive_spans` applies via `fork.permit2_approve` — so all multihop-Uniswap
+/// rows here are also multi-hop Permit2 proofs.
 #[cfg(feature = "curve")]
 fn multihop_curve_cases() -> Vec<PlanCase> {
     vec![
@@ -1048,6 +1059,22 @@ fn multihop_curve_cases() -> Vec<PlanCase> {
             native_out: false,
             recipient: RecipientKind::Sender,
             expect: Expect::AtLeast,
+        },
+        // pool_type 20 on-chain: USDT →(tricrypto2)→ WETH →(twocrypto_ng)→ TC_NG.
+        // Exercises build_curve_span's classifier for a TwoCrypto-NG pool
+        // (CryptoU256Receiver, n_coins=2 → pool_type 20) chained after a classic
+        // TriCrypto (pool_type 3) — both in one CurveRouterNG.exchange call.
+        PlanCase {
+            name: "multihop_curve_pool_type_20_usdt_weth_tcng",
+            chain: ChainId(1),
+            pools: &["curve_tricrypto2", "curve_twocrypto_ng"],
+            path: &[USDT, WETH, TC_NG_TOKEN],
+            amount: U256::from(100_000_000u64), // 100 USDT (6 dp)
+            trade_type: TradeType::ExactIn,
+            native_in: false,
+            native_out: false,
+            recipient: RecipientKind::Sender,
+            expect: Expect::WeiExact,
         },
         // Strict exact-out over a Curve span must be REJECTED at plan() time:
         // CurveRouterNG has no exact-out entrypoint, so the Strict gate returns
