@@ -37,6 +37,8 @@ pub struct Routers {
     pub aerodrome: Option<Address>,
     /// Aerodrome (Solidly) factory contract address.
     pub aerodrome_factory: Option<Address>,
+    /// Curve router (CurveRouterNG) contract address.
+    pub curve: Option<Address>,
 }
 
 /// Per-chain address configuration required by the swap build layer.
@@ -160,6 +162,19 @@ impl ChainConfig {
                 chain: self.chain,
                 what: MissingAddr::AerodromeFactory,
             })
+    }
+
+    /// Return the Curve router (CurveRouterNG) address, or a typed error if unconfigured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::MissingChainConfig`] with
+    /// `what = MissingAddr::CurveRouter` when no Curve router address has been set.
+    pub fn router_curve(&self) -> Result<Address, BuildError> {
+        self.routers.curve.ok_or(BuildError::MissingChainConfig {
+            chain: self.chain,
+            what: MissingAddr::CurveRouter,
+        })
     }
 
     /// Return the Uniswap Universal Router address, or a typed error if unconfigured.

@@ -64,12 +64,22 @@ pub struct RouterSpan {
     pub pools: Range<usize>,
 }
 
+/// Maximum pools CurveRouterNG can chain in one `exchange` call (`_route` holds
+/// 11 addresses = 5 swaps). A longer consecutive-Curve run is split into
+/// multiple ≤5-pool spans, which the executor chains sequentially.
+pub(crate) const CURVE_MAX_HOPS: usize = 5;
+
 /// Partition `route.pools` into maximal same-router [`RouterSpan`]s.
 ///
 /// The result is a total, ordered, gap-free partition of `0..route.pools.len()`:
 /// - `spans[0].pools.start == 0`
 /// - `spans.last().pools.end == route.pools.len()`
 /// - `spans[i].pools.end == spans[i+1].pools.start` for every adjacent pair
+///
+/// Consecutive Curve pools are additionally capped at [`CURVE_MAX_HOPS`] per
+/// span (CurveRouterNG's 5-swap limit), so a run of `k > 5` Curve pools becomes
+/// `ceil(k / 5)` spans that the executor submits and chains sequentially. Every
+/// other router family stays a single maximal span.
 ///
 /// Returns [`BuildError::UnsupportedProtocol`] if any pool has no classifiable
 /// router (i.e. [`RouterKind::of`] returns `None`).
@@ -79,10 +89,17 @@ pub fn partition(route: &Route<'_>) -> Result<Vec<RouterSpan>, BuildError> {
     for (i, pool) in route.pools.iter().enumerate() {
         let kind = RouterKind::of(*pool).ok_or(BuildError::UnsupportedProtocol)?;
 
-        // Extend the last span when it already has this router kind;
-        // otherwise open a fresh span at this index.
+        // Extend the last span when it already has this router kind — unless it
+        // is a Curve span that has already reached the router's 5-swap limit, in
+        // which case open a fresh Curve span so the run is split into chained
+        // calls. Otherwise open a fresh span at this index.
         match spans.last_mut() {
-            Some(span) if span.kind == kind => span.pools.end = i + 1,
+            Some(span)
+                if span.kind == kind
+                    && !(kind == RouterKind::Curve && span.pools.len() >= CURVE_MAX_HOPS) =>
+            {
+                span.pools.end = i + 1
+            }
             _ => spans.push(RouterSpan {
                 kind,
                 pools: i..i + 1,
@@ -243,6 +260,46 @@ mod tests {
 
         assert_eq!(segs[2].kind, RouterKind::Aerodrome);
         assert_eq!(segs[2].pools, 3..4);
+    }
+
+    #[test]
+    fn curve_run_over_five_pools_splits_into_chained_spans() {
+        // 7 consecutive Curve pools exceed CurveRouterNG's 5-swap limit, so the
+        // run must split into [0..5, 5..7] — two chained Curve spans.
+        let pools: Vec<MockPool> = (0..7)
+            .map(|_| MockPool::new(PoolKind::CurveStable))
+            .collect();
+        let refs: Vec<&dyn Pool> = pools.iter().map(|p| p as &dyn Pool).collect();
+        let path: Vec<AssetId> = (0u8..8).map(asset).collect();
+        let route = Route {
+            pools: refs,
+            path,
+            trade_type: TradeType::ExactIn,
+        };
+
+        let segs = partition(&route).unwrap();
+        assert_eq!(segs.len(), 2, "7 Curve pools split into two spans");
+        assert_eq!(segs[0].kind, RouterKind::Curve);
+        assert_eq!(segs[0].pools, 0..5, "first span caps at 5 pools");
+        assert_eq!(segs[1].kind, RouterKind::Curve);
+        assert_eq!(segs[1].pools, 5..7, "remainder forms the second span");
+    }
+
+    #[test]
+    fn curve_run_of_exactly_five_pools_stays_one_span() {
+        let pools: Vec<MockPool> = (0..5)
+            .map(|_| MockPool::new(PoolKind::CurveStable))
+            .collect();
+        let refs: Vec<&dyn Pool> = pools.iter().map(|p| p as &dyn Pool).collect();
+        let path: Vec<AssetId> = (0u8..6).map(asset).collect();
+        let route = Route {
+            pools: refs,
+            path,
+            trade_type: TradeType::ExactIn,
+        };
+        let segs = partition(&route).unwrap();
+        assert_eq!(segs.len(), 1, "exactly 5 Curve pools fit one span");
+        assert_eq!(segs[0].pools, 0..5);
     }
 
     #[test]

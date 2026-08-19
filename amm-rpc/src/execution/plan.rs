@@ -54,6 +54,8 @@ use crate::execution::prepared::PreparedSwap;
 use crate::execution::protocols::common;
 use crate::execution::routing::ExactOutPolicy;
 use crate::execution::routing::family::aerodrome::build_aerodrome_span;
+#[cfg(feature = "curve")]
+use crate::execution::routing::family::curve::build_curve_span;
 use crate::execution::routing::family::slipstream::{
     build_slipstream_span, build_slipstream_span_exact_out,
 };
@@ -482,8 +484,26 @@ impl<'a> Plan<'a> {
                 self.deadline,
                 is_final,
             )?,
-            // Curve (Plan 3b) is not yet wired.
-            (Some(RouterKind::Curve), _) | (None, _) => {
+            // Multi-hop Curve → one CurveRouterNG `exchange` for the whole span.
+            #[cfg(feature = "curve")]
+            (Some(RouterKind::Curve), _) => build_curve_span(
+                self.ctx,
+                self.route,
+                &span,
+                in_amount,
+                min_out,
+                recipient,
+                span_native_in,
+                span_native_out,
+                self.deadline,
+                is_final,
+            )?,
+            // Without the `curve` feature the Curve encoder is absent.
+            #[cfg(not(feature = "curve"))]
+            (Some(RouterKind::Curve), _) => {
+                return Err(BuildError::UnsupportedProtocol);
+            }
+            (None, _) => {
                 return Err(BuildError::UnsupportedProtocol);
             }
         };

@@ -6,5 +6,7 @@
 //! or the Aerodrome multi-hop router).
 
 pub mod aerodrome;
+#[cfg(feature = "curve")]
+pub mod curve;
 pub mod slipstream;
 pub mod uniswap_ur;

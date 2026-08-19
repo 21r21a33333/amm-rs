@@ -28,6 +28,8 @@ pub enum MissingAddr {
     AerodromeRouter,
     /// Aerodrome (Solidly) factory contract.
     AerodromeFactory,
+    /// Curve router (CurveRouterNG) contract.
+    CurveRouter,
 }
 
 /// All the ways a swap build step can fail before touching the network.
