@@ -174,6 +174,17 @@ Implement `Pool` (and any extension traits you can support) for your type in you
 own crate. Nothing in `amm-rs` needs to change, and your pool drops straight into
 any router that consumes `Box<dyn Pool>`.
 
+## Ecosystem — the off-chain router
+
+`amm-rs` is the quoting + calldata engine; [**`arb-router`**](../arb-router) is
+the companion off-chain **universal router** built on top of it. Per chain it
+discovers and refreshes pools into `amm-core` pools (via `amm-rpc`'s
+`StateSource`), models the market as a graph of assets and pools, enumerates and
+quotes candidate paths against the local pool math, and ranks opportunities over
+a read API — then executes the chosen route through this library's `plan()`
+builder. It is the reference consumer that demonstrates the full path from raw
+chain state to a signed-ready multi-hop swap.
+
 ## Correctness
 
 Four layers:

@@ -16,6 +16,7 @@
 //! - [`Executable`] — sealed trait for pools that can encode swap transactions
 //! - [`as_executable`] — dispatch: recovers a pool's encoder by concrete type
 
+pub mod chains;
 pub mod config;
 pub mod error;
 pub mod executable;

@@ -5,7 +5,8 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "Optional alloy-backed on-chain state fetching for amm-core pools."
+description = "On-chain state fetching and swap calldata for amm-core pools."
+readme = "README.md"
 
 [dependencies]
 amm-core = { path = "../amm-core", features = ["uniswap-v2", "uniswap-v3", "uniswap-v4", "aerodrome"] }

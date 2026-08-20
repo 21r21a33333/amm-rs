@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 description = "Wei-exact AMM quoting primitives and traits behind an open Pool trait."
+readme = "README.md"
 
 [dependencies]
 alloy-primitives = { workspace = true }
