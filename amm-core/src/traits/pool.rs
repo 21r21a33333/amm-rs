@@ -35,6 +35,7 @@ pub trait Pool: Any + Send + Sync {
     ///
     /// Returns [`QuoteError::AssetNotInPool`] if the pool does not trade the
     /// `amount_in.asset -> to` pair.
+    #[must_use = "discarding the quote silently loses a wei-exact output or hides a quote error"]
     fn quote(&self, amount_in: &AssetAmount, to: &AssetId) -> Result<AssetAmount, QuoteError>;
 
     /// This pool as an [`ExactOut`] quoter, or `None` if it doesn't support

@@ -74,7 +74,7 @@ fn build_pool(key: &PoolKey, reserve0: U256, reserve1: U256) -> Option<Box<dyn P
         [a, b] => [*a, *b],
         _ => return None,
     };
-    let id = PoolId::new(&format!(
+    let id = PoolId::new(format!(
         "{}:{}:{}",
         key.chain.0,
         key.exchange.as_str(),

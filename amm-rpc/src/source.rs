@@ -11,7 +11,7 @@ use crate::error::RpcError;
 /// The canonical identity for a fetched pool: `chain:exchange:address`. Shared by
 /// every source so the id format lives in one place.
 pub(crate) fn pool_id(key: &PoolKey) -> PoolId {
-    PoolId::new(&format!(
+    PoolId::new(format!(
         "{}:{}:{}",
         key.chain.0,
         key.exchange.as_str(),

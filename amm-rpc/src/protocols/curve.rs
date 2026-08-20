@@ -334,7 +334,7 @@ fn build_curve_pool(config: &CurvePoolConfig, results: &[CallResult]) -> Option<
     let inner = build_pool(&raw).ok()?;
     Some(Box::new(
         CurvePool::new(
-            amm_core::primitives::pool::PoolId::new(&config.address.to_string()),
+            amm_core::primitives::pool::PoolId::new(config.address.to_string()),
             config.coins.clone(),
             inner,
         )

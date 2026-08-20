@@ -373,8 +373,8 @@ pub(crate) fn build_slipstream_span(
 /// - [`BuildError::MissingChainConfig`] — Slipstream router not configured.
 /// - [`BuildError::UnsupportedProtocol`] — a pool in the span cannot be downcast.
 //
-// `dead_code`: called by Task 9's exact-out dispatch once plan.rs is wired.
-// Exercised by this module's tests.
+// `dead_code`: reached only through the executor's Strict exact-out dispatch;
+// exercised directly by this module's tests.
 #[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) fn build_slipstream_span_exact_out(
     ctx: &ChainConfig,

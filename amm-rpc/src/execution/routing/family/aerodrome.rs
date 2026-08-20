@@ -244,7 +244,8 @@ pub(crate) fn build_aerodrome_span(
 /// Accepted for signature parity with [`super::uniswap_ur::build_uniswap_span_exact_out`];
 /// callers that support exact-out must not route Aerodrome spans through this builder.
 //
-// `dead_code`: present for API completeness; plan.rs exact-out is stubbed (Task 9).
+// `dead_code`: present for signature parity with sibling `_exact_out` builders;
+// Solidly has no exact-out entrypoint, so the executor never dispatches here.
 #[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) fn build_aerodrome_span_exact_out(
     _ctx: &ChainConfig,

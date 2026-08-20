@@ -113,9 +113,8 @@ fn downcast<T: Any>(pool: &dyn Pool) -> Result<&T, BuildError> {
 /// - [`BuildError::Overflow`] — a V4 `amountOutMinimum` exceeds `u128`.
 /// - Router/Permit2 address lookups may return [`BuildError::MissingChainConfig`].
 //
-// `dead_code`: this is the span-dispatch entry point; the multi-span
-// composer that calls it lands in a later task. Exercised now by this module's
-// tests. The allow keeps `downcast` (only reachable through here) live too.
+// `dead_code`: span-dispatch entry point called by the plan executor; the
+// allow also keeps `downcast` (only reachable through here) live.
 #[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) fn build_uniswap_span(
     ctx: &ChainConfig,
@@ -356,7 +355,7 @@ fn span_is_single_version(route: &Route<'_>, span: &RouterSpan) -> Option<PoolKi
 /// - [`BuildError::Overflow`] — a V4 amount exceeds `u128`.
 /// - Router/Permit2 address lookups may return [`BuildError::MissingChainConfig`].
 //
-// `dead_code`: entry point used by the multi-span composer (later task).
+// `dead_code`: reached only through the executor's Strict exact-out dispatch.
 // Exercised by this module's tests. Allow keeps `span_is_single_version` live.
 #[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) fn build_uniswap_span_exact_out(
@@ -1433,7 +1432,7 @@ mod tests {
     }
 
     /// exact-out with native_in=true → Err(UnsupportedProtocol).
-    /// Native-ETH exact-out edges are deferred; they land with on-chain fork proofs later.
+    /// Native-ETH exact-out edges are not supported by this span builder.
     #[test]
     fn exact_out_native_in_returns_unsupported_protocol() {
         let (a, b, c) = (asset(0x11), asset(0x22), asset(0x33));
@@ -1471,7 +1470,7 @@ mod tests {
     }
 
     /// exact-out with native_out=true → Err(UnsupportedProtocol).
-    /// Native-ETH exact-out edges are deferred; they land with on-chain fork proofs later.
+    /// Native-ETH exact-out edges are not supported by this span builder.
     #[test]
     fn exact_out_native_out_returns_unsupported_protocol() {
         let (a, b, c) = (asset(0x11), asset(0x22), asset(0x33));

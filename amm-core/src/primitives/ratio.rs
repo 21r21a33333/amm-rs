@@ -14,6 +14,7 @@ use num_traits::Zero;
 
 /// Rounding mode, applied only at value-producing boundaries (never silently).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Rounding {
     /// Toward zero (floor for non-negative values).
     Down,
@@ -40,10 +41,12 @@ pub struct Ratio(BigRational);
 
 impl Ratio {
     /// Build from `U256` parts. `None` if `den == 0`.
+    #[must_use]
     pub fn new(num: U256, den: U256) -> Option<Ratio> {
-        match den.is_zero() {
-            true => None,
-            false => Some(Ratio(BigRational::new(to_bigint(num), to_bigint(den)))),
+        if den.is_zero() {
+            None
+        } else {
+            Some(Ratio(BigRational::new(to_bigint(num), to_bigint(den))))
         }
     }
 
@@ -60,6 +63,7 @@ impl Ratio {
     /// `floor(sqrt(self · 2¹⁹²))`. The exact inverse of [`Ratio::from_q192_sqrt`]
     /// for perfect squares, flooring otherwise. `None` only if the result exceeds
     /// `U256` (unreachable for any in-range price).
+    #[must_use]
     pub fn to_q192_sqrt(&self) -> Option<U256> {
         // sqrtPriceX96 = floor( sqrt( numer · 2¹⁹² / denom ) ). numer ≥ 0 and
         // denom > 0 (a non-negative reduced rational), so the root is well-defined.
@@ -68,10 +72,12 @@ impl Ratio {
     }
 
     /// The reciprocal. `None` if the ratio is zero.
+    #[must_use]
     pub fn invert(self) -> Option<Ratio> {
-        match self.0.is_zero() {
-            true => None,
-            false => Some(Ratio(self.0.recip())),
+        if self.0.is_zero() {
+            None
+        } else {
+            Some(Ratio(self.0.recip()))
         }
     }
 
@@ -109,9 +115,10 @@ fn to_bigint(x: U256) -> BigInt {
 
 fn from_bigint(x: &BigInt) -> Option<U256> {
     let (sign, bytes) = x.to_bytes_be();
-    match sign == Sign::Minus || bytes.len() > 32 {
-        true => None,
-        false => Some(U256::from_be_slice(&bytes)),
+    if sign == Sign::Minus || bytes.len() > 32 {
+        None
+    } else {
+        Some(U256::from_be_slice(&bytes))
     }
 }
 

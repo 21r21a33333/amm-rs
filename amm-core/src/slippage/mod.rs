@@ -30,6 +30,7 @@ impl Slippage {
 
     /// The minimum output to accept for a quoted output: `quoted * (1 - tol)`,
     /// rounded **down**.
+    #[must_use]
     pub fn min_amount_out(&self, quoted_out: &AssetAmount) -> AssetAmount {
         let Bps(tol) = self.0;
         let num = BPS_ONE.saturating_sub(u64::from(tol));
@@ -42,6 +43,7 @@ impl Slippage {
 
     /// The maximum input to spend for a quoted input: `quoted * (1 + tol)`,
     /// rounded **up** (saturating at `U256::MAX`).
+    #[must_use]
     pub fn max_amount_in(&self, quoted_in: &AssetAmount) -> AssetAmount {
         let Bps(tol) = self.0;
         let num = BPS_ONE + u64::from(tol);
@@ -54,6 +56,7 @@ impl Slippage {
 
     /// Compound this per-hop tolerance across `hops`: `1 - (1 - tol)^hops`,
     /// floored to whole basis points.
+    #[must_use]
     pub fn compound(self, hops: usize) -> Slippage {
         let Bps(tol) = self.0;
         let one_minus_t = Ratio::new(

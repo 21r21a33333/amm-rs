@@ -77,23 +77,22 @@ impl UniswapV2Pool {
         reserve_out: U256,
         amount_in: U256,
     ) -> Result<U256, QuoteError> {
-        match reserve_in.is_zero() || reserve_out.is_zero() {
-            true => Err(QuoteError::InsufficientLiquidity),
-            false => {
-                let in_with_fee = amount_in
-                    .checked_mul(self.fee_factor()?)
-                    .ok_or(QuoteError::Overflow)?;
-                let numerator = in_with_fee
-                    .checked_mul(reserve_out)
-                    .ok_or(QuoteError::Overflow)?;
-                let denominator = reserve_in
-                    .checked_mul(U256::from(BPS_ONE))
-                    .ok_or(QuoteError::Overflow)?
-                    .checked_add(in_with_fee)
-                    .ok_or(QuoteError::Overflow)?;
-                // denominator ≥ reserve_in·10000 > 0, so the division is safe.
-                Ok(numerator / denominator)
-            }
+        if reserve_in.is_zero() || reserve_out.is_zero() {
+            Err(QuoteError::InsufficientLiquidity)
+        } else {
+            let in_with_fee = amount_in
+                .checked_mul(self.fee_factor()?)
+                .ok_or(QuoteError::Overflow)?;
+            let numerator = in_with_fee
+                .checked_mul(reserve_out)
+                .ok_or(QuoteError::Overflow)?;
+            let denominator = reserve_in
+                .checked_mul(U256::from(BPS_ONE))
+                .ok_or(QuoteError::Overflow)?
+                .checked_add(in_with_fee)
+                .ok_or(QuoteError::Overflow)?;
+            // denominator ≥ reserve_in·10000 > 0, so the division is safe.
+            Ok(numerator / denominator)
         }
     }
 
@@ -107,23 +106,23 @@ impl UniswapV2Pool {
         reserve_out: U256,
         amount_out: U256,
     ) -> Result<U256, QuoteError> {
-        match reserve_in.is_zero() || amount_out >= reserve_out {
-            true => Err(QuoteError::InsufficientLiquidity),
-            false => {
-                let numerator = reserve_in
-                    .checked_mul(amount_out)
-                    .ok_or(QuoteError::Overflow)?
-                    .checked_mul(U256::from(BPS_ONE))
-                    .ok_or(QuoteError::Overflow)?;
-                let denominator = (reserve_out - amount_out)
-                    .checked_mul(self.fee_factor()?)
-                    .ok_or(QuoteError::Overflow)?;
-                match denominator.is_zero() {
-                    true => Err(QuoteError::Overflow),
-                    false => (numerator / denominator)
-                        .checked_add(U256::from(1u64))
-                        .ok_or(QuoteError::Overflow),
-                }
+        if reserve_in.is_zero() || amount_out >= reserve_out {
+            Err(QuoteError::InsufficientLiquidity)
+        } else {
+            let numerator = reserve_in
+                .checked_mul(amount_out)
+                .ok_or(QuoteError::Overflow)?
+                .checked_mul(U256::from(BPS_ONE))
+                .ok_or(QuoteError::Overflow)?;
+            let denominator = (reserve_out - amount_out)
+                .checked_mul(self.fee_factor()?)
+                .ok_or(QuoteError::Overflow)?;
+            if denominator.is_zero() {
+                Err(QuoteError::Overflow)
+            } else {
+                (numerator / denominator)
+                    .checked_add(U256::from(1u64))
+                    .ok_or(QuoteError::Overflow)
             }
         }
     }

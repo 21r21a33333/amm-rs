@@ -135,7 +135,7 @@ impl Pricing for AerodromeSlipstreamPool {
 impl Introspect for AerodromeSlipstreamPool {
     fn fee_bps(&self, source: &AssetId, destination: &AssetId) -> Option<Bps> {
         two_asset_direction(&self.assets, source, destination)
-            .map(|_| Bps((self.fee_pips / 100) as u16))
+            .map(|_| Bps(u16::try_from(self.fee_pips / 100).unwrap_or(u16::MAX)))
     }
 
     fn reserve(&self, _asset: &AssetId) -> Option<AssetAmount> {

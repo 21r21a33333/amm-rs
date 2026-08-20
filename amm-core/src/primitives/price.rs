@@ -25,10 +25,12 @@ pub struct Price {
 impl Price {
     /// Build a price of `quote` per `base`. `None` if `base == quote` or the
     /// ratio is zero (both are degenerate and would break `invert`).
+    #[must_use]
     pub fn new(base: AssetId, quote: AssetId, ratio: Ratio) -> Option<Price> {
-        match base == quote || ratio.is_zero() {
-            true => None,
-            false => Some(Price { base, quote, ratio }),
+        if base == quote || ratio.is_zero() {
+            None
+        } else {
+            Some(Price { base, quote, ratio })
         }
     }
 
@@ -49,6 +51,7 @@ impl Price {
 
     /// The reciprocal price, `base` per `quote`. Total: a `Price` always has a
     /// non-zero ratio and distinct base/quote by construction.
+    #[must_use]
     pub fn invert(self) -> Price {
         let ratio = self
             .ratio
@@ -63,28 +66,29 @@ impl Price {
 
     /// Convert a base amount into a quote amount at this price (rounding down).
     /// `Err(AssetMismatch)` if `input.asset != self.base`.
+    #[must_use = "discarding the converted amount silently loses a wei-exact result or hides an asset mismatch"]
     pub fn convert(&self, input: &AssetAmount) -> Result<AssetAmount, QuoteError> {
-        match input.asset == self.base {
-            false => Err(QuoteError::AssetMismatch {
+        if input.asset != self.base {
+            Err(QuoteError::AssetMismatch {
                 expected: self.base,
                 got: input.asset,
-            }),
-            true => {
-                let raw = self
-                    .ratio
-                    .apply(input.raw, Rounding::Down)
-                    .ok_or(QuoteError::Overflow)?;
-                Ok(AssetAmount {
-                    asset: self.quote,
-                    raw,
-                })
-            }
+            })
+        } else {
+            let raw = self
+                .ratio
+                .apply(input.raw, Rounding::Down)
+                .ok_or(QuoteError::Overflow)?;
+            Ok(AssetAmount {
+                asset: self.quote,
+                raw,
+            })
         }
     }
 
     /// Chain two prices along a path: `self` (`base→quote`) composed with `next`
     /// (`quote→other`) yields `base→other`. `Err(AssetMismatch)` if
     /// `self.quote != next.base`.
+    #[must_use = "discarding the composed price silently drops a multi-hop rate or hides a path error"]
     pub fn compose(self, next: Price) -> Result<Price, QuoteError> {
         if self.quote != next.base {
             return Err(QuoteError::AssetMismatch {
@@ -103,9 +107,10 @@ impl PartialOrd for Price {
     /// Prices are comparable only when they share the same `base` and `quote`
     /// orientation; otherwise the comparison is meaningless (`None`).
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        match self.base == other.base && self.quote == other.quote {
-            true => Some(self.ratio.cmp(&other.ratio)),
-            false => None,
+        if self.base == other.base && self.quote == other.quote {
+            Some(self.ratio.cmp(&other.ratio))
+        } else {
+            None
         }
     }
 }

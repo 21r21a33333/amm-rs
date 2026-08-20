@@ -26,7 +26,8 @@
 //! - **>1 Uniswap** → [`build_uniswap_span`] (one Universal Router `execute`).
 //! - **>1 Aerodrome** → [`build_aerodrome_span`] (one Aerodrome router call, `Route[]`).
 //! - **>1 Slipstream** → [`build_slipstream_span`] (one path-encoded `exactInput`).
-//! - **>1 Curve** → [`BuildError::UnsupportedProtocol`] until Plan 3b lands.
+//! - **>1 Curve** → `build_curve_span` (one `CurveRouterNG.exchange`; requires
+//!   the `curve` feature).
 //!
 //! ## Recipients
 //! Only the **final** span pays the caller's recipient; every earlier span
@@ -36,7 +37,7 @@
 //! `native_in`/`native_out` are supplied explicitly to [`plan`] (the [`Route`]
 //! carries no [`Currency`], so native intent cannot be derived from it). Only
 //! the first span may wrap native input; only the final span may unwrap to
-//! native output. Task 2 refines slippage/native handling.
+//! native output.
 
 use alloy::primitives::{Address, U256};
 use amm_core::error::QuoteError;
@@ -67,21 +68,14 @@ use crate::execution::types::{Currency, CurrencyAmount, TradeType};
 
 /// Map a path [`QuoteError`] to a [`BuildError`].
 ///
-/// `ExactOutUnavailable` is the only quote error that names a specific
-/// capability gap, so it maps to [`BuildError::UnsupportedExactOut`] (the pool
-/// kind is unknown at this layer, so a generic V4 kind is not appropriate — we
-/// only reach this from the exact-out backward solve, which Task 9 wires; the
-/// exact-in path here never produces it). Every other math failure (asset
-/// mismatch, insufficient liquidity, overflow, …) is a pool that cannot serve
-/// this route, which the build layer already expresses as
-/// [`BuildError::UnsupportedProtocol`].
+/// `ExactOutUnavailable` names the specific pool that cannot backward-solve an
+/// exact-out quote, so it maps to [`BuildError::ExactOutUnavailable`] carrying
+/// that pool's id. Every other math failure (asset mismatch, insufficient
+/// liquidity, overflow, …) is a pool that cannot serve this route, which the
+/// build layer expresses as [`BuildError::UnsupportedProtocol`].
 fn map_quote_err(e: QuoteError) -> BuildError {
     match e {
-        // A pool on the path lacks exact-out; surface as the exact-out gap.
-        QuoteError::ExactOutUnavailable { .. } => BuildError::UnsupportedExactOut {
-            kind: PoolKind::UniswapV4,
-        },
-        // All other quote failures mean this route is not serviceable here.
+        QuoteError::ExactOutUnavailable { pool } => BuildError::ExactOutUnavailable { pool },
         _ => BuildError::UnsupportedProtocol,
     }
 }
@@ -343,9 +337,8 @@ impl<'a> Plan<'a> {
     /// span takes its input from the quoted route start.
     ///
     /// # Errors
-    /// - [`BuildError::UnresolvedRecipient`] when a sequential span is missing
-    ///   its `observed` predecessor output (no dedicated variant exists; this
-    ///   reuses the "recipient/amount not resolved" family — see the report).
+    /// - [`BuildError::MissingObservedAmount`] when a sequential span is driven
+    ///   without its predecessor's `observed` output amount.
     /// - Any [`BuildError`] from the underlying span/pool builder.
     pub fn next_tx(
         &mut self,
@@ -394,10 +387,9 @@ impl<'a> Plan<'a> {
         // Compound the per-hop tolerance across the number of pools in this span.
         // A k-pool atomic Uniswap span must revert when the *cumulative* drift
         // across all k hops exceeds the user's tolerance; compounding scales that
-        // floor correctly.  For a 1-pool span compound(1) is the identity, so
-        // behaviour is unchanged relative to Task 1.  Sequential (cross-router)
-        // spans each carry their own compound floor, which is correct because each
-        // one submits as its own on-chain transaction.
+        // floor correctly. For a 1-pool span compound(1) is the identity.
+        // Sequential (cross-router) spans each carry their own compound floor,
+        // which is correct because each submits as its own on-chain transaction.
         let span_hops = end - start; // == span.pools.len()
         // OrBetter exact-out overrides the FINAL span's floor with the exact
         // target, so delivery is `AtLeast(target)` rather than the slippage floor
@@ -522,7 +514,7 @@ impl<'a> Plan<'a> {
         // observed output — the ground-truth input for this leg.
         match self.cursor {
             0 => Ok(self.amounts[0].raw),
-            _ => Ok(observed.ok_or(BuildError::UnresolvedRecipient)?.raw),
+            _ => Ok(observed.ok_or(BuildError::MissingObservedAmount)?.raw),
         }
     }
 
@@ -946,7 +938,7 @@ mod tests {
         );
     }
 
-    // ── Task 2: slippage compounding ─────────────────────────────────────────
+    // ── Slippage compounding ─────────────────────────────────────────────────
 
     /// (a) A 2-hop single Uniswap span is atomic: the Universal Router encodes
     /// one `execute` call whose last V3 hop carries `amountOutMinimum` equal to
@@ -954,9 +946,9 @@ mod tests {
     ///
     /// Invariant: `amountOutMinimum == slippage.compound(2).min_amount_out(quoted_span_out).raw`
     ///
-    /// This is the key new guard from Task 2.  A naive `slippage.min_amount_out`
-    /// (no compounding) would accept too much drift on a 2-hop path; compounding
-    /// scales the floor to the cumulative tolerance over both hops.
+    /// A naive `slippage.min_amount_out` (no compounding) would accept too much
+    /// drift on a 2-hop path; compounding scales the floor to the cumulative
+    /// tolerance over both hops.
     #[test]
     fn two_hop_ur_span_carries_compounded_slippage_floor() {
         use crate::execution::route_planner::IUniversalRouter;
@@ -1268,7 +1260,7 @@ mod tests {
         );
     }
 
-    // ── Task 9: exact-out (Strict vs OrBetter) ───────────────────────────────
+    // ── Exact-out (Strict vs OrBetter) ───────────────────────────────────────
 
     /// Strict exact-out on a single atomic all-V3 span: `next_tx(None)` yields a
     /// UR `execute` whose command stream is `[V3_SWAP_EXACT_OUT]`, carrying the

@@ -11,6 +11,7 @@ use crate::traits::pool::Pool;
 /// tick/curve pools.
 pub trait ExactOut: Pool {
     /// The `from` input amount required to receive exactly `amount_out`.
+    #[must_use = "discarding the input quote silently loses the required amount or hides a quote error"]
     fn quote_exact_out(
         &self,
         amount_out: &AssetAmount,

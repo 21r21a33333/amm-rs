@@ -79,6 +79,7 @@ pub struct AssetAmount {
 
 impl AssetAmount {
     /// Construct from a raw base-unit amount.
+    #[must_use]
     pub const fn new(asset: AssetId, raw: U256) -> Self {
         Self { asset, raw }
     }
@@ -86,6 +87,7 @@ impl AssetAmount {
     /// Parse a human decimal string (e.g. `"1.5"`) into a raw amount using
     /// `decimals`. Delegates to alloy's `parse_units`; rejects negatives and
     /// more fractional digits than `decimals`.
+    #[must_use = "discarding a parsed amount silently drops precision; use the value or propagate the error"]
     pub fn from_decimal(asset: AssetId, decimals: u8, s: &str) -> Result<Self, ParseError> {
         // alloy's parse_units silently truncates extra fractional digits; reject
         // that here so a wei-exact library never loses precision quietly.
@@ -101,11 +103,13 @@ impl AssetAmount {
     }
 
     /// Render as a human decimal string using `decimals` (alloy's `format_units`).
+    #[must_use = "discarding the formatted string silently loses the value; use or propagate"]
     pub fn to_decimal_string(&self, decimals: u8) -> Result<String, ParseError> {
         format_units(self.raw, decimals).map_err(|_| ParseError::Decimal)
     }
 
     /// Add two amounts of the *same* asset. `Err(AssetMismatch)` otherwise.
+    #[must_use = "discarding the sum silently loses the result or hides an asset mismatch"]
     pub fn try_add(self, other: Self) -> Result<Self, QuoteError> {
         self.same_asset(&other)?;
         let raw = self
@@ -120,6 +124,7 @@ impl AssetAmount {
 
     /// Subtract two amounts of the *same* asset. `Err(AssetMismatch)` on a
     /// different asset, `Err(Overflow)` on underflow.
+    #[must_use = "discarding the difference silently loses the result or hides an error"]
     pub fn try_sub(self, other: Self) -> Result<Self, QuoteError> {
         self.same_asset(&other)?;
         let raw = self
@@ -133,12 +138,13 @@ impl AssetAmount {
     }
 
     fn same_asset(&self, other: &Self) -> Result<(), QuoteError> {
-        match self.asset == other.asset {
-            true => Ok(()),
-            false => Err(QuoteError::AssetMismatch {
+        if self.asset == other.asset {
+            Ok(())
+        } else {
+            Err(QuoteError::AssetMismatch {
                 expected: self.asset,
                 got: other.asset,
-            }),
+            })
         }
     }
 }

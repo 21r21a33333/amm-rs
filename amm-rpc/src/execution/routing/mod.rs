@@ -1,7 +1,7 @@
 //! The routing layer's public types. A `Route` is the single execution-time
 //! route type — one or more pools traversed in order. A single-hop swap is
-//! just a 1-pool route. The planner (later tasks) turns a `Route` into
-//! encoded calldata by dispatching to per-pool `Executable` encoders.
+//! just a 1-pool route. The planner turns a `Route` into encoded calldata by
+//! dispatching to per-pool `Executable` encoders.
 
 pub mod family;
 pub mod router_span;
@@ -27,6 +27,8 @@ pub struct Route<'a> {
 }
 
 /// What to do when a pool along the route cannot perform a true exact-out swap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ExactOutPolicy {
     /// Return an error rather than approximate.
     Strict,

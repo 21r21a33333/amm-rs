@@ -624,7 +624,7 @@ fn structural_uniswap_span_wellformed_2_to_6_hops() {
         let addr_b = Address::from_word(b.token);
         let (lo, hi) = if addr_a < addr_b { (a, b) } else { (b, a) };
         UniswapV3Pool::new(
-            PoolId::new(&format!("1:univ3:synthetic-{idx}")),
+            PoolId::new(format!("1:univ3:synthetic-{idx}")),
             [lo, hi],
             U256::from(SQRT_1_1),
             1_000_000_000_000_000_000u128, // 1e18 liquidity

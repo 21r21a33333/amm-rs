@@ -1,4 +1,4 @@
-//! Curve multi-pool span builder (Plan 3b).
+//! Curve multi-pool span builder.
 //!
 //! Encodes one ≤5-pool [`RouterSpan`] of consecutive Curve pools into a single
 //! atomic `CurveRouterNG.exchange(...)` transaction. Longer consecutive-Curve

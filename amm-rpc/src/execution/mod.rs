@@ -34,4 +34,5 @@ pub use executable::{Executable, as_executable};
 pub use options::{ApprovalMode, Deadline, ExecutionOptions, Recipient, resolve};
 pub use plan::{Plan, plan};
 pub use prepared::{ApprovalRequirement, PreparedSwap};
+pub use routing::{ExactOutPolicy, Route, RouterKind, RouterSpan, partition};
 pub use types::{Currency, CurrencyAmount, TradeType, UnsignedTx};

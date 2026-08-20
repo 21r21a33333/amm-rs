@@ -73,15 +73,14 @@ impl AerodromeVolatilePool {
         reserve_out: U256,
         amount_in: U256,
     ) -> Result<U256, QuoteError> {
-        match reserve_in.is_zero() || reserve_out.is_zero() {
-            true => Err(QuoteError::InsufficientLiquidity),
-            false => {
-                let net = self.after_fee(amount_in)?;
-                let numerator = net.checked_mul(reserve_out).ok_or(QuoteError::Overflow)?;
-                // reserve_in > 0, so the denominator is non-zero.
-                let denominator = reserve_in.checked_add(net).ok_or(QuoteError::Overflow)?;
-                Ok(numerator / denominator)
-            }
+        if reserve_in.is_zero() || reserve_out.is_zero() {
+            Err(QuoteError::InsufficientLiquidity)
+        } else {
+            let net = self.after_fee(amount_in)?;
+            let numerator = net.checked_mul(reserve_out).ok_or(QuoteError::Overflow)?;
+            // reserve_in > 0, so the denominator is non-zero.
+            let denominator = reserve_in.checked_add(net).ok_or(QuoteError::Overflow)?;
+            Ok(numerator / denominator)
         }
     }
 
@@ -98,36 +97,34 @@ impl AerodromeVolatilePool {
         reserve_out: U256,
         amount_out: U256,
     ) -> Result<U256, QuoteError> {
-        match reserve_in.is_zero() || amount_out >= reserve_out {
-            true => Err(QuoteError::InsufficientLiquidity),
-            false => {
-                let numerator = reserve_in
-                    .checked_mul(amount_out)
-                    .ok_or(QuoteError::Overflow)?;
-                let net_needed = (numerator / (reserve_out - amount_out))
+        if reserve_in.is_zero() || amount_out >= reserve_out {
+            Err(QuoteError::InsufficientLiquidity)
+        } else {
+            let numerator = reserve_in
+                .checked_mul(amount_out)
+                .ok_or(QuoteError::Overflow)?;
+            let net_needed = (numerator / (reserve_out - amount_out))
+                .checked_add(U256::from(1u64))
+                .ok_or(QuoteError::Overflow)?;
+            // Gross the post-fee input back up: in = ceil(net · 10000 / (10000 − fee)).
+            let fee_factor = BPS_ONE
+                .checked_sub(self.fee_bps)
+                .ok_or(QuoteError::Overflow)?;
+            if fee_factor == 0 {
+                Err(QuoteError::Overflow)
+            } else {
+                let candidate = net_needed
+                    .checked_mul(U256::from(BPS_ONE))
+                    .ok_or(QuoteError::Overflow)?
+                    .checked_div(U256::from(fee_factor))
+                    .ok_or(QuoteError::Overflow)?
                     .checked_add(U256::from(1u64))
                     .ok_or(QuoteError::Overflow)?;
-                // Gross the post-fee input back up: in = ceil(net · 10000 / (10000 − fee)).
-                let fee_factor = BPS_ONE
-                    .checked_sub(self.fee_bps)
-                    .ok_or(QuoteError::Overflow)?;
-                match fee_factor == 0 {
-                    true => Err(QuoteError::Overflow),
-                    false => {
-                        let candidate = net_needed
-                            .checked_mul(U256::from(BPS_ONE))
-                            .ok_or(QuoteError::Overflow)?
-                            .checked_div(U256::from(fee_factor))
-                            .ok_or(QuoteError::Overflow)?
-                            .checked_add(U256::from(1u64))
-                            .ok_or(QuoteError::Overflow)?;
-                        Ok(crate::protocols::minimal_exact_out_input(
-                            candidate,
-                            amount_out,
-                            |dx| self.amount_out(reserve_in, reserve_out, dx).ok(),
-                        ))
-                    }
-                }
+                Ok(crate::protocols::minimal_exact_out_input(
+                    candidate,
+                    amount_out,
+                    |dx| self.amount_out(reserve_in, reserve_out, dx).ok(),
+                ))
             }
         }
     }

@@ -11,6 +11,7 @@ use crate::traits::pool::Pool;
 /// Pools that can report a marginal (zero-size) price and derived price impact.
 pub trait Pricing: Pool {
     /// The marginal price of `quote` per `base` (the price of an infinitesimal swap).
+    #[must_use = "discarding the spot price silently loses a marginal rate or hides a pricing error"]
     fn spot_price(&self, base: &AssetId, quote: &AssetId) -> Result<Price, QuoteError>;
 
     /// Price impact of swapping `amount_in` for `to`, in basis points: how far
@@ -18,6 +19,7 @@ pub trait Pricing: Pool {
     ///
     /// Default impl: `(spot_implied_out - actual_out) / spot_implied_out`,
     /// floored to whole basis points. Impact is in `[0, 10_000]` bps.
+    #[must_use = "discarding the price impact silently loses basis-point data or hides a pricing error"]
     fn price_impact(&self, amount_in: &AssetAmount, to: &AssetId) -> Result<Bps, QuoteError> {
         let ideal = self
             .spot_price(&amount_in.asset, to)?

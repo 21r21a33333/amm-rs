@@ -92,9 +92,10 @@ impl TickData {
 /// Set the initialization bit for `tick` in a bitmap, using Uniswap's compressed
 /// word/bit encoding.
 fn set_bitmap_bit(bitmap: &mut HashMap<i16, U256>, tick: i32, spacing: i32) {
-    let compressed = match tick < 0 && tick % spacing != 0 {
-        true => (tick / spacing) - 1,
-        false => tick / spacing,
+    let compressed = if tick < 0 && tick % spacing != 0 {
+        (tick / spacing) - 1
+    } else {
+        tick / spacing
     };
     let word = (compressed >> 8) as i16;
     let bit = (compressed % 256) as u8;
@@ -197,13 +198,12 @@ pub(crate) fn simulate(
         // Move `remaining` toward zero. Step amounts are bounded by pool
         // liquidity, so the signed arithmetic cannot genuinely overflow;
         // `overflowing_*` keeps it panic-free regardless.
-        remaining = match exact_in {
-            true => {
-                remaining
-                    .overflowing_sub(I256::from_raw(step_in.overflowing_add(step_fee).0))
-                    .0
-            }
-            false => remaining.overflowing_add(I256::from_raw(step_out)).0,
+        remaining = if exact_in {
+            remaining
+                .overflowing_sub(I256::from_raw(step_in.overflowing_add(step_fee).0))
+                .0
+        } else {
+            remaining.overflowing_add(I256::from_raw(step_out)).0
         };
 
         let price_start = sqrt;
@@ -240,10 +240,7 @@ fn window_edge_price(ticks: &TickData, zero_for_one: bool) -> Result<U256, Quote
     match ticks.window {
         None => Ok(price_limit(zero_for_one)),
         Some((min_tick, max_tick)) => {
-            let edge = match zero_for_one {
-                true => min_tick,
-                false => max_tick,
-            };
+            let edge = if zero_for_one { min_tick } else { max_tick };
             uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick(edge)
                 .map_err(|_| QuoteError::Overflow)
         }
@@ -253,17 +250,15 @@ fn window_edge_price(ticks: &TickData, zero_for_one: bool) -> Result<U256, Quote
 /// The tighter (closer to the current price) of two sqrt-price bounds: the higher
 /// price when `zero_for_one` (prices fall), the lower otherwise.
 fn tighter_price(zero_for_one: bool, a: U256, b: U256) -> U256 {
-    match zero_for_one {
-        true => a.max(b),
-        false => a.min(b),
-    }
+    if zero_for_one { a.max(b) } else { a.min(b) }
 }
 
 /// Whether `edge` is a strictly tighter bound than `limit` in the swap direction.
 fn strictly_tighter_price(zero_for_one: bool, edge: U256, limit: U256) -> bool {
-    match zero_for_one {
-        true => edge > limit,
-        false => edge < limit,
+    if zero_for_one {
+        edge > limit
+    } else {
+        edge < limit
     }
 }
 
@@ -305,17 +300,17 @@ fn advance_tick(
 ) -> Result<(i32, u128), QuoteError> {
     match (sqrt_now == next.price, sqrt_now != price_start) {
         (true, _) => {
-            let liquidity = match next.initialized {
-                true => {
-                    let net = tick_liquidity_net(&ticks.ticks, next.tick, zero_for_one)
-                        .ok_or(QuoteError::InsufficientLiquidity)?;
-                    crossed_liquidity(liquidity, net).ok_or(QuoteError::Overflow)?
-                }
-                false => liquidity,
+            let liquidity = if next.initialized {
+                let net = tick_liquidity_net(&ticks.ticks, next.tick, zero_for_one)
+                    .ok_or(QuoteError::InsufficientLiquidity)?;
+                crossed_liquidity(liquidity, net).ok_or(QuoteError::Overflow)?
+            } else {
+                liquidity
             };
-            let tick = match zero_for_one {
-                true => next.tick.wrapping_sub(1),
-                false => next.tick,
+            let tick = if zero_for_one {
+                next.tick.wrapping_sub(1)
+            } else {
+                next.tick
             };
             Ok((tick, liquidity))
         }
@@ -331,9 +326,10 @@ fn advance_tick(
 /// The extreme sqrt price a full-range swap runs toward (one unit inside the
 /// valid range).
 fn price_limit(zero_for_one: bool) -> U256 {
-    match zero_for_one {
-        true => uniswap_v3_math::tick_math::MIN_SQRT_RATIO + U256::from(1u64),
-        false => uniswap_v3_math::tick_math::MAX_SQRT_RATIO - U256::from(1u64),
+    if zero_for_one {
+        uniswap_v3_math::tick_math::MIN_SQRT_RATIO + U256::from(1u64)
+    } else {
+        uniswap_v3_math::tick_math::MAX_SQRT_RATIO - U256::from(1u64)
     }
 }
 
@@ -341,9 +337,10 @@ fn price_limit(zero_for_one: bool) -> U256 {
 /// `zero_for_one` prices fall (clamp up = `max`); otherwise they rise (clamp
 /// down = `min`).
 fn step_target(zero_for_one: bool, next_tick_price: U256, limit: U256) -> U256 {
-    match zero_for_one {
-        true => next_tick_price.max(limit),
-        false => next_tick_price.min(limit),
+    if zero_for_one {
+        next_tick_price.max(limit)
+    } else {
+        next_tick_price.min(limit)
     }
 }
 
@@ -358,10 +355,7 @@ fn tick_liquidity_net(
     zero_for_one: bool,
 ) -> Option<i128> {
     let net = ticks.get(&tick)?.liquidity_net;
-    Some(match zero_for_one {
-        true => -net,
-        false => net,
-    })
+    Some(if zero_for_one { -net } else { net })
 }
 
 /// Liquidity after crossing an initialized tick — `None` on overflow/underflow.
@@ -370,9 +364,10 @@ fn tick_liquidity_net(
 /// helper negates its `i128` argument, which panics in debug builds on
 /// `i128::MIN`; `unsigned_abs()` here stays correct across the full `i128` range.
 fn crossed_liquidity(liquidity: u128, liquidity_net: i128) -> Option<u128> {
-    match liquidity_net.is_negative() {
-        true => liquidity.checked_sub(liquidity_net.unsigned_abs()),
-        false => liquidity.checked_add(liquidity_net as u128),
+    if liquidity_net.is_negative() {
+        liquidity.checked_sub(liquidity_net.unsigned_abs())
+    } else {
+        liquidity.checked_add(liquidity_net as u128)
     }
 }
 
@@ -382,9 +377,10 @@ fn crossed_liquidity(liquidity: u128, liquidity_net: i128) -> Option<u128> {
 /// bit 255 is set (not a representable positive amount).
 fn positive_i256(x: U256) -> Result<I256, QuoteError> {
     let v = I256::from_raw(x);
-    match v < I256::ZERO {
-        true => Err(QuoteError::Overflow),
-        false => Ok(v),
+    if v < I256::ZERO {
+        Err(QuoteError::Overflow)
+    } else {
+        Ok(v)
     }
 }
 
@@ -447,11 +443,12 @@ pub(crate) fn spot_price(
 ) -> Result<Price, QuoteError> {
     // sqrtPriceX96 encodes token1 per token0 = sqrtP² / 2¹⁹².
     let token1_per_token0 = Ratio::from_q192_sqrt(sqrt_price_x96);
-    let ratio = match zero_for_one {
-        true => token1_per_token0,
-        false => token1_per_token0
+    let ratio = if zero_for_one {
+        token1_per_token0
+    } else {
+        token1_per_token0
             .invert()
-            .ok_or(QuoteError::InsufficientLiquidity)?,
+            .ok_or(QuoteError::InsufficientLiquidity)?
     };
     Price::new(*base, *quote, ratio).ok_or(QuoteError::InsufficientLiquidity)
 }
@@ -468,14 +465,15 @@ pub(crate) fn quote_with_limit(
     let spec = positive_i256(amount_in.raw)?;
     let sqrt_limit = clamped_sqrt_limit(assets, limit)?;
     // If the price is already past the bound, nothing swaps toward it.
-    let outcome = match limit_already_reached(state.sqrt_price_x96, zero_for_one, sqrt_limit) {
-        true => SwapOutcome {
+    let outcome = if limit_already_reached(state.sqrt_price_x96, zero_for_one, sqrt_limit) {
+        SwapOutcome {
             amount_in: U256::ZERO,
             amount_out: U256::ZERO,
             limited: true,
             window_exhausted: false,
-        },
-        false => simulate(state, zero_for_one, spec, sqrt_limit)?,
+        }
+    } else {
+        simulate(state, zero_for_one, spec, sqrt_limit)?
     };
     // A user price limit inside the fetched window fills partially (honest); one
     // beyond it cannot be priced without liquidity we never fetched.
@@ -533,9 +531,10 @@ fn clamped_sqrt_limit(assets: &[AssetId; 2], limit: &Price) -> Result<U256, Quot
 /// Whether the price is already at or past `sqrt_limit` for this direction, so no
 /// swap toward it is possible.
 fn limit_already_reached(sqrt_price_x96: U256, zero_for_one: bool, sqrt_limit: U256) -> bool {
-    match zero_for_one {
-        true => sqrt_limit >= sqrt_price_x96, // price falls; limit is below
-        false => sqrt_limit <= sqrt_price_x96, // price rises; limit is above
+    if zero_for_one {
+        sqrt_limit >= sqrt_price_x96 // price falls; limit is below
+    } else {
+        sqrt_limit <= sqrt_price_x96 // price rises; limit is above
     }
 }
 

@@ -97,12 +97,13 @@ mod tests {
         }
 
         fn quote(&self, amount_in: &AssetAmount, to: &AssetId) -> Result<AssetAmount, QuoteError> {
-            match self.assets.contains(&amount_in.asset) && self.assets.contains(to) {
-                false => Err(QuoteError::AssetNotInPool {
+            if self.assets.contains(&amount_in.asset) && self.assets.contains(to) {
+                Ok(AssetAmount::new(*to, amount_in.raw * U256::from(2u64)))
+            } else {
+                Err(QuoteError::AssetNotInPool {
                     input: amount_in.asset,
                     output: *to,
-                }),
-                true => Ok(AssetAmount::new(*to, amount_in.raw * U256::from(2u64))),
+                })
             }
         }
 
@@ -117,13 +118,14 @@ mod tests {
             amount_out: &AssetAmount,
             from: &AssetId,
         ) -> Result<AssetAmount, QuoteError> {
-            match self.assets.contains(from) && self.assets.contains(&amount_out.asset) {
-                false => Err(QuoteError::AssetNotInPool {
+            if self.assets.contains(from) && self.assets.contains(&amount_out.asset) {
+                // Inverse of doubling: divide by 2.
+                Ok(AssetAmount::new(*from, amount_out.raw / U256::from(2u64)))
+            } else {
+                Err(QuoteError::AssetNotInPool {
                     input: *from,
                     output: amount_out.asset,
-                }),
-                // Inverse of doubling: divide by 2.
-                true => Ok(AssetAmount::new(*from, amount_out.raw / U256::from(2u64))),
+                })
             }
         }
     }
@@ -151,12 +153,13 @@ mod tests {
         }
 
         fn quote(&self, amount_in: &AssetAmount, to: &AssetId) -> Result<AssetAmount, QuoteError> {
-            match self.assets.contains(&amount_in.asset) && self.assets.contains(to) {
-                false => Err(QuoteError::AssetNotInPool {
+            if self.assets.contains(&amount_in.asset) && self.assets.contains(to) {
+                Ok(AssetAmount::new(*to, amount_in.raw))
+            } else {
+                Err(QuoteError::AssetNotInPool {
                     input: amount_in.asset,
                     output: *to,
-                }),
-                true => Ok(AssetAmount::new(*to, amount_in.raw)),
+                })
             }
         }
         // `as_exact_out` is not overridden — defaults to `None`.

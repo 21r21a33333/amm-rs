@@ -11,13 +11,20 @@ pub struct PoolId(String);
 
 impl PoolId {
     /// Wrap a string identifier.
-    pub fn new(s: &str) -> Self {
-        Self(s.to_string())
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
     }
 
     /// The identifier as a string slice.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl core::fmt::Display for PoolId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -28,13 +35,20 @@ pub struct ExchangeId(String);
 
 impl ExchangeId {
     /// Wrap a string identifier.
-    pub fn new(s: &str) -> Self {
-        Self(s.to_string())
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
     }
 
     /// The identifier as a string slice.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl core::fmt::Display for ExchangeId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 

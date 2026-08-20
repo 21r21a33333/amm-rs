@@ -96,30 +96,29 @@ impl AerodromeStablePool {
     /// `getAmountOut`: exact-input output in base units. `None` on zero input, an
     /// empty reserve, overflow, or Newton non-convergence.
     fn amount_out(&self, amount_in: U256, s: &Scaled) -> Result<U256, QuoteError> {
-        match amount_in.is_zero() || self.reserves[0].is_zero() || self.reserves[1].is_zero() {
-            true => Err(QuoteError::InsufficientLiquidity),
-            false => {
-                let net = self.after_fee(amount_in)?;
-                let xy = self.invariant()?;
-                let amount_in_scaled = scale(net, s.unit_in)?;
-                let y_new = self
-                    .get_y(
-                        amount_in_scaled
-                            .checked_add(s.reserve_in)
-                            .ok_or(QuoteError::Overflow)?,
-                        xy,
-                        s.reserve_out,
-                    )
-                    .ok_or(QuoteError::InsufficientLiquidity)?;
-                let out_scaled = s
-                    .reserve_out
-                    .checked_sub(y_new)
-                    .ok_or(QuoteError::Overflow)?;
-                out_scaled
-                    .checked_mul(s.unit_out)
-                    .ok_or(QuoteError::Overflow)
-                    .map(|v| v / e18())
-            }
+        if amount_in.is_zero() || self.reserves[0].is_zero() || self.reserves[1].is_zero() {
+            Err(QuoteError::InsufficientLiquidity)
+        } else {
+            let net = self.after_fee(amount_in)?;
+            let xy = self.invariant()?;
+            let amount_in_scaled = scale(net, s.unit_in)?;
+            let y_new = self
+                .get_y(
+                    amount_in_scaled
+                        .checked_add(s.reserve_in)
+                        .ok_or(QuoteError::Overflow)?,
+                    xy,
+                    s.reserve_out,
+                )
+                .ok_or(QuoteError::InsufficientLiquidity)?;
+            let out_scaled = s
+                .reserve_out
+                .checked_sub(y_new)
+                .ok_or(QuoteError::Overflow)?;
+            out_scaled
+                .checked_mul(s.unit_out)
+                .ok_or(QuoteError::Overflow)
+                .map(|v| v / e18())
         }
     }
 
@@ -127,59 +126,57 @@ impl AerodromeStablePool {
     /// symmetric invariant for the new input reserve, then rounds up through the
     /// unit and fee conversions so the delivered output covers the request.
     fn amount_in(&self, amount_out: U256, s: &Scaled) -> Result<U256, QuoteError> {
-        match amount_out.is_zero() || self.reserves[0].is_zero() || self.reserves[1].is_zero() {
-            true => Err(QuoteError::InsufficientLiquidity),
-            false => {
-                let xy = self.invariant()?;
-                let out_scaled = ceil_div(
-                    amount_out.checked_mul(e18()).ok_or(QuoteError::Overflow)?,
-                    s.unit_out,
-                )?;
-                let new_reserve_out = s
-                    .reserve_out
-                    .checked_sub(out_scaled)
-                    .ok_or(QuoteError::InsufficientLiquidity)?;
-                // Symmetric invariant: hold the (reduced) output reserve, solve for
-                // the input reserve that restores k.
-                let new_reserve_in = self
-                    .get_y(new_reserve_out, xy, s.reserve_in)
-                    .ok_or(QuoteError::InsufficientLiquidity)?;
-                let in_scaled = new_reserve_in
-                    .checked_sub(s.reserve_in)
-                    .ok_or(QuoteError::InsufficientLiquidity)?;
-                let net = ceil_div(
-                    in_scaled
-                        .checked_mul(s.unit_in)
+        if amount_out.is_zero() || self.reserves[0].is_zero() || self.reserves[1].is_zero() {
+            Err(QuoteError::InsufficientLiquidity)
+        } else {
+            let xy = self.invariant()?;
+            let out_scaled = ceil_div(
+                amount_out.checked_mul(e18()).ok_or(QuoteError::Overflow)?,
+                s.unit_out,
+            )?;
+            let new_reserve_out = s
+                .reserve_out
+                .checked_sub(out_scaled)
+                .ok_or(QuoteError::InsufficientLiquidity)?;
+            // Symmetric invariant: hold the (reduced) output reserve, solve for
+            // the input reserve that restores k.
+            let new_reserve_in = self
+                .get_y(new_reserve_out, xy, s.reserve_in)
+                .ok_or(QuoteError::InsufficientLiquidity)?;
+            let in_scaled = new_reserve_in
+                .checked_sub(s.reserve_in)
+                .ok_or(QuoteError::InsufficientLiquidity)?;
+            let net = ceil_div(
+                in_scaled
+                    .checked_mul(s.unit_in)
+                    .ok_or(QuoteError::Overflow)?,
+                e18(),
+            )?;
+            // Gross the post-fee input back up (round up). The two ceilings
+            // bound the unit and fee conversion error, and the +1 absorbs the
+            // Newton solver's own residual (`get_y` returns an approximate
+            // root) — together a guaranteed upper bound, which is then
+            // tightened to the exact minimum against the forward `amount_out`.
+            // The forward quote is wei-exact against the chain, so the result
+            // is minimal and never under-delivers.
+            let fee_factor = BPS_ONE
+                .checked_sub(self.fee_bps)
+                .ok_or(QuoteError::Overflow)?;
+            if fee_factor == 0 {
+                Err(QuoteError::Overflow)
+            } else {
+                let candidate = ceil_div(
+                    net.checked_mul(U256::from(BPS_ONE))
                         .ok_or(QuoteError::Overflow)?,
-                    e18(),
-                )?;
-                // Gross the post-fee input back up (round up). The two ceilings
-                // bound the unit and fee conversion error, and the +1 absorbs the
-                // Newton solver's own residual (`get_y` returns an approximate
-                // root) — together a guaranteed upper bound, which is then
-                // tightened to the exact minimum against the forward `amount_out`.
-                // The forward quote is wei-exact against the chain, so the result
-                // is minimal and never under-delivers.
-                let fee_factor = BPS_ONE
-                    .checked_sub(self.fee_bps)
-                    .ok_or(QuoteError::Overflow)?;
-                match fee_factor == 0 {
-                    true => Err(QuoteError::Overflow),
-                    false => {
-                        let candidate = ceil_div(
-                            net.checked_mul(U256::from(BPS_ONE))
-                                .ok_or(QuoteError::Overflow)?,
-                            U256::from(fee_factor),
-                        )?
-                        .checked_add(U256::from(1u64))
-                        .ok_or(QuoteError::Overflow)?;
-                        Ok(crate::protocols::minimal_exact_out_input(
-                            candidate,
-                            amount_out,
-                            |dx| self.amount_out(dx, s).ok(),
-                        ))
-                    }
-                }
+                    U256::from(fee_factor),
+                )?
+                .checked_add(U256::from(1u64))
+                .ok_or(QuoteError::Overflow)?;
+                Ok(crate::protocols::minimal_exact_out_input(
+                    candidate,
+                    amount_out,
+                    |dx| self.amount_out(dx, s).ok(),
+                ))
             }
         }
     }
@@ -207,38 +204,35 @@ impl AerodromeStablePool {
         let one = U256::from(1u8);
         for _ in 0..255 {
             let k = f(x0, y)?;
-            match k < xy {
-                true => {
-                    let derivative = d(x0, y)?;
-                    if derivative.is_zero() {
-                        return None;
-                    }
-                    let mut dy = (xy - k).checked_mul(e18())? / derivative;
-                    if dy.is_zero() {
-                        if k == xy {
-                            return Some(y);
-                        }
-                        if self.k(x0, y.checked_add(one)?)? > xy {
-                            return Some(y + one);
-                        }
-                        dy = one;
-                    }
-                    y = y.checked_add(dy)?;
+            if k < xy {
+                let derivative = d(x0, y)?;
+                if derivative.is_zero() {
+                    return None;
                 }
-                false => {
-                    let derivative = d(x0, y)?;
-                    if derivative.is_zero() {
-                        return None;
+                let mut dy = (xy - k).checked_mul(e18())? / derivative;
+                if dy.is_zero() {
+                    if k == xy {
+                        return Some(y);
                     }
-                    let mut dy = (k - xy).checked_mul(e18())? / derivative;
-                    if dy.is_zero() {
-                        if k == xy || f(x0, y.checked_sub(one)?)? < xy {
-                            return Some(y);
-                        }
-                        dy = one;
+                    if self.k(x0, y.checked_add(one)?)? > xy {
+                        return Some(y + one);
                     }
-                    y = y.checked_sub(dy)?;
+                    dy = one;
                 }
+                y = y.checked_add(dy)?;
+            } else {
+                let derivative = d(x0, y)?;
+                if derivative.is_zero() {
+                    return None;
+                }
+                let mut dy = (k - xy).checked_mul(e18())? / derivative;
+                if dy.is_zero() {
+                    if k == xy || f(x0, y.checked_sub(one)?)? < xy {
+                        return Some(y);
+                    }
+                    dy = one;
+                }
+                y = y.checked_sub(dy)?;
             }
         }
         None
@@ -253,9 +247,10 @@ struct Scaled {
     unit_out: U256,
 }
 
-/// `10^decimals`.
+/// `10^decimals`. Computed entirely in `U256` so a large `decimals` (a token
+/// with >38 decimals) cannot overflow a `u128` intermediate.
 fn pow10(decimals: u8) -> U256 {
-    U256::from(10u128.pow(decimals as u32))
+    U256::from(10u8).pow(U256::from(decimals))
 }
 
 /// The fixed-point unit `1e18`.
@@ -272,12 +267,12 @@ fn scale(x: U256, unit: U256) -> Result<U256, QuoteError> {
 
 /// `ceil(a / b)`; `Err` if `b == 0`.
 fn ceil_div(a: U256, b: U256) -> Result<U256, QuoteError> {
-    match b.is_zero() {
-        true => Err(QuoteError::Overflow),
-        false => Ok(a
-            .checked_add(b - U256::from(1u64))
+    if b.is_zero() {
+        Err(QuoteError::Overflow)
+    } else {
+        Ok(a.checked_add(b - U256::from(1u64))
             .ok_or(QuoteError::Overflow)?
-            / b),
+            / b)
     }
 }
 

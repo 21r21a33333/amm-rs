@@ -1,7 +1,7 @@
 //! The build-layer error: typed and total — no panics on caller input.
 
 use amm_core::primitives::asset::{AssetId, ChainId};
-use amm_core::primitives::pool::PoolKind;
+use amm_core::primitives::pool::{PoolId, PoolKind};
 
 /// Which contract address is absent for a given chain.
 ///
@@ -59,6 +59,11 @@ pub enum BuildError {
     #[error("recipient must be resolved to an explicit address before building")]
     UnresolvedRecipient,
 
+    /// A sequential span was driven without the previous span's observed output
+    /// amount, so its input amount could not be resolved.
+    #[error("missing observed output amount for a sequential span")]
+    MissingObservedAmount,
+
     /// Deadline was left as a relative offset; must be an absolute Unix timestamp.
     #[error("deadline must be an absolute timestamp before building")]
     UnresolvedDeadline,
@@ -101,6 +106,13 @@ pub enum BuildError {
     UnsupportedExactOut {
         /// The pool kind that rejected the exact-out request.
         kind: PoolKind,
+    },
+
+    /// A pool on the route cannot backward-solve an exact-out quote.
+    #[error("exact-out quote unavailable for pool {pool}")]
+    ExactOutUnavailable {
+        /// The pool that lacks exact-out quoting.
+        pool: PoolId,
     },
 
     /// The pool's swap ABI has no `receiver` parameter — it always pays

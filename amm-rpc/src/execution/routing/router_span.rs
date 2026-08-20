@@ -15,6 +15,7 @@ use crate::execution::routing::Route;
 /// V2, V3, and V4 all go through Uniswap's Universal Router); this enum
 /// captures that many-to-one mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RouterKind {
     /// Uniswap Universal Router: handles V2, V3, and V4 pools.
     UniswapUniversal,

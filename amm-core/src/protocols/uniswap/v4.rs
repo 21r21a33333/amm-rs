@@ -25,6 +25,7 @@ pub use crate::protocols::concentrated::{TickData, TickInfo};
 
 /// How a V4 pool's hook affects quoting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Hooks {
     /// No hook, or a hook that does not alter swap pricing — quotes are exact.
     None,
@@ -234,8 +235,9 @@ impl Pricing for UniswapV4Pool {
 impl Introspect for UniswapV4Pool {
     fn fee_bps(&self, source: &AssetId, destination: &AssetId) -> Option<Bps> {
         // Per-direction effective fee in pips; 100 pips = 1 bp.
-        two_asset_direction(&self.assets, source, destination)
-            .map(|zero_for_one| Bps((self.fee_pips(zero_for_one) / 100) as u16))
+        two_asset_direction(&self.assets, source, destination).map(|zero_for_one| {
+            Bps(u16::try_from(self.fee_pips(zero_for_one) / 100).unwrap_or(u16::MAX))
+        })
     }
 
     fn reserve(&self, _asset: &AssetId) -> Option<AssetAmount> {
