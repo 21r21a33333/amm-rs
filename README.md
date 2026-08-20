@@ -209,11 +209,32 @@ Four layers:
 
 ## Examples
 
+A progression from a single offline quote to cross-router execution. Every one
+is self-contained and runnable (only `refresh_onchain` touches the network).
+
 ```bash
-# Offline quoting (no network):
+# 1. Quote one pool offline — Pool / ExactOut / Slippage (amm-core):
 cargo run -p amm-core --example quote_offline --features uniswap-v2
 
-# Live on-chain refresh (set AMM_RPC_URL, or a public node is used):
+# 2. Multi-hop quoting — quote_path_amounts + quote_path_exact_out (amm-core):
+cargo run -p amm-core --example multihop_quote --features uniswap-v2
+
+# 3. One trait, many protocols — heterogeneous Vec<Box<dyn Pool>>, Pricing/Introspect:
+cargo run -p amm-core --example multi_protocol --features "uniswap-v2 aerodrome"
+
+# 4. Build sign-ready calldata for a single swap (amm-rpc):
+cargo run -p amm-rpc --example build_calldata
+
+# 5. Multi-hop atomic execution — plan() + next_tx loop (amm-rpc):
+cargo run -p amm-rpc --example multihop_execution
+
+# 6. Exact-out (Strict / OrBetter) and native-ETH edges (amm-rpc):
+cargo run -p amm-rpc --example exact_out_and_native
+
+# 7. Cross-router (Curve + Uniswap) — non-atomic, two transactions (amm-rpc):
+cargo run -p amm-rpc --example cross_router --features curve
+
+# 8. Live on-chain refresh (set AMM_RPC_URL, or a public node is used):
 cargo run -p amm-rpc --example refresh_onchain
 ```
 

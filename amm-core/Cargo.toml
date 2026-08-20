@@ -33,6 +33,14 @@ aerodrome = ["dep:uniswap_v3_math"]
 name = "quote_offline"
 required-features = ["uniswap-v2"]
 
+[[example]]
+name = "multihop_quote"
+required-features = ["uniswap-v2"]
+
+[[example]]
+name = "multi_protocol"
+required-features = ["uniswap-v2", "aerodrome"]
+
 [dev-dependencies]
 proptest = "1"
 rstest = "0.26"

@@ -31,9 +31,17 @@ let prepared = as_executable(&pool)
 // prepared.tx — sign & send;  prepared.approval — grant first if Some.
 ```
 
-See [`examples/build_calldata.rs`](examples/build_calldata.rs) for a runnable
-end-to-end flow, and [`examples/refresh_onchain.rs`](examples/refresh_onchain.rs)
-for live state fetching.
+Runnable examples, simplest first:
+
+- [`build_calldata.rs`](examples/build_calldata.rs) — quote one pool and build a
+  sign-ready Universal Router tx + Permit2 approval.
+- [`multihop_execution.rs`](examples/multihop_execution.rs) — `plan()` a multi-hop
+  route and drive the `next_tx` loop (one atomic tx for a same-router route).
+- [`exact_out_and_native.rs`](examples/exact_out_and_native.rs) — exact-out
+  (Strict vs OrBetter) and native-ETH edges.
+- [`cross_router.rs`](examples/cross_router.rs) — a Curve + Uniswap route that
+  settles as two sequential transactions (`--features curve`).
+- [`refresh_onchain.rs`](examples/refresh_onchain.rs) — live on-chain state fetch.
 
 ## Multi-hop
 
