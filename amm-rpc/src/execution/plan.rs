@@ -80,6 +80,34 @@ fn map_quote_err(e: QuoteError) -> BuildError {
     }
 }
 
+/// Which endpoint of a route (if any) is native ETH rather than a wrapped token.
+///
+/// Native ETH can only sit at a route's endpoints, and never both — so this enum
+/// makes the "both native" case unrepresentable, unlike a `native_in`/`native_out`
+/// bool pair which could express it only to be rejected.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NativeEdge {
+    /// Pure ERC-20 route — neither endpoint is native ETH.
+    #[default]
+    None,
+    /// The input edge is native ETH (wrapped to WETH on the way in).
+    Input,
+    /// The output edge is native ETH (unwrapped from WETH on the way out).
+    Output,
+}
+
+impl NativeEdge {
+    /// `(native_in, native_out)` flags for the internal span builders.
+    fn flags(self) -> (bool, bool) {
+        match self {
+            NativeEdge::None => (false, false),
+            NativeEdge::Input => (true, false),
+            NativeEdge::Output => (false, true),
+        }
+    }
+}
+
 /// How this plan realises its trade — the exact-in vs exact-out shape that
 /// `next_tx` must honour when it dispatches each span.
 ///
@@ -167,14 +195,14 @@ pub struct Plan<'a> {
 /// # Examples
 /// ```ignore
 /// // Exact-out, best-effort: deliver at least `target`, input backward-solved.
-/// let mut p = plan(&ctx, &route, target, &opts, sender, false, false,
+/// let mut p = plan(&ctx, &route, target, &opts, sender, NativeEdge::None,
 ///                  ExactOutPolicy::OrBetter)?;
 /// let tx = p.next_tx(None)?; // exact-in shape, final floor == target
 /// ```
 //
 // The argument count is inherent to the public multi-hop entry point: it threads
-// ctx, route, amount, opts, sender, both native-edge flags, and the exact-out
-// policy. Bundling them would obscure the call site more than it helps.
+// ctx, route, amount, opts, sender, the native edge, and the exact-out policy.
+// Bundling them would obscure the call site more than it helps.
 #[allow(clippy::too_many_arguments)]
 pub fn plan<'a>(
     ctx: &'a ChainConfig,
@@ -182,10 +210,10 @@ pub fn plan<'a>(
     amount: U256,
     opts: &'a ExecutionOptions,
     sender: Address,
-    native_in: bool,
-    native_out: bool,
+    native: NativeEdge,
     policy: ExactOutPolicy,
 ) -> Result<Plan<'a>, BuildError> {
+    let (native_in, native_out) = native.flags();
     route.validate()?;
     let spans = partition(route)?;
 
@@ -829,8 +857,7 @@ mod tests {
             U256::from(1_000u64),
             &options,
             sender,
-            false,
-            false,
+            NativeEdge::None,
             ExactOutPolicy::Strict,
         )
         .expect("plan must build");
@@ -879,8 +906,7 @@ mod tests {
             U256::from(1_000_000u64),
             &options,
             sender,
-            false,
-            false,
+            NativeEdge::None,
             ExactOutPolicy::Strict,
         )
         .expect("plan must build");
@@ -978,8 +1004,7 @@ mod tests {
             amount_in,
             &options,
             sender,
-            false, // native_in
-            false, // native_out
+            NativeEdge::None,
             ExactOutPolicy::Strict,
         )
         .expect("plan must build");
@@ -1094,8 +1119,7 @@ mod tests {
                 amount_in,
                 &options,
                 sender,
-                false, // native_in
-                false, // native_out
+                NativeEdge::None,
                 ExactOutPolicy::Strict,
             )
             .expect("plan must build");
@@ -1163,8 +1187,7 @@ mod tests {
                 amount_in,
                 &options,
                 sender,
-                true,  // native_in: first (and only) span gets ETH
-                false, // native_out
+                NativeEdge::Input,
                 ExactOutPolicy::Strict,
             )
             .expect("native-in UR plan must build");
@@ -1229,8 +1252,7 @@ mod tests {
             amount_in,
             &options,
             sender,
-            false,
-            false,
+            NativeEdge::None,
             ExactOutPolicy::Strict,
         )
         .expect("plan must build");
@@ -1294,8 +1316,7 @@ mod tests {
             target,
             &options,
             sender,
-            false,
-            false,
+            NativeEdge::None,
             ExactOutPolicy::Strict,
         )
         .expect("strict single-span V3 exact-out must build");
@@ -1397,8 +1418,7 @@ mod tests {
             target,
             &options,
             sender,
-            false,
-            false,
+            NativeEdge::None,
             ExactOutPolicy::OrBetter,
         )
         .expect("OrBetter exact-out must build even with a non-exact-out span family");
@@ -1460,8 +1480,7 @@ mod tests {
             U256::from(500_000u64),
             &options,
             sender,
-            false,
-            false,
+            NativeEdge::None,
             ExactOutPolicy::Strict,
         );
         assert!(
@@ -1494,8 +1513,7 @@ mod tests {
             U256::from(1_000u64),
             &options,
             sender,
-            false,
-            false,
+            NativeEdge::None,
             ExactOutPolicy::Strict,
         );
         assert!(

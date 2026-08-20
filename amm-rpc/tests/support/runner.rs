@@ -25,8 +25,8 @@ use alloy::providers::Provider;
 use amm_core::primitives::asset::{AssetAmount, AssetId};
 use amm_rpc::execution::routing::{ExactOutPolicy, RouterKind};
 use amm_rpc::execution::{
-    ChainConfig, Currency, CurrencyAmount, Recipient, TradeType, as_executable, error::BuildError,
-    plan,
+    ChainConfig, Currency, CurrencyAmount, NativeEdge, Recipient, TradeType, as_executable,
+    error::BuildError, plan,
 };
 
 use super::{
@@ -44,6 +44,16 @@ const DISTINCT_RECIPIENT: Address = Address::repeat_byte(0xD1);
 
 /// 1 ETH in wei — used as a headroom buffer for native-out and exact-out funding.
 const ONE_ETH: U256 = U256::from_limbs([1_000_000_000_000_000_000u64, 0, 0, 0]);
+
+/// Map a `PlanCase`'s `(native_in, native_out)` bool pair to a [`NativeEdge`].
+/// The both-`true` case cannot occur (a route has at most one native endpoint).
+pub fn native_edge(native_in: bool, native_out: bool) -> NativeEdge {
+    match (native_in, native_out) {
+        (true, false) => NativeEdge::Input,
+        (false, true) => NativeEdge::Output,
+        _ => NativeEdge::None,
+    }
+}
 
 /// Vyper-storage tokens whose `balanceOf` mapping reverses the key order
 /// (`keccak(slot ++ holder)` instead of Solidity's `keccak(holder ++ slot)`).
@@ -326,8 +336,7 @@ where
         case.amount,
         &opts,
         SENDER,
-        case.native_in,
-        case.native_out,
+        native_edge(case.native_in, case.native_out),
         policy,
     );
 

@@ -43,7 +43,9 @@ use amm_core::protocols::uniswap::v3::{TickData, TickInfo, UniswapV3Pool};
 use amm_core::slippage::Slippage;
 use amm_rpc::execution::routing::{ExactOutPolicy, Route};
 use amm_rpc::execution::types::TradeType;
-use amm_rpc::execution::{ChainConfig, Deadline, ExecutionOptions, Recipient, Routers, plan};
+use amm_rpc::execution::{
+    ChainConfig, Deadline, ExecutionOptions, NativeEdge, Recipient, Routers, plan,
+};
 use support::{
     BuildErrorKind, Expect, PlanCase, RecipientKind, base_chain_config, mainnet_chain_config,
     open_fork, run_plan_case,
@@ -499,8 +501,7 @@ async fn multihop_cross_router_matrix() {
             case.amount,
             &opts,
             Address::repeat_byte(0xBE),
-            case.native_in,
-            case.native_out,
+            support::native_edge(case.native_in, case.native_out),
             ExactOutPolicy::Strict,
         )
         .unwrap_or_else(|e| panic!("PlanCase {}: plan() failed: {e:?}", case.name));
@@ -684,8 +685,7 @@ fn structural_uniswap_span_wellformed_2_to_6_hops() {
             amount_in,
             &opts,
             sender,
-            false, // native_in
-            false, // native_out
+            NativeEdge::None,
             ExactOutPolicy::Strict,
         )
         .unwrap_or_else(|e| panic!("plan({n}-hop) must build: {e:?}"));
