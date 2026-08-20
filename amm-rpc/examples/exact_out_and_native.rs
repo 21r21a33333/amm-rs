@@ -17,7 +17,7 @@ use alloy::primitives::{U256, address};
 use amm_core::protocols::uniswap::v2::UniswapV2Pool;
 use amm_rpc::execution::routing::Route;
 use amm_rpc::execution::{
-    ExactOutPolicy, ExecutionOptions, NativeEdge, Plan, Recipient, TradeType, chains, plan, resolve,
+    self, ExactOutPolicy, ExecutionOptions, NativeEdge, Plan, Recipient, TradeType, chains, resolve,
 };
 use amm_rpc::{AssetId, Bps, ChainId, PoolId, Slippage};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -93,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         path: vec![usdc, weth],
         trade_type: TradeType::ExactOut,
     };
-    let p = plan(
+    let p = execution::plan(
         &cfg,
         &route,
         e18,
@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         path: vec![usdc, weth, dai],
         trade_type: TradeType::ExactOut,
     };
-    let p = plan(
+    let p = execution::plan(
         &cfg,
         &route2,
         U256::from(1_000u128) * e18,
@@ -127,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         path: vec![usdc, weth],
         trade_type: TradeType::ExactIn,
     };
-    let p = plan(
+    let p = execution::plan(
         &cfg,
         &route3,
         U256::from(1_000_000_000u64),

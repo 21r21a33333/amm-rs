@@ -17,7 +17,7 @@ use amm_core::protocols::curve::pool::CurvePool;
 use amm_core::protocols::uniswap::v2::UniswapV2Pool;
 use amm_rpc::execution::routing::Route;
 use amm_rpc::execution::{
-    ExactOutPolicy, ExecutionOptions, NativeEdge, Recipient, TradeType, chains, plan, resolve,
+    self, ExactOutPolicy, ExecutionOptions, NativeEdge, Recipient, TradeType, chains, resolve,
 };
 use amm_rpc::{AssetAmount, AssetId, Bps, ChainId, Pool, PoolId, Slippage};
 use curve_math::Pool as CurveMathPool;
@@ -71,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let amount_in = U256::from(1_000u128) * e18;
-    let mut plan = plan(
+    let mut plan = execution::plan(
         &cfg,
         &route,
         amount_in,

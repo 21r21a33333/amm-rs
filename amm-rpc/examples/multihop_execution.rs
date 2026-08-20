@@ -13,7 +13,7 @@ use alloy::primitives::{U256, address};
 use amm_core::protocols::uniswap::v2::UniswapV2Pool;
 use amm_rpc::execution::routing::Route;
 use amm_rpc::execution::{
-    ExactOutPolicy, ExecutionOptions, NativeEdge, Recipient, TradeType, chains, plan, resolve,
+    self, ExactOutPolicy, ExecutionOptions, NativeEdge, Recipient, TradeType, chains, resolve,
 };
 use amm_rpc::{AssetId, Bps, ChainId, PoolId, Slippage};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -70,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Plan 1,000 USDC → DAI, exact-in, no native edges.
-    let mut plan = plan(
+    let mut plan = execution::plan(
         &cfg,
         &route,
         U256::from(1_000_000_000u64),
