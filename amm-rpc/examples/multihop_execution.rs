@@ -19,12 +19,10 @@ use amm_rpc::{AssetId, Bps, ChainId, PoolId, Slippage};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn asset(hex: &str) -> AssetId {
-    AssetId::new(
-        ChainId(1),
-        hex.parse::<alloy::primitives::Address>()
-            .unwrap()
-            .into_word(),
-    )
+    let addr = hex
+        .parse::<alloy::primitives::Address>()
+        .expect("valid hex address");
+    AssetId::new(ChainId(1), addr.into_word())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

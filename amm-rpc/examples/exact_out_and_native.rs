@@ -23,12 +23,10 @@ use amm_rpc::{AssetId, Bps, ChainId, PoolId, Slippage};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn asset(hex: &str) -> AssetId {
-    AssetId::new(
-        ChainId(1),
-        hex.parse::<alloy::primitives::Address>()
-            .unwrap()
-            .into_word(),
-    )
+    let addr = hex
+        .parse::<alloy::primitives::Address>()
+        .expect("valid hex address");
+    AssetId::new(ChainId(1), addr.into_word())
 }
 
 fn report(label: &str, mut plan: Plan<'_>) -> Result<(), Box<dyn std::error::Error>> {
@@ -93,16 +91,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         path: vec![usdc, weth],
         trade_type: TradeType::ExactOut,
     };
-    let p = execution::plan(
-        &cfg,
-        &route,
-        e18,
-        &opts,
-        sender,
-        NativeEdge::None,
-        ExactOutPolicy::Strict,
+    report(
+        "exact-out Strict: receive exactly 1 WETH",
+        execution::plan(
+            &cfg,
+            &route,
+            e18,
+            &opts,
+            sender,
+            NativeEdge::None,
+            ExactOutPolicy::Strict,
+        )?,
     )?;
-    report("exact-out Strict: receive exactly 1 WETH", p)?;
 
     // 2) Exact-out OrBetter over 2 hops: receive AT LEAST 1,000 DAI.
     let route2 = Route {
@@ -110,16 +110,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         path: vec![usdc, weth, dai],
         trade_type: TradeType::ExactOut,
     };
-    let p = execution::plan(
-        &cfg,
-        &route2,
-        U256::from(1_000u128) * e18,
-        &opts,
-        sender,
-        NativeEdge::None,
-        ExactOutPolicy::OrBetter,
+    report(
+        "exact-out OrBetter: receive at least 1,000 DAI",
+        execution::plan(
+            &cfg,
+            &route2,
+            U256::from(1_000u128) * e18,
+            &opts,
+            sender,
+            NativeEdge::None,
+            ExactOutPolicy::OrBetter,
+        )?,
     )?;
-    report("exact-out OrBetter: receive at least 1,000 DAI", p)?;
 
     // 3) Native output: swap USDC and receive native ETH (the router unwraps WETH).
     let route3 = Route {
@@ -127,15 +129,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         path: vec![usdc, weth],
         trade_type: TradeType::ExactIn,
     };
-    let p = execution::plan(
-        &cfg,
-        &route3,
-        U256::from(1_000_000_000u64),
-        &opts,
-        sender,
-        NativeEdge::Output,
-        ExactOutPolicy::Strict,
+    report(
+        "native-out: 1,000 USDC -> ETH (unwrapped)",
+        execution::plan(
+            &cfg,
+            &route3,
+            U256::from(1_000_000_000u64),
+            &opts,
+            sender,
+            NativeEdge::Output,
+            ExactOutPolicy::Strict,
+        )?,
     )?;
-    report("native-out: 1,000 USDC -> ETH (unwrapped)", p)?;
     Ok(())
 }

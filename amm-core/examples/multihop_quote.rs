@@ -16,12 +16,10 @@ use amm_core::protocols::uniswap::v2::UniswapV2Pool;
 use amm_core::traits::pool::Pool;
 
 fn asset(hex: &str) -> AssetId {
-    AssetId::new(
-        ChainId(1),
-        hex.parse::<alloy_primitives::Address>()
-            .unwrap()
-            .into_word(),
-    )
+    let addr = hex
+        .parse::<alloy_primitives::Address>()
+        .expect("valid hex address");
+    AssetId::new(ChainId(1), addr.into_word())
 }
 
 fn main() {
@@ -30,8 +28,8 @@ fn main() {
     let weth = asset("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
     let dai = asset("0x6B175474E89094C44Da98b954EedeAC495271d0F");
 
-    // Pool A: USDC/WETH — 50M USDC (6 dp) / 15k WETH (18 dp).
-    let a = UniswapV2Pool::new(
+    // USDC/WETH — 50M USDC (6 dp) / 15k WETH (18 dp).
+    let usdc_weth = UniswapV2Pool::new(
         PoolId::new("1:univ2:usdc-weth"),
         [usdc, weth],
         [
@@ -40,8 +38,8 @@ fn main() {
         ],
         30,
     );
-    // Pool B: WETH/DAI — 15k WETH / 50M DAI (both 18 dp).
-    let b = UniswapV2Pool::new(
+    // WETH/DAI — 15k WETH / 50M DAI (both 18 dp).
+    let weth_dai = UniswapV2Pool::new(
         PoolId::new("1:univ2:weth-dai"),
         [weth, dai],
         [
@@ -56,11 +54,11 @@ fn main() {
     // `&dyn Pool`, so any protocol can appear at any hop.
     let hops = [
         Hop {
-            pool: &a as &dyn Pool,
+            pool: &usdc_weth as &dyn Pool,
             to: weth,
         },
         Hop {
-            pool: &b as &dyn Pool,
+            pool: &weth_dai as &dyn Pool,
             to: dai,
         },
     ];
